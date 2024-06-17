@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from patchvae.models.normalization import PatchGroupNorm
+from patchvae.models.layers.normalization import PatchGroupNorm
 
 class GroupNormAdapter(nn.Module):
     def __init__(self, group_norm: nn.GroupNorm):

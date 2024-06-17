@@ -159,7 +159,6 @@ class PatchGroupNorm(nn.GroupNorm):
         group_sum = torch.stack(partial_sum_list, dim = 0).sum(dim=0)
         # shape: [bs, num_groups]
         E = group_sum / nelements
-        # E = E.view(E.shape[0], E.shape[1], 1, 1, 1)
         
         partial_var_sum = ((x - E[:, :, None, None, None]) ** 2).sum_to_size(x.shape[0], self.num_groups, 1, 1, 1)
         partial_var_sum_list = [torch.empty([x.shape[0], self.num_groups], device=x.device) for _ in range(world_size)]
