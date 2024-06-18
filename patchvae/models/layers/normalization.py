@@ -1,3 +1,4 @@
+import numbers
 from typing import Optional
 
 import torch
@@ -8,43 +9,7 @@ from torch import Tensor
 
 from diffusers.models.activations import get_activation
 
-class AdaGroupNorm(nn.Module):
-    r"""
-    GroupNorm layer modified to incorporate timestep embeddings.
-
-    Parameters:
-        embedding_dim (`int`): The size of each embedding vector.
-        num_embeddings (`int`): The size of the embeddings dictionary.
-        num_groups (`int`): The number of groups to separate the channels into.
-        act_fn (`str`, *optional*, defaults to `None`): The activation function to use.
-        eps (`float`, *optional*, defaults to `1e-5`): The epsilon value to use for numerical stability.
-    """
-
-    def __init__(
-        self, embedding_dim: int, out_dim: int, num_groups: int, act_fn: Optional[str] = None, eps: float = 1e-5
-    ):
-        super().__init__()
-        self.num_groups = num_groups
-        self.eps = eps
-
-        if act_fn is None:
-            self.act = None
-        else:
-            self.act = get_activation(act_fn)
-
-        self.linear = nn.Linear(embedding_dim, out_dim * 2)
-
-    def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
-        if self.act:
-            emb = self.act(emb)
-        emb = self.linear(emb)
-        emb = emb[:, :, None, None]
-        scale, shift = emb.chunk(2, dim=1)
-
-        x = F.group_norm(x, self.num_groups, eps=self.eps)
-        x = x * (1 + scale) + shift
-        return x
-
+#TODO test and fix
 class PatchAdaGroupNorm(nn.Module):
     def __init__(
         self, embedding_dim: int, out_dim: int, num_groups: int, act_fn: Optional[str] = None, eps: float = 1e-5
@@ -171,3 +136,34 @@ class PatchGroupNorm(nn.GroupNorm):
         x = x.view(x.shape[0], -1, x.shape[-2], x.shape[-1])
         x = x * self.weight[None, :, None, None] + self.bias[None, :, None, None]
         return x
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps: float, elementwise_affine: bool = True):
+        super().__init__()
+
+        self.eps = eps
+
+        if isinstance(dim, numbers.Integral):
+            dim = (dim,)
+
+        self.dim = torch.Size(dim)
+
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.weight = None
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+
+        if self.weight is not None:
+            # convert into half-precision if necessary
+            if self.weight.dtype in [torch.float16, torch.bfloat16]:
+                hidden_states = hidden_states.to(self.weight.dtype)
+            hidden_states = hidden_states * self.weight
+        else:
+            hidden_states = hidden_states.to(input_dtype)
+
+        return hidden_states
