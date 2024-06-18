@@ -1,5 +1,5 @@
 from patchvae.modules.patch_utils import Patchify, DePatchify
-from patchvae.modules.adapters.norm_adapters import GroupNormAdapter
+from patchvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from torch.nn import GroupNorm
 
 import torch

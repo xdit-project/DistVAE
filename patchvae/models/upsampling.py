@@ -7,7 +7,7 @@ from diffusers.utils import deprecate
 from diffusers.models.upsampling import Upsample2D
 
 from patchvae.models.layers.normalization import RMSNorm
-from patchvae.modules.adapters.conv_adapters import Conv2dAdapter
+from patchvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
 
 
 class PatchUpsample2D(Upsample2D):
