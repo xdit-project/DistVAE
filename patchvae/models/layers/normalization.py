@@ -33,20 +33,20 @@ class PatchAdaGroupNorm(nn.Module):
         scale, shift = emb.chunk(2, dim=1)
 
         world_size = dist.get_world_size()
-        height_list = [torch.empty([1], dtype=torch.int64) for rank in range(world_size)]
+        height_list = [torch.empty([1], dtype=torch.int64) for _ in range(world_size)]
         dist.all_gather(height_list, torch.tensor([x.shape[2]], dtype=torch.int64))
         height = torch.tensor(height_list).sum()
 
         channels_per_group = x.shape[1] // self.num_groups
         
         partial_sum = x.sum_to_size(x.shape[0], self.num_groups)
-        partial_sum_list = [torch.empty([x.shape[0], self.num_groups]) for _ in range(world_size)]
+        partial_sum_list = [torch.empty([x.shape[0], self.num_groups], dtype=x.dtype, device=x.device) for _ in range(world_size)]
         dist.all_gather(partial_sum_list, partial_sum)
         group_sum = torch.tensor(partial_sum_list).sum(dim=0)
         E = group_sum / (channels_per_group * height * x.shape[-1])
         
         partial_var = ((x - E) ** 2).sum_to_size(x.shape[0], self.num_groups)
-        partial_var_list = [torch.empty([x.shape[0], self.num_groups]) for _ in range(world_size)]
+        partial_var_list = [torch.empty([x.shape[0], self.num_groups], dtype=x.dtype, device=x.device) for _ in range(world_size)]
         dist.all_gather(partial_var_list, partial_var)
         group_var = torch.tensor(partial_var_list).sum(dim=0)
         var = group_var / (channels_per_group * height * x.shape[-1])
@@ -119,14 +119,14 @@ class PatchGroupNorm(nn.GroupNorm):
        
         x = x.view(x.shape[0], self.num_groups, -1, x.shape[-2], x.shape[-1])
         partial_sum = x.sum_to_size(x.shape[0], self.num_groups, 1, 1, 1)
-        partial_sum_list = [torch.empty([x.shape[0], self.num_groups], device=x.device) for _ in range(world_size)]
+        partial_sum_list = [torch.empty([x.shape[0], self.num_groups], dtype=x.dtype, device=x.device) for _ in range(world_size)]
         dist.all_gather(partial_sum_list, partial_sum)
         group_sum = torch.stack(partial_sum_list, dim = 0).sum(dim=0)
         # shape: [bs, num_groups]
         E = group_sum / nelements
         
         partial_var_sum = ((x - E[:, :, None, None, None]) ** 2).sum_to_size(x.shape[0], self.num_groups, 1, 1, 1)
-        partial_var_sum_list = [torch.empty([x.shape[0], self.num_groups], device=x.device) for _ in range(world_size)]
+        partial_var_sum_list = [torch.empty([x.shape[0], self.num_groups], dtype=x.dtype, device=x.device) for _ in range(world_size)]
         dist.all_gather(partial_var_sum_list, partial_var_sum)
         group_var_sum = torch.stack(partial_var_sum_list, dim=0).sum(dim=0)
         # shape: [bs, num_groups]

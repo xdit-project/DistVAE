@@ -348,10 +348,6 @@ class PatchDecoder(nn.Module):
             # up
             sample = self.patch(sample)
             for up_block in self.up_blocks:
-                for name, module in up_block.named_children():
-                    print("parents:" + name)
-                    for name, _ in module.named_children():
-                        print("child: " + name)
                 sample = up_block(sample, latent_embeds)
             sample = self.depatch(sample)
 

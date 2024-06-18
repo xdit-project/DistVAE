@@ -14,9 +14,11 @@ from diffusers.models.upsampling import Upsample2D
 class UpDecoderBlock2DAdapter(nn.Module):
     def __init__(self, up_block: UpDecoderBlock2D):
         super().__init__()
+        assert up_block is not None and isinstance(up_block, UpDecoderBlock2D), "up_block must be a UpDecoderBlock2D instance"
         self.up_block = PatchUpDecoderBlock2D(
             in_channels=32,
             out_channels=32,
+            add_upsample=False,
         )
         self.up_block.resolution_idx = up_block.resolution_idx
         self.up_block.resnets = nn.ModuleList([

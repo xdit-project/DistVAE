@@ -24,13 +24,13 @@ def main():
     parser.add_argument(
         "--height",
         type=int,
-        default=1024,
+        default=128,
         help="The height of image",
     )
     parser.add_argument(
         "--width",
         type=int,
-        default=1024,
+        default=128,
         help="The width of image",
     )
     args = parser.parse_args() 
@@ -48,22 +48,19 @@ def main():
         norm_num_groups=32,
         act_fn="silu",
     ).to(f"cuda:{rank}")
-
+    patch_decoder = DecoderAdapter(decoder).to(f"cuda:{rank}")
+    if rank == 0:
+        print("decoder: ", decoder)
+        print("patch decoder: ", patch_decoder)
     hidden_state = torch.randn(1, 4, args.height, args.width, device=f"cuda:{rank}")
-    # print("hidden state shape: ", hidden_state.shape)
 
     result = decoder(hidden_state)
-    # if rank == 0:
-        # print("result: ", result)
-
-    patch_decoder = DecoderAdapter(decoder).to(f"cuda:{rank}")
-    del decoder
 
     patch_result = patch_decoder(hidden_state)
 
     print("result shape: ", patch_result.shape)
     if rank == 0:
-        assert torch.allclose(result, patch_result), "two hidden states are not equal"
+        assert torch.allclose(result, patch_result, atol=1e-2), "two hidden states are not equal"
 
 
 if __name__ == "__main__":

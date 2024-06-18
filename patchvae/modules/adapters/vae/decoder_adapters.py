@@ -25,7 +25,6 @@ class DecoderAdapter(nn.Module):
         self.decoder.conv_act = decoder.conv_act
         self.decoder.conv_out = decoder.conv_out
 
-        
 
     def forward(
         self,
