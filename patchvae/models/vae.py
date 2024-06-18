@@ -22,12 +22,15 @@ from diffusers.utils import BaseOutput, is_torch_version
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.models.activations import get_activation
 from diffusers.models.attention_processor import SpatialNorm
-from .unets.unet_2d_blocks import (
+from diffusers.models.unets.unet_2d_blocks import (
     AutoencoderTinyBlock,
     UNetMidBlock2D,
-    get_down_block,
+    get_down_block
+)
+from patchvae.models.unets.unet_2d_blocks import (
     get_up_block,
 )
+from patchvae.modules.patch_utils import Patchify, DePatchify
 
 
 @dataclass
@@ -182,7 +185,7 @@ class Encoder(nn.Module):
         return sample
 
 
-class Decoder(nn.Module):
+class PatchDecoder(nn.Module):
     r"""
     The `Decoder` layer of a variational autoencoder that decodes its latent representation into an output sample.
 
@@ -217,7 +220,10 @@ class Decoder(nn.Module):
         norm_type: str = "group",  # group, spatial
         mid_block_add_attention=True,
     ):
+        assert norm_type is "group", "Only group normalization is supported in PatchDecoder. Please use Decoder instead."
         super().__init__()
+        for up_block in up_block_types:
+            assert up_block in ["UpDecoderBlock2D"], "Only UpDecoderBlock2D is supported in PatchDecoder. Please use Decoder instead."
         self.layers_per_block = layers_per_block
 
         self.conv_in = nn.Conv2d(
@@ -254,7 +260,7 @@ class Decoder(nn.Module):
             output_channel = reversed_block_out_channels[i]
 
             is_final_block = i == len(block_out_channels) - 1
-
+        
             up_block = get_up_block(
                 up_block_type,
                 num_layers=self.layers_per_block + 1,
@@ -272,6 +278,12 @@ class Decoder(nn.Module):
             self.up_blocks.append(up_block)
             prev_output_channel = output_channel
 
+        # patchify
+        self.patch = Patchify()
+        # unpatchify
+        self.depatch = DePatchify()
+
+         
         # out
         if norm_type == "spatial":
             self.conv_norm_out = SpatialNorm(block_out_channels[0], temb_channels)
@@ -334,12 +346,14 @@ class Decoder(nn.Module):
             sample = sample.to(upscale_dtype)
 
             # up
+            sample = self.patch(sample)
             for up_block in self.up_blocks:
                 for name, module in up_block.named_children():
                     print("parents:" + name)
                     for name, _ in module.named_children():
                         print("child: " + name)
                 sample = up_block(sample, latent_embeds)
+            sample = self.depatch(sample)
 
         # post-process
         if latent_embeds is None:

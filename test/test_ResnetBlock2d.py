@@ -1,6 +1,8 @@
 from patchvae.modules.patch_utils import Patchify, DePatchify
-from patchvae.models.adapters.norm_adapters import GroupNormAdapter
+from patchvae.modules.adapters.resnet_adapters import ResnetBlock2DAdapter
 from torch.nn import GroupNorm
+
+from diffusers.models.resnet import ResnetBlock2D
 
 import torch
 import random
@@ -36,24 +38,35 @@ def main():
     world_size = dist.get_world_size()
     torch.device('cuda', rank)
 
-    norm = GroupNorm(num_groups=2, num_channels=2).to(f"cuda:{rank}")
-    patch_norm = GroupNormAdapter(norm).to(f"cuda:{rank}")
+    resnet = ResnetBlock2D(
+        in_channels=64,
+        out_channels=32,
+        temb_channels=None,
+        eps=1e-6,
+        groups=4,
+        dropout=0.0,
+        time_embedding_norm="default",
+        non_linearity="swish",
+        output_scale_factor=1.0,
+        pre_norm=True,
+    ).to(f"cuda:{rank}")
+    patch_resnet = ResnetBlock2DAdapter(resnet).to(f"cuda:{rank}")
 
-    hidden_state = torch.randn(1, 2, args.height, args.width, device=f"cuda:{rank}")
+    hidden_state = torch.randn(1, 64, args.height, args.width, device=f"cuda:{rank}")
 
-    result = norm(hidden_state)
+    result = resnet(hidden_state, None)
     # if rank == 0:
         # print("result: ", result)
 
     patch = Patchify()
     depatch = DePatchify()
-    patch_result = patch_norm(patch(hidden_state))
+    patch_result = patch_resnet(patch(hidden_state))
     # print("patch_res:", rank, patch_result)
     patch_result = depatch(patch_result)
 
 
     if rank == 0:
-        assert torch.allclose(result, patch_result), "two hidden states are not equal"
+        assert torch.allclose(result, patch_result, atol=1e-2), "two hidden states are not equal"
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from patchvae.models.upsampling import PatchUpsample2D
-from patchvae.models.adapters.conv_adapters import Conv2dAdapter
+from patchvae.modules.adapters.conv_adapters import Conv2dAdapter
 
 from diffusers.models.upsampling import Upsample2D
 

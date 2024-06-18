@@ -1,6 +1,6 @@
-from patchvae.models.adapters.upsampling_adapters import Upsample2DAdapter
 from patchvae.modules.patch_utils import Patchify, DePatchify
-from diffusers.models.upsampling import Upsample2D
+from patchvae.modules.adapters.norm_adapters import GroupNormAdapter
+from torch.nn import GroupNorm
 
 import torch
 import random
@@ -36,22 +36,20 @@ def main():
     world_size = dist.get_world_size()
     torch.device('cuda', rank)
 
-    upsampler = Upsample2D(64, use_conv=True, out_channels=64).to(f"cuda:{rank}")
-    patch_upsampler = Upsample2DAdapter(upsampler).to(f"cuda:{rank}")
+    norm = GroupNorm(num_groups=2, num_channels=2).to(f"cuda:{rank}")
+    patch_norm = GroupNormAdapter(norm).to(f"cuda:{rank}")
 
-    hidden_state = torch.randn(1, 64, args.height, args.width, device=f"cuda:{rank}")
-    print("hidden state shape: ", hidden_state.shape)
+    hidden_state = torch.randn(1, 2, args.height, args.width, device=f"cuda:{rank}")
 
-    result = upsampler(hidden_state)
+    result = norm(hidden_state)
     # if rank == 0:
         # print("result: ", result)
 
     patch = Patchify()
     depatch = DePatchify()
-    patch_result = patch_upsampler(patch(hidden_state))
+    patch_result = patch_norm(patch(hidden_state))
     # print("patch_res:", rank, patch_result)
     patch_result = depatch(patch_result)
-    print("result shape: ", patch_result.shape)
 
 
     if rank == 0:
