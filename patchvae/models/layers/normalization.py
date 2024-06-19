@@ -108,6 +108,8 @@ class PatchGroupNorm(nn.GroupNorm):
                          affine=affine, device=device, dtype=dtype)
 
     def forward(self, x: Tensor) -> Tensor:
+        # xtype = x.dtype
+        # x.to(torch.float32)
         world_size = dist.get_world_size()
         # get height
         height_list = [torch.empty([1], dtype=torch.int64, device=x.device) for _ in range(world_size)]
@@ -115,19 +117,23 @@ class PatchGroupNorm(nn.GroupNorm):
         height = torch.tensor(height_list).sum()
 
         channels_per_group = x.shape[1] // self.num_groups
+        nelements_rank = channels_per_group * x.shape[-2] * x.shape[-1]
         nelements = channels_per_group * height * x.shape[-1]
-       
+
         x = x.view(x.shape[0], self.num_groups, -1, x.shape[-2], x.shape[-1])
-        group_sum = x.sum_to_size(x.shape[0], self.num_groups, 1, 1, 1).view(x.shape[0], self.num_groups)
+        group_sum = x.mean(dim=(2,3,4), dtype=torch.float32)
+        group_sum = group_sum * nelements_rank
         dist.all_reduce(group_sum)
         # shape: [bs, num_groups, 1, 1, 1]
-        E = (group_sum / nelements)[:, :, None, None, None]
-        
-        group_var_sum = ((x - E).pow_(2)).sum_to_size(x.shape[0], self.num_groups, 1, 1, 1).view(x.shape[0], self.num_groups)
+        E = (group_sum / nelements)[:, :, None, None, None].to(x.dtype)
+
+        group_var_sum = torch.empty((x.shape[0], self.num_groups), dtype=torch.float32, device=x.device)
+        torch.var(x, dim=(2,3,4), out=group_var_sum)
+        group_var_sum = group_var_sum * nelements_rank
         dist.all_reduce(group_var_sum)
         print(f"rank {dist.get_rank()}, group var sum after reduce: {group_var_sum}, group var sum shape: {group_var_sum.shape}")
-        # shape: [bs, num_groups]
-        var = (group_var_sum / nelements)[:, :, None, None, None]
+        # shape: [bs, num_groups, 1, 1, 1]
+        var = (group_var_sum / nelements)[:, :, None, None, None].to(x.dtype)
 
         x = (x - E) / torch.sqrt(var + self.eps)
         # print(f"rank {dist.get_rank()}, E in norm: {E}")
@@ -135,6 +141,7 @@ class PatchGroupNorm(nn.GroupNorm):
         # print(f"rank {dist.get_rank()}, hidden state in norm: {x}")
         x = x.view(x.shape[0], -1, x.shape[-2], x.shape[-1])
         x = x * self.weight[None, :, None, None] + self.bias[None, :, None, None]
+        # return x.to(xtype)
         return x
 
 class RMSNorm(nn.Module):

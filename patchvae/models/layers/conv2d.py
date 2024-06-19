@@ -203,14 +203,4 @@ class PatchConv2d(nn.Conv2d):
                     conv_res = F.conv2d(F.pad(input, padding, "constant", 0.0),
                                     weight, bias, self.stride,
                                     _pair(0), self.dilation, self.groups)
-            #     # print(f"rank: {rank}, output: ")
-            #     # print(conv_res)
-            #     conv_res = F.conv2d(input, weight, bias, self.stride,
-            #                     self.padding, self.dilation, self.groups)
-
-            # # print(rank, conv_res.shape, flush=True)
-            # if halo_width[1] == 0:
-            #     conv_res = conv_res[:, :, halo_width[0]:, :].contiguous()
-            # else:
-            #     conv_res = conv_res[:, :, halo_width[0]:-halo_width[1], :].contiguous()
             return conv_res
