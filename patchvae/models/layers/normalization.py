@@ -118,21 +118,21 @@ class PatchGroupNorm(nn.GroupNorm):
         nelements = channels_per_group * height * x.shape[-1]
        
         x = x.view(x.shape[0], self.num_groups, -1, x.shape[-2], x.shape[-1])
-        partial_sum = x.sum_to_size(x.shape[0], self.num_groups, 1, 1, 1)
-        partial_sum_list = [torch.empty([x.shape[0], self.num_groups], dtype=x.dtype, device=x.device) for _ in range(world_size)]
-        dist.all_gather(partial_sum_list, partial_sum)
-        group_sum = torch.stack(partial_sum_list, dim = 0).sum(dim=0)
-        # shape: [bs, num_groups]
-        E = group_sum / nelements
+        group_sum = x.sum_to_size(x.shape[0], self.num_groups, 1, 1, 1).view(x.shape[0], self.num_groups)
+        dist.all_reduce(group_sum)
+        # shape: [bs, num_groups, 1, 1, 1]
+        E = (group_sum / nelements)[:, :, None, None, None]
         
-        partial_var_sum = ((x - E[:, :, None, None, None]) ** 2).sum_to_size(x.shape[0], self.num_groups, 1, 1, 1)
-        partial_var_sum_list = [torch.empty([x.shape[0], self.num_groups], dtype=x.dtype, device=x.device) for _ in range(world_size)]
-        dist.all_gather(partial_var_sum_list, partial_var_sum)
-        group_var_sum = torch.stack(partial_var_sum_list, dim=0).sum(dim=0)
+        group_var_sum = ((x - E).pow_(2)).sum_to_size(x.shape[0], self.num_groups, 1, 1, 1).view(x.shape[0], self.num_groups)
+        dist.all_reduce(group_var_sum)
+        print(f"rank {dist.get_rank()}, group var sum after reduce: {group_var_sum}, group var sum shape: {group_var_sum.shape}")
         # shape: [bs, num_groups]
-        var = group_var_sum / nelements
+        var = (group_var_sum / nelements)[:, :, None, None, None]
 
-        x = (x - E[:, :, None, None, None]) / torch.sqrt(var + self.eps)[:, :, None, None, None]
+        x = (x - E) / torch.sqrt(var + self.eps)
+        # print(f"rank {dist.get_rank()}, E in norm: {E}")
+        # print(f"rank {dist.get_rank()}, var in norm: {var}, var shape: {var.shape}")
+        # print(f"rank {dist.get_rank()}, hidden state in norm: {x}")
         x = x.view(x.shape[0], -1, x.shape[-2], x.shape[-1])
         x = x * self.weight[None, :, None, None] + self.bias[None, :, None, None]
         return x

@@ -30,16 +30,22 @@ def main():
         default=1024,
         help="The width of image",
     )
+    parser.add_argument(
+        "--channels",
+        type=int,
+        default=512,
+        help="The width of image",
+    )
     args = parser.parse_args() 
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     torch.device('cuda', rank)
 
-    norm = GroupNorm(num_groups=2, num_channels=2).to(f"cuda:{rank}")
+    norm = GroupNorm(num_groups=32, num_channels=args.channels, eps=1e-6, affine=True).to(f"cuda:{rank}")
     patch_norm = GroupNormAdapter(norm).to(f"cuda:{rank}")
 
-    hidden_state = torch.randn(1, 2, args.height, args.width, device=f"cuda:{rank}")
+    hidden_state = torch.randn(1, args.channels, args.height, args.width, device=f"cuda:{rank}")
 
     result = norm(hidden_state)
     # if rank == 0:

@@ -1,5 +1,6 @@
 from patchvae.models.layers.conv2d import PatchConv2d
 from patchvae.modules.patch_utils import Patchify, DePatchify
+from patchvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
 
 import torch
 import random
@@ -21,36 +22,6 @@ class Conv2dModules(nn.Module):
         for conv in self.convs:
             x = conv(x)
         return x
-
-class PatchConv2dModules(nn.Module):
-    def __init__(self, convs: nn.ModuleDict):
-        super().__init__()
-        self.patchify = Patchify()
-        self.patch_convs = nn.ModuleList()
-        for conv in convs:
-            patched_conv = PatchConv2d(
-                conv.in_channels,
-                conv.out_channels,
-                conv.kernel_size,
-                conv.stride,
-                conv.padding,
-                conv.dilation,
-                conv.groups,
-                conv.bias is not None,
-                conv.padding_mode,
-                conv.weight.device,
-                conv.weight.dtype
-            )
-            patched_conv.weight.data = conv.weight.data
-            patched_conv.bias.data = conv.bias.data
-            self.patch_convs.append(patched_conv)
-        self.depatchify = DePatchify()
-    
-    def forward(self, x):
-        x = self.patchify(x)
-        for patch_conv in self.patch_convs:
-            x = patch_conv(x)
-        return self.depatchify(x)
             
 
 def set_seed(seed: int = 42):
@@ -83,14 +54,17 @@ def main():
 
     in_channels = 64
     out_channels = 3
-    # for kernel_size in range(3,4):
-    #     for stride in range(1,2):
-    #         for padding in range(1,2):
-    for kernel_size in range(3,10):
-        for stride in range(1,kernel_size+1):
-            for padding in range(1,kernel_size):
+    for kernel_size in range(3,4):
+        for stride in range(1,2):
+            for padding in range(1,2):
+    # for kernel_size in range(3,10):
+    #     for stride in range(1,kernel_size+1):
+    #         for padding in range(1,kernel_size):
                 convs = Conv2dModules(in_channels, out_channels, kernel_size, stride, padding).to(f"cuda:{rank}")
-                patch_convs = PatchConv2dModules(convs.convs).to(f"cuda:{rank}")
+                patch_convs = nn.ModuleList()
+                for conv in convs.convs:
+                    patch_convs.append(Conv2dAdapter(conv))
+                patch_convs = patch_convs.to(f"cuda:{rank}")
 
                 hidden_state = torch.randn(1, 64, args.height, args.width, device=f"cuda:{rank}")
                 result = convs(hidden_state)
@@ -98,8 +72,13 @@ def main():
                 
                 if rank == 0: 
                     print(kernel_size, stride, padding, "start", flush=True)
+                patch = Patchify()
+                depatch = DePatchify()
 
-                ppresult = patch_convs(hidden_state.clone())
+                patch_hidden_state = patch(hidden_state)
+                for conv in patch_convs:
+                    patch_hidden_state = conv(patch_hidden_state)
+                ppresult = depatch(patch_hidden_state)
 
 
 
@@ -110,15 +89,15 @@ def main():
 
                     # print(result.shape)
                     # print(ppresult.shape)
-                    flag = 1
-                    for i in range(out_channels):
-                        for j in range(max_height):
-                            for k in range(max_height):
-                                if (result[0, i, j, k] - ppresult[0, i, j, k]) > 1e-3:
-                                    flag = 0
+                    # flag = 1
+                    # for i in range(out_channels):
+                    #     for j in range(max_height):
+                    #         for k in range(max_height):
+                    #             if (result[0, i, j, k] - ppresult[0, i, j, k]) > 1e-3:
+                    #                 flag = 0
                                     # print(f"result: {result[0, i, j, k]}, ppresult: {ppresult[0, i, j, k]}")
                                     # print(f"i: {i}, j: {j}, k: {k}\n")
-                    if flag == 0:
+                    if not torch.allclose(result, ppresult, atol=1e-6):
                         print("in kernel size: ", kernel_size, "stride: ", stride, "padding: ", padding, flush=True)
                         print("two hidden states are not equal\n", flush=True)
                     else:

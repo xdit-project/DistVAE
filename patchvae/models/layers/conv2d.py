@@ -152,7 +152,7 @@ class PatchConv2d(nn.Conv2d):
                 # recv from prev
                 assert patch_height_index[rank] - halo_width[0] >= patch_height_index[rank-1], \
                     "width of top halo region is larger than the height of input tensor of last rank"
-                top_halo_recv = torch.empty([bs, channels, halo_width[0], w], device=f"cuda:{rank}")
+                top_halo_recv = torch.empty([bs, channels, halo_width[0], w], dtype=input.dtype, device=f"cuda:{rank}")
                 dist.recv(top_halo_recv, rank - 1)
 
         # down to up
@@ -165,7 +165,7 @@ class PatchConv2d(nn.Conv2d):
                 # recv from next
                 assert patch_height_index[rank+1] + halo_width[1] < patch_height_index[rank+2], \
                     "width of bottom halo region is larger than the height of input tensor of next rank"
-                bottom_halo_recv = torch.empty([bs, channels, halo_width[1], w], device=f"cuda:{rank}")
+                bottom_halo_recv = torch.empty([bs, channels, halo_width[1], w], dtype=input.dtype, device=f"cuda:{rank}")
                 dist.recv(bottom_halo_recv, rank + 1)
         
         # Remove redundancy at the top of the input
@@ -191,9 +191,18 @@ class PatchConv2d(nn.Conv2d):
                                 weight, bias, self.stride,
                                 _pair(0), self.dilation, self.groups)
             else:
-                conv_res = F.conv2d(F.pad(input, padding, "constant", 0.0),
-                                weight, bias, self.stride,
-                                _pair(0), self.dilation, self.groups)
+                if self.stride[0] == 1 and self.padding[0] == 1 and self.kernel_size[0] == 3:
+                    conv_res = F.conv2d(input, weight, bias, self.stride,
+                                self.padding, self.dilation, self.groups)
+                    if halo_width[1] == 0:
+                        conv_res = conv_res[:, :, halo_width[0]:, :].contiguous()
+                    else:
+                        conv_res = conv_res[:, :, halo_width[0]:-halo_width[1], :]
+                    # print(rank, conv_res.shape, flush=True)
+                else:
+                    conv_res = F.conv2d(F.pad(input, padding, "constant", 0.0),
+                                    weight, bias, self.stride,
+                                    _pair(0), self.dilation, self.groups)
             #     # print(f"rank: {rank}, output: ")
             #     # print(conv_res)
             #     conv_res = F.conv2d(input, weight, bias, self.stride,
@@ -204,5 +213,4 @@ class PatchConv2d(nn.Conv2d):
             #     conv_res = conv_res[:, :, halo_width[0]:, :].contiguous()
             # else:
             #     conv_res = conv_res[:, :, halo_width[0]:-halo_width[1], :].contiguous()
-            # print(rank, conv_res.shape, flush=True)
             return conv_res
