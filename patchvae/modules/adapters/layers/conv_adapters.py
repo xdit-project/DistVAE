@@ -5,6 +5,8 @@ import torch.nn as nn
 class Conv2dAdapter(nn.Module):
     def __init__(self, conv2d: nn.Conv2d):
         super().__init__()
+        for i in conv2d.dilation:
+            assert i == 1, "dilation is not supported in Conv2dAdapter"
         self.conv2d = PatchConv2d(
             in_channels=conv2d.in_channels,
             out_channels=conv2d.out_channels,

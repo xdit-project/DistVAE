@@ -26,7 +26,11 @@ class PatchConv2d(nn.Conv2d):
         dtype=None
     ) -> None:
 
-        assert dilation != 1, "dilation is not supported in PatchConv2d"
+        if isinstance(dilation, int):
+            assert dilation == 1, "dilation is not supported in PatchConv2d"
+        else:
+            for i in dilation:
+                assert i == 1, "dilation is not supported in PatchConv2d"
         super().__init__(
             in_channels, out_channels, kernel_size, stride, padding, dilation, 
             groups, bias, padding_mode, device, dtype)

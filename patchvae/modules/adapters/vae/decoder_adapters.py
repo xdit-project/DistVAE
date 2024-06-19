@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 from patchvae.models.vae import PatchDecoder
 from patchvae.modules.adapters.unets.unet_2d_blocks_adapters import UpDecoderBlock2DAdapter
+from patchvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
+from patchvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
 
 from diffusers.models.autoencoders.vae import Decoder
 from diffusers.models.unets.unet_2d_blocks import UpDecoderBlock2D
@@ -21,9 +23,9 @@ class DecoderAdapter(nn.Module):
         self.decoder.up_blocks = nn.ModuleList([
             UpDecoderBlock2DAdapter(up_block) for up_block in decoder.up_blocks
         ])
-        self.decoder.conv_norm_out = decoder.conv_norm_out
+        self.decoder.conv_norm_out = GroupNormAdapter(decoder.conv_norm_out)
         self.decoder.conv_act = decoder.conv_act
-        self.decoder.conv_out = decoder.conv_out
+        self.decoder.conv_out = Conv2dAdapter(decoder.conv_out)
 
 
     def forward(

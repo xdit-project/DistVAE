@@ -108,11 +108,9 @@ class PatchGroupNorm(nn.GroupNorm):
                          affine=affine, device=device, dtype=dtype)
 
     def forward(self, x: Tensor) -> Tensor:
-        world_size = dist.get_world_size()
         # get height
-        height_list = [torch.empty([1], dtype=torch.int64, device=x.device) for _ in range(world_size)]
-        dist.all_gather(height_list, torch.tensor([x.shape[-2]], dtype=torch.int64, device=x.device))
-        height = torch.tensor(height_list).sum()
+        height = torch.tensor(x.shape[-2], dtype=torch.int64, device=x.device)
+        dist.all_reduce(height)
 
         channels_per_group = x.shape[1] // self.num_groups
         nelements_rank = channels_per_group * x.shape[-2] * x.shape[-1]
