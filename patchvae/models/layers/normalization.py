@@ -108,8 +108,6 @@ class PatchGroupNorm(nn.GroupNorm):
                          affine=affine, device=device, dtype=dtype)
 
     def forward(self, x: Tensor) -> Tensor:
-        # xtype = x.dtype
-        # x.to(torch.float32)
         world_size = dist.get_world_size()
         # get height
         height_list = [torch.empty([1], dtype=torch.int64, device=x.device) for _ in range(world_size)]
@@ -131,17 +129,12 @@ class PatchGroupNorm(nn.GroupNorm):
         torch.var(x, dim=(2,3,4), out=group_var_sum)
         group_var_sum = group_var_sum * nelements_rank
         dist.all_reduce(group_var_sum)
-        print(f"rank {dist.get_rank()}, group var sum after reduce: {group_var_sum}, group var sum shape: {group_var_sum.shape}")
         # shape: [bs, num_groups, 1, 1, 1]
         var = (group_var_sum / nelements)[:, :, None, None, None].to(x.dtype)
 
         x = (x - E) / torch.sqrt(var + self.eps)
-        # print(f"rank {dist.get_rank()}, E in norm: {E}")
-        # print(f"rank {dist.get_rank()}, var in norm: {var}, var shape: {var.shape}")
-        # print(f"rank {dist.get_rank()}, hidden state in norm: {x}")
         x = x.view(x.shape[0], -1, x.shape[-2], x.shape[-1])
         x = x * self.weight[None, :, None, None] + self.bias[None, :, None, None]
-        # return x.to(xtype)
         return x
 
 class RMSNorm(nn.Module):

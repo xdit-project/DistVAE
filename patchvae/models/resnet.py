@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+import torch.distributed
 import torch.nn as nn
 
 from diffusers.utils import deprecate 

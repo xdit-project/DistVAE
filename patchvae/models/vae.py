@@ -16,6 +16,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed
 import torch.nn as nn
 
 from diffusers.utils import BaseOutput, is_torch_version
@@ -220,7 +221,7 @@ class PatchDecoder(nn.Module):
         norm_type: str = "group",  # group, spatial
         mid_block_add_attention=True,
     ):
-        assert norm_type is "group", "Only group normalization is supported in PatchDecoder. Please use Decoder instead."
+        assert norm_type == "group", "Only group normalization is supported in PatchDecoder. Please use Decoder instead."
         super().__init__()
         for up_block in up_block_types:
             assert up_block in ["UpDecoderBlock2D"], "Only UpDecoderBlock2D is supported in PatchDecoder. Please use Decoder instead."
