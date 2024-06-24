@@ -215,6 +215,7 @@ class PatchResnetBlock2D(nn.Module):
         down: bool = False,
         conv_shortcut_bias: bool = True,
         conv_2d_out_channels: Optional[int] = None,
+        conv_block_size = 0,
     ):
         assert temb_channels is None, "temb_channels is not supported currently."
         assert up is False, "Upsampling is not supported currently."
@@ -249,7 +250,7 @@ class PatchResnetBlock2D(nn.Module):
 
         self.norm1 = GroupNormAdapter(torch.nn.GroupNorm(num_groups=groups, num_channels=in_channels, eps=eps, affine=True))
 
-        self.conv1 = Conv2dAdapter(conv_cls(in_channels, out_channels, kernel_size=3, stride=1, padding=1))
+        self.conv1 = Conv2dAdapter(conv_cls(in_channels, out_channels, kernel_size=3, stride=1, padding=1), block_size=conv_block_size)
 
         #TODO: Add support for temb_channels
         assert temb_channels is None, "temb_channels is not supported currently."
@@ -268,7 +269,7 @@ class PatchResnetBlock2D(nn.Module):
 
         self.dropout = torch.nn.Dropout(dropout)
         conv_2d_out_channels = conv_2d_out_channels or out_channels
-        self.conv2 = Conv2dAdapter(conv_cls(out_channels, conv_2d_out_channels, kernel_size=3, stride=1, padding=1))
+        self.conv2 = Conv2dAdapter(conv_cls(out_channels, conv_2d_out_channels, kernel_size=3, stride=1, padding=1), block_size=conv_block_size)
 
         self.nonlinearity = get_activation(non_linearity)
 
@@ -298,14 +299,17 @@ class PatchResnetBlock2D(nn.Module):
 
         self.conv_shortcut = None
         if self.use_in_shortcut:
-            self.conv_shortcut = Conv2dAdapter(conv_cls(
-                in_channels,
-                conv_2d_out_channels,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-                bias=conv_shortcut_bias,
-            ))
+            self.conv_shortcut = Conv2dAdapter(
+                conv_cls(
+                    in_channels,
+                    conv_2d_out_channels,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    bias=conv_shortcut_bias,
+                ),
+                block_size=conv_block_size
+            )
 
     def forward(self, input_tensor: torch.FloatTensor, temb: torch.FloatTensor, *args, **kwargs) -> torch.FloatTensor:
         #TODO: Add support for temb

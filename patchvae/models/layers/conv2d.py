@@ -23,7 +23,8 @@ class PatchConv2d(nn.Conv2d):
         bias: bool = True,
         padding_mode: str = 'zeros',  # TODO: refine this type
         device=None,
-        dtype=None
+        dtype=None,
+        block_size = 0,
     ) -> None:
 
         if isinstance(dilation, int):
@@ -31,6 +32,7 @@ class PatchConv2d(nn.Conv2d):
         else:
             for i in dilation:
                 assert i == 1, "dilation is not supported in PatchConv2d"
+        self.block_size = block_size
         super().__init__(
             in_channels, out_channels, kernel_size, stride, padding, dilation, 
             groups, bias, padding_mode, device, dtype)
@@ -188,23 +190,96 @@ class PatchConv2d(nn.Conv2d):
                 to_prev.wait()
 
         # 3. do convolution and postprocess
-            conv_res: Tensor 
+            conv_res: Tensor
             padding = self._adjust_padding_for_patch(self._reversed_padding_repeated_twice, rank=rank, world_size=world_size)
-            if self.padding_mode != 'zeros':
-                conv_res = F.conv2d(F.pad(input, padding, mode=self.padding_mode),
-                                weight, bias, self.stride,
-                                _pair(0), self.dilation, self.groups)
-            else:
-                if self.stride[0] == 1 and self.padding[0] == 1 and self.kernel_size[0] == 3:
-                    conv_res = F.conv2d(input, weight, bias, self.stride,
-                                self.padding, self.dilation, self.groups)
-                    if halo_width[1] == 0:
-                        conv_res = conv_res[:, :, halo_width[0]:, :].contiguous()
-                    else:
-                        conv_res = conv_res[:, :, halo_width[0]:-halo_width[1], :]
-                    # print(rank, conv_res.shape, flush=True)
-                else:
-                    conv_res = F.conv2d(F.pad(input, padding, "constant", 0.0),
+            bs, channels, h, w = input.shape
+            if self.block_size == 0 or (h <= self.block_size and w <= self.block_size):
+                if self.padding_mode != 'zeros':
+                    conv_res = F.conv2d(F.pad(input, padding, mode=self.padding_mode),
                                     weight, bias, self.stride,
                                     _pair(0), self.dilation, self.groups)
-            return conv_res
+                else:
+                    if self.stride[0] == 1 and self.padding[0] == 1 and self.kernel_size[0] == 3:
+                        conv_res = F.conv2d(input, weight, bias, self.stride,
+                                    self.padding, self.dilation, self.groups)
+                        if halo_width[1] == 0:
+                            conv_res = conv_res[:, :, halo_width[0]:, :].contiguous()
+                        else:
+                            conv_res = conv_res[:, :, halo_width[0]:-halo_width[1], :]
+                        # print(rank, conv_res.shape, flush=True)
+                    else:
+                        conv_res = F.conv2d(F.pad(input, padding, "constant", 0.0),
+                                        weight, bias, self.stride,
+                                        _pair(0), self.dilation, self.groups)
+                return conv_res
+
+            else:
+                if self.padding_mode != "zeros":
+                    input = F.pad(input, padding, mode=self.padding_mode)
+                elif self.padding != 0:
+                    input = F.pad(input, padding, mode="constant")
+
+                _, _, h, w = input.shape
+                num_chunks_in_h = (h + self.block_size - 1) // self.block_size
+                num_chunks_in_w = (w + self.block_size - 1) // self.block_size
+                unit_chunk_size_h = h // num_chunks_in_h
+                unit_chunk_size_w = w // num_chunks_in_w
+                if isinstance(self.kernel_size, int):
+                    kernel_size_h, kernel_size_w = self.kernel_size, self.kernel_size
+                elif isinstance(self.kernel_size, tuple):
+                    kernel_size_h, kernel_size_w = self.kernel_size
+                else:
+                    raise ValueError(
+                        f"kernel_size should be int or tuple, type:{type(self.kernel_size)}"
+                    )
+
+                if isinstance(self.stride, int):
+                    stride_h, stride_w = self.stride, self.stride
+                elif isinstance(self.stride, tuple):
+                    stride_h, stride_w = self.stride
+                else:
+                    raise ValueError(
+                        f"stride should be int or tuple, type: {type(self.stride)}"
+                    )
+
+                def correct_end(end, kernel_size, stride):
+                    return ((end + stride - 1) // stride - 1) * stride + kernel_size
+
+                def correct_start(start, stride):
+                    return ((start + stride - 1) // stride) * stride
+
+                outputs = []
+                for idx_h in range(num_chunks_in_h):
+                    inner_output = []
+                    for idx_w in range(num_chunks_in_w):
+                        start_w = idx_w * unit_chunk_size_w
+                        start_h = idx_h * unit_chunk_size_h
+                        end_w = (idx_w + 1) * unit_chunk_size_w
+                        end_h = (idx_h + 1) * unit_chunk_size_h
+                        if idx_w + 1 < num_chunks_in_w:
+                            end_w = correct_end(end_w, kernel_size_w, stride_w)
+                        else:
+                            end_w = w
+                        if idx_h + 1 < num_chunks_in_h:
+                            end_h = correct_end(end_h, kernel_size_h, stride_h)
+                        else:
+                            end_h = h
+
+                        if idx_w > 0:
+                            start_w = correct_start(start_w, stride_w)
+                        if idx_h > 0:
+                            start_h = correct_start(start_h, stride_h)
+
+                        inner_output.append(
+                            F.conv2d(
+                                input[:, :, start_h:end_h, start_w:end_w],
+                                weight,
+                                bias,
+                                self.stride,
+                                0,
+                                self.dilation,
+                                self.groups,
+                            )
+                        )
+                    outputs.append(torch.cat(inner_output, dim=-1))
+                return torch.cat(outputs, dim=-2)

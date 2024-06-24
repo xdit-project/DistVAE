@@ -15,7 +15,13 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 
 class DecoderAdapter(nn.Module):
-    def __init__(self, decoder: Decoder, use_profiler: bool = False):
+    def __init__(
+        self, 
+        decoder: Decoder, 
+        *,
+        use_profiler: bool = False,
+        conv_block_size = 0,
+    ):
         super().__init__()
         assert isinstance(decoder.conv_norm_out, nn.GroupNorm), "DecoderAdapter dose not support normalization method except GroupNorm"
         for up_block in decoder.up_blocks:
@@ -25,11 +31,11 @@ class DecoderAdapter(nn.Module):
         self.decoder.conv_in = decoder.conv_in
         self.decoder.mid_block = decoder.mid_block
         self.decoder.up_blocks = nn.ModuleList([
-            UpDecoderBlock2DAdapter(up_block) for up_block in decoder.up_blocks
+            UpDecoderBlock2DAdapter(up_block, conv_block_size=conv_block_size) for up_block in decoder.up_blocks
         ])
         self.decoder.conv_norm_out = GroupNormAdapter(decoder.conv_norm_out)
         self.decoder.conv_act = decoder.conv_act
-        self.decoder.conv_out = Conv2dAdapter(decoder.conv_out)
+        self.decoder.conv_out = Conv2dAdapter(decoder.conv_out, block_size=conv_block_size)
         self.use_profiler = use_profiler
 
 

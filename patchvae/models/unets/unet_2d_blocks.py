@@ -83,6 +83,7 @@ def get_up_block(
     attention_head_dim: Optional[int] = None,
     upsample_type: Optional[str] = None,
     dropout: float = 0.0,
+    conv_block_size = 0,
 ) -> nn.Module:
     # If attn head dim is not defined, we default it to the number of heads
     if attention_head_dim is None:
@@ -235,6 +236,7 @@ def get_up_block(
             resnet_groups=resnet_groups,
             resnet_time_scale_shift=resnet_time_scale_shift,
             temb_channels=temb_channels,
+            conv_block_size=conv_block_size,
         )
     elif up_block_type == "AttnUpDecoderBlock2D":
         return AttnUpDecoderBlock2D(
@@ -298,6 +300,7 @@ class PatchUpDecoderBlock2D(UpDecoderBlock2D):
         output_scale_factor: float = 1.0,
         add_upsample: bool = True,
         temb_channels: Optional[int] = None,
+        conv_block_size = 0,
     ):
         #TODO: Add support for spatial time embedding
         assert resnet_time_scale_shift != "spatial", "'spatial' has not been supported for UpDecoderBlock2D yet."
@@ -307,11 +310,11 @@ class PatchUpDecoderBlock2D(UpDecoderBlock2D):
                          add_upsample, temb_channels)
         patched_resnet = []
         for resnet in self.resnets:
-            patched_resnet.append(ResnetBlock2DAdapter(resnet))
+            patched_resnet.append(ResnetBlock2DAdapter(resnet, conv_block_size=conv_block_size))
         self.resnets = nn.ModuleList(patched_resnet)
 
         if add_upsample:
             patched_upsamplers = []
             for upsampler in self.upsamplers:
-                patched_upsamplers.append(Upsample2DAdapter(upsampler))
+                patched_upsamplers.append(Upsample2DAdapter(upsampler, conv_block_size=conv_block_size))
             self.upsamplers = nn.ModuleList(patched_upsamplers)

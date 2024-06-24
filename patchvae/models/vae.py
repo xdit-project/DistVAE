@@ -222,6 +222,7 @@ class PatchDecoder(nn.Module):
         act_fn: str = "silu",
         norm_type: str = "group",  # group, spatial
         mid_block_add_attention=True,
+        conv_block_size = 0,
     ):
         assert norm_type == "group", "Only group normalization is supported in PatchDecoder. Please use Decoder instead."
         super().__init__()
@@ -277,6 +278,7 @@ class PatchDecoder(nn.Module):
                 attention_head_dim=output_channel,
                 temb_channels=temb_channels,
                 resnet_time_scale_shift=norm_type,
+                conv_block_size=conv_block_size
             )
             self.up_blocks.append(up_block)
             prev_output_channel = output_channel
@@ -293,7 +295,7 @@ class PatchDecoder(nn.Module):
         else:
             self.conv_norm_out = PatchGroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=1e-6)
         self.conv_act = nn.SiLU()
-        self.conv_out = PatchConv2d(block_out_channels[0], out_channels, 3, padding=1)
+        self.conv_out = PatchConv2d(block_out_channels[0], out_channels, 3, padding=1, block_size=conv_block_size)
 
         self.gradient_checkpointing = False
 
