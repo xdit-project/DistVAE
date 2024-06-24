@@ -20,13 +20,13 @@ def main():
     parser.add_argument(
         "--height",
         type=int,
-        default=128,
+        default=1024,
         help="The height of image",
     )
     parser.add_argument(
         "--width",
         type=int,
-        default=128,
+        default=1024,
         help="The width of image",
     )
     args = parser.parse_args() 
@@ -47,33 +47,18 @@ def main():
     # transform vae.decoder to patchvae.decoder
     patch_decoder = DecoderAdapter(decoder, conv_block_size=1024).to(f"cuda:{rank}")
     # forward
-    # result = decoder(hidden_state)
-    torch.cuda.memory._record_memory_history(enabled=None)
-    # for width in [512, 1536, 1024, 2048, 2560, 3072, 4096]:
-    #     for height in [512, 1024, 1536, 2048, 2560, 3072, 4096]:
-    #         torch.cuda.reset_max_memory_allocated(device=f"cuda:{rank}")
-    #         hidden_state = torch.randn(1, 4, height // 8, width // 8, device=f"cuda:{rank}")
-    #         start_time = time.time()
-    #         patch_result = decoder(hidden_state)
-    #         end_time = time.time()
-    #         peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{rank}")
-    #         if rank == 0:
-    #             # assert torch.allclose(result, patch_result, atol=1e-2), "two hidden states are not equal"
-    #             print(f"VAE: resolution: {height}x{width}, time: {end_time - start_time} sec, peak memory: {peak_memory / 2 ** 30} GB")
+    hidden_state = torch.randn(1, 4, args.height // 8, args.width // 8, device=f"cuda:{rank}")
+    result = decoder(hidden_state)
 
-    # for width in range(1024, 8192, 1024):
-        # for height in range(width, 8192, 1024):
-    for width in range(8192, 8192 + 1024, 1024):
-        for height in range(width, 8192 + 1024, 1024):
-            torch.cuda.reset_max_memory_allocated(device=f"cuda:{rank}")
-            hidden_state = torch.randn(1, 4, height // 8, width // 8, device=f"cuda:{rank}")
-            start_time = time.time()
-            patch_result = patch_decoder(hidden_state)
-            end_time = time.time()
-            peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{rank}")
-            if rank == 0:
-                # assert torch.allclose(result, patch_result, atol=1e-2), "two hidden states are not equal"
-                print(f"PatchVAE: resolution: {height}x{width}, time: {end_time - start_time} sec, peak memory: {peak_memory / 2 ** 30} GB")
+    torch.cuda.memory._record_memory_history(enabled=None)
+    start_time = time.time()
+    patch_result = patch_decoder(hidden_state)
+    end_time = time.time()
+    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{rank}")
+    if rank == 0:
+        assert torch.allclose(result, patch_result, atol=1e-2), "two hidden states are not equal"
+        print(f"VAE: resolution: {args.height}x{args.width}, time: {end_time - start_time} sec, peak memory: {peak_memory / 2 ** 30} GB")
+
 
 if __name__ == "__main__":
     main()
