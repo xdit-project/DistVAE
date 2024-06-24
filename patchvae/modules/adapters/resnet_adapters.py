@@ -7,7 +7,12 @@ from patchvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from diffusers.models.resnet import ResnetBlock2D
 
 class ResnetBlock2DAdapter(nn.Module):
-    def __init__(self, resnet: ResnetBlock2D):
+    def __init__(
+        self, 
+        resnet: ResnetBlock2D, 
+        *, 
+        conv_block_size = 0,
+    ):
         super().__init__()
         assert resnet.time_emb_proj is None, "temb_channels is not supported in ResnetBlock2DAdapter currently"
         assert resnet.up is False, "up sample is not supported in ResnetBlock2DAdapter currently"
@@ -29,13 +34,13 @@ class ResnetBlock2DAdapter(nn.Module):
             down=resnet.down,
         )
         self.resnet.use_in_shortcut = resnet.use_in_shortcut
-        self.resnet.conv1 = Conv2dAdapter(resnet.conv1)
+        self.resnet.conv1 = Conv2dAdapter(resnet.conv1, block_size=conv_block_size)
         self.resnet.norm1 = GroupNormAdapter(resnet.norm1)
-        self.resnet.conv2 = Conv2dAdapter(resnet.conv2)
+        self.resnet.conv2 = Conv2dAdapter(resnet.conv2, block_size=conv_block_size)
         self.resnet.norm2 = GroupNormAdapter(resnet.norm2)
         self.resnet.dropout = resnet.dropout
         self.resnet.nonlinearity = resnet.nonlinearity
-        self.resnet.conv_shortcut = Conv2dAdapter(resnet.conv_shortcut) if resnet.conv_shortcut is not None else None
+        self.resnet.conv_shortcut = Conv2dAdapter(resnet.conv_shortcut, block_size=conv_block_size) if resnet.conv_shortcut is not None else None
         
 
     def forward(self, x, temb: torch.FloatTensor = None, *args, **kwargs):

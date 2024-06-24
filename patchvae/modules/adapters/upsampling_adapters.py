@@ -8,7 +8,12 @@ from patchvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
 from diffusers.models.upsampling import Upsample2D
 
 class Upsample2DAdapter(nn.Module):
-    def __init__(self, upsample2d: Upsample2D):
+    def __init__(
+        self, 
+        upsample2d: Upsample2D,
+        *,
+        conv_block_size = 0,
+    ):
         super().__init__()
         assert upsample2d.norm is None, "upsample2dBlock2DAdapter dose not support normalization"
         if upsample2d.name == "conv":
@@ -26,9 +31,9 @@ class Upsample2DAdapter(nn.Module):
             interpolate=upsample2d.interpolate
         )
         if upsample2d.name == "conv":
-            self.upsample2d.conv = Conv2dAdapter(upsample2d.conv)
+            self.upsample2d.conv = Conv2dAdapter(upsample2d.conv, block_size=conv_block_size)
         else:
-            self.upsample2d.Conv2d_0 = Conv2dAdapter(upsample2d.Conv2d_0)
+            self.upsample2d.Conv2d_0 = Conv2dAdapter(upsample2d.Conv2d_0, block_size=conv_block_size)
         
 
     def forward(
