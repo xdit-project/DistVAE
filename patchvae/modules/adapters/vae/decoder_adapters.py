@@ -39,8 +39,9 @@ class DecoderAdapter(nn.Module):
         latent_embeds: Optional[torch.FloatTensor] = None,
     ):
         rank = torch.distributed.get_rank()
+        start_time = time.time()
+        elapsed_time = 0
         if self.use_profiler:
-            start_time = time.time()
             torch.cuda.memory._record_memory_history(enabled=None)
             with profile(
                 activities=[
@@ -55,14 +56,14 @@ class DecoderAdapter(nn.Module):
                 record_shapes=True,
             ) as prof:
                 output = self.decoder(sample, latent_embeds)
-
-            end_time = time.time()
-            elapsed_time = end_time - start_time
-            peak_memory = torch.cuda.max_memory_allocated(device="cuda")
-
-            if rank == 0:
-                print(f"Patch vae profiler: [elapsed_time: {elapsed_time:.2f} sec, peak_memory: {peak_memory/1e9} GB]")
-                prof.export_memory_timeline(f"patch_vae_profiler_mem_{rank}.html")
-            return output
+            prof.export_memory_timeline(f"patch_vae_profiler_mem_{rank}.html")
         else:
-            return self.decoder(sample, latent_embeds)
+            output =  self.decoder(sample, latent_embeds)
+
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        peak_memory = torch.cuda.max_memory_allocated(device="cuda")
+
+        if rank == 0:
+            print(f"Patch vae: [elapsed_time: {elapsed_time:.2f} sec, peak_memory: {peak_memory/1e9} GB]")
+        return output
