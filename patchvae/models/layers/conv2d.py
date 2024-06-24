@@ -24,7 +24,7 @@ class PatchConv2d(nn.Conv2d):
         padding_mode: str = 'zeros',  # TODO: refine this type
         device=None,
         dtype=None,
-        block_size = 0,
+        block_size: Union[int, Tuple[int, int]] = 0
     ) -> None:
 
         if isinstance(dilation, int):
@@ -213,6 +213,8 @@ class PatchConv2d(nn.Conv2d):
                                         _pair(0), self.dilation, self.groups)
                 return conv_res
 
+        # 3.1. if block_size is not 0, split patch to block and do convolution to 
+                # reduce memory spike
             else:
                 if self.padding_mode != "zeros":
                     input = F.pad(input, padding, mode=self.padding_mode)
@@ -220,8 +222,14 @@ class PatchConv2d(nn.Conv2d):
                     input = F.pad(input, padding, mode="constant")
 
                 _, _, h, w = input.shape
-                num_chunks_in_h = (h + self.block_size - 1) // self.block_size
-                num_chunks_in_w = (w + self.block_size - 1) // self.block_size
+                num_chunks_in_h = 0
+                num_chunks_in_w = 0
+                if isinstance(self.block_size, int):
+                    num_chunks_in_h = (h + self.block_size - 1) // self.block_size
+                    num_chunks_in_w = (w + self.block_size - 1) // self.block_size
+                elif isinstance(self.block_size, tuple):
+                    num_chunks_in_h = (h + self.block_size[0] - 1) // self.block_size[0]
+                    num_chunks_in_w = (w + self.block_size[1] - 1) // self.block_size[1]
                 unit_chunk_size_h = h // num_chunks_in_h
                 unit_chunk_size_w = w // num_chunks_in_w
                 if isinstance(self.kernel_size, int):
