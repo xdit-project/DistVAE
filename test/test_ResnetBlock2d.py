@@ -1,5 +1,5 @@
-from patchvae.modules.patch_utils import Patchify, DePatchify
-from patchvae.modules.adapters.resnet_adapters import ResnetBlock2DAdapter
+from distvae.modules.patch_utils import Patchify, DePatchify
+from distvae.modules.adapters.resnet_adapters import ResnetBlock2DAdapter
 from torch.nn import GroupNorm
 
 from diffusers.models.resnet import ResnetBlock2D

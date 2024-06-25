@@ -1,4 +1,4 @@
-# PatchVAE: A patch parallelism VAE implement for high resolution generation
+# DistVAE: A patch parallelism distributed VAE implement for high resolution generation
 
 By providing a set of adapter interfaces, this project allows users to quickly convert vae-related implementations in the diffusers library into parallel versions on multiple gpu's, enabling non-intrusive parallelisation of the vae portion of an existing model, thus reducing the memory footprint of the image generation process, and avoiding vae-induced memory spikes.
 
@@ -17,7 +17,7 @@ As an example, we can transform an initialised vae decoder into a parallel versi
 
 ``` python
 from diffusers.models.autoencoders.vae import Decoder
-from patchvae.modules.adapters.vae.decoder_adapters import DecoderAdapter
+from distvae.modules.adapters.vae.decoder_adapters import DecoderAdapter
 
 import torch
 import random
@@ -44,7 +44,7 @@ def main():
         block_out_channels=(128, 256, 512, 512), layers_per_block=2,
         norm_num_groups=32, act_fn="silu",
     ).to(f"cuda:{rank}")
-    # transform vae.decoder to patchvae.decoder
+    # transform vae.decoder to distvae.decoder
     patch_decoder = DecoderAdapter(decoder).to(f"cuda:{rank}")
     # forward
     result = decoder(hidden_state)

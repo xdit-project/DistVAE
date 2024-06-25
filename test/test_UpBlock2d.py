@@ -1,5 +1,5 @@
-from patchvae.modules.adapters.unets.unet_2d_blocks_adapters import UpDecoderBlock2DAdapter, UpDecoderBlock2D
-from patchvae.modules.patch_utils import Patchify, DePatchify
+from distvae.modules.adapters.unets.unet_2d_blocks_adapters import UpDecoderBlock2DAdapter, UpDecoderBlock2D
+from distvae.modules.patch_utils import Patchify, DePatchify
 
 import torch
 import random

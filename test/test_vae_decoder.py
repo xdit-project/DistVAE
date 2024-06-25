@@ -1,5 +1,5 @@
 from diffusers.models.autoencoders.vae import Decoder
-from patchvae.modules.adapters.vae.decoder_adapters import DecoderAdapter
+from distvae.modules.adapters.vae.decoder_adapters import DecoderAdapter
 
 import time
 import torch
@@ -44,7 +44,7 @@ def main():
         norm_num_groups=32,
         act_fn="silu",
     ).to(f"cuda:{rank}")
-    # transform vae.decoder to patchvae.decoder
+    # transform vae.decoder to distvae.decoder
     patch_decoder = DecoderAdapter(decoder, conv_block_size=1024).to(f"cuda:{rank}")
     # forward
     hidden_state = torch.randn(1, 4, args.height // 8, args.width // 8, device=f"cuda:{rank}")

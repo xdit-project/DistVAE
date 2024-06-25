@@ -12,8 +12,8 @@ from diffusers.models.attention_processor import SpatialNorm
 from diffusers.models.downsampling import Downsample2D
 from diffusers.models.upsampling import Upsample2D
 
-from patchvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
-from patchvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
+from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
+from distvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
 
 # class ResnetBlockCondNorm2D(nn.Module):
 #     r"""

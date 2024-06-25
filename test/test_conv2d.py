@@ -1,6 +1,6 @@
-from patchvae.models.layers.conv2d import PatchConv2d
-from patchvae.modules.patch_utils import Patchify, DePatchify
-from patchvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
+from distvae.models.layers.conv2d import PatchConv2d
+from distvae.modules.patch_utils import Patchify, DePatchify
+from distvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
 
 import torch
 import random

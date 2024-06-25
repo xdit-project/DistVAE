@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
-from patchvae.models.resnet import PatchResnetBlock2D
-from patchvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
-from patchvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
+from distvae.models.resnet import PatchResnetBlock2D
+from distvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
+from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 
 from diffusers.models.resnet import ResnetBlock2D
 

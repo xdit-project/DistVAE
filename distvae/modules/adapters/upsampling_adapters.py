@@ -2,8 +2,8 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from patchvae.models.upsampling import PatchUpsample2D
-from patchvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
+from distvae.models.upsampling import PatchUpsample2D
+from distvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
 
 from diffusers.models.upsampling import Upsample2D
 

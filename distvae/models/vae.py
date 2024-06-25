@@ -28,12 +28,12 @@ from diffusers.models.unets.unet_2d_blocks import (
     UNetMidBlock2D,
     get_down_block
 )
-from patchvae.models.unets.unet_2d_blocks import (
+from distvae.models.unets.unet_2d_blocks import (
     get_up_block,
 )
-from patchvae.models.layers.conv2d import PatchConv2d
-from patchvae.models.layers.normalization import PatchGroupNorm
-from patchvae.modules.patch_utils import Patchify, DePatchify
+from distvae.models.layers.conv2d import PatchConv2d
+from distvae.models.layers.normalization import PatchGroupNorm
+from distvae.modules.patch_utils import Patchify, DePatchify
 
 
 @dataclass

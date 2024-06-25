@@ -1,5 +1,5 @@
-from patchvae.modules.adapters.upsampling_adapters import Upsample2DAdapter
-from patchvae.modules.patch_utils import Patchify, DePatchify
+from distvae.modules.adapters.upsampling_adapters import Upsample2DAdapter
+from distvae.modules.patch_utils import Patchify, DePatchify
 from diffusers.models.upsampling import Upsample2D
 
 import torch

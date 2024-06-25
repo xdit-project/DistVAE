@@ -2,10 +2,10 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from patchvae.modules.adapters.resnet_adapters import ResnetBlock2DAdapter
-from patchvae.modules.adapters.upsampling_adapters import Upsample2DAdapter
+from distvae.modules.adapters.resnet_adapters import ResnetBlock2DAdapter
+from distvae.modules.adapters.upsampling_adapters import Upsample2DAdapter
 
-from patchvae.models.unets.unet_2d_blocks import PatchUpDecoderBlock2D
+from distvae.models.unets.unet_2d_blocks import PatchUpDecoderBlock2D
 from diffusers.models.unets.unet_2d_blocks import UpDecoderBlock2D
 from diffusers.models.resnet import ResnetBlock2D
 from diffusers.models.upsampling import Upsample2D

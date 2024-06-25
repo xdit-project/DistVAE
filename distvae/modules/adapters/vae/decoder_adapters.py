@@ -3,10 +3,10 @@ import time
 
 import torch
 import torch.nn as nn
-from patchvae.models.vae import PatchDecoder
-from patchvae.modules.adapters.unets.unet_2d_blocks_adapters import UpDecoderBlock2DAdapter
-from patchvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
-from patchvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
+from distvae.models.vae import PatchDecoder
+from distvae.modules.adapters.unets.unet_2d_blocks_adapters import UpDecoderBlock2DAdapter
+from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
+from distvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
 
 from diffusers.models.autoencoders.vae import Decoder
 from diffusers.models.unets.unet_2d_blocks import UpDecoderBlock2D

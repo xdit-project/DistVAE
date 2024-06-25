@@ -1,4 +1,4 @@
-from patchvae.models.layers.conv2d import PatchConv2d
+from distvae.models.layers.conv2d import PatchConv2d
 
 import torch.nn as nn
 

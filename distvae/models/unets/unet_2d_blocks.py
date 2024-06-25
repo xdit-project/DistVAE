@@ -49,8 +49,8 @@ from diffusers.models.unets.unet_2d_blocks import (
     UpDecoderBlock2D
 )
 
-from patchvae.modules.adapters.resnet_adapters import ResnetBlock2DAdapter
-from patchvae.modules.adapters.upsampling_adapters import Upsample2DAdapter
+from distvae.modules.adapters.resnet_adapters import ResnetBlock2DAdapter
+from distvae.modules.adapters.upsampling_adapters import Upsample2DAdapter
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
