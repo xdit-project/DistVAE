@@ -1,3 +1,5 @@
 __pycache__/
 .vscode/
-PatchVAE.egg-info/
+dist/
+build/
+DistVAE.egg-info/
