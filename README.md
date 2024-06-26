@@ -5,7 +5,7 @@ By providing a set of adapter interfaces, this project allows users to quickly c
 ## Installation
 
 ``` bash
-python setup.py install
+pip install distvae
 ```
 
 ## Usage
