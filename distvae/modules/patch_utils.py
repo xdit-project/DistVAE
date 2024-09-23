@@ -34,7 +34,7 @@ class DePatchify(nn.Module):
         )
         patch_hidden_state_list = [
             torch.empty(
-                [1, patch_hidden_state.shape[1], patch_height_list[i].item(), patch_hidden_state.shape[-1]], 
+                [patch_hidden_state.shape[0], patch_hidden_state.shape[1], patch_height_list[i].item(), patch_hidden_state.shape[-1]], 
                 dtype=patch_hidden_state.dtype,
                 device=f"cuda:{self.rank}"
             ) for i in range(self.world_size)
