@@ -6,7 +6,6 @@ import torch.nn as nn
 
 from distvae.utils import DistributedEnv
 
-
 class WanAttentionBlockAdapter(torch.nn.Module):
     """Runs attention on the full sequence by gathering along the patch dim, then narrows back to the local patch.
 

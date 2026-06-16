@@ -1,7 +1,7 @@
 import torch.nn as nn
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanMidBlock
 
-from distvae.modules.adapters.layers.attn_adapters import WanAttentionBlockAdapter
+from distvae.models.layers.wan.ringattentionblock import WanRingAttentionBlock
 from distvae.modules.adapters.resnet_adapters import WanResidualBlockAdapter
 
 class WanMidBlockAdapter(nn.Module):
@@ -25,7 +25,7 @@ class WanMidBlockAdapter(nn.Module):
             ) for resnet in wan_mid_block.resnets
         ])
         self.mid_block.attentions = nn.ModuleList([
-            WanAttentionBlockAdapter(attn, patch_dim=patch_dim)
+            WanRingAttentionBlock(attn, patch_dim=patch_dim)
             for attn in wan_mid_block.attentions
         ])
 
