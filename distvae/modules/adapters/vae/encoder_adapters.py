@@ -21,6 +21,7 @@ from distvae.modules.adapters.downsampling_adapters import (
 )
 from distvae.modules.adapters.layers.attn_adapters import GatheredAttentionAdapter
 from distvae.modules.adapters.layers.conv_adapters import (
+    Conv2dAdapter,
     HunyuanVideo15CausalConv3dAdapter,
     HunyuanVideoCausalConv3dAdapter,
     LTX2VideoCausalConv3dAdapter,
@@ -39,9 +40,12 @@ from distvae.modules.adapters.resnet_adapters import (
     QwenImageResidualBlockAdapter,
     WanResidualBlockAdapter,
 )
+from distvae.modules.adapters.unets.unet_2d_blocks_adapters import DownEncoderBlock2DAdapter
 from distvae.modules.patch_utils import Patchify, DePatchify
 from distvae.utils import DistributedEnv
 
+from diffusers.models.autoencoders.vae import Encoder
+from diffusers.models.unets.unet_2d_blocks import DownEncoderBlock2D
 from diffusers.models.autoencoders.autoencoder_kl_wan import (
     WanAttentionBlock,
     WanResample,
@@ -55,6 +59,71 @@ QwenImageResidualBlock = block(QWEN_IMAGE, "QwenImageResidualBlock")
 HunyuanVideoDownBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoDownBlock3D")
 HunyuanVideo15DownBlock3D = block(HUNYUAN_VIDEO_15, "HunyuanVideo15DownBlock3D")
 LTX2VideoDownBlock3D = block(LTX2_VIDEO, "LTX2VideoDownBlock3D")
+
+
+class EncoderAdapter(nn.Module):
+    """Shards the 2D encoder AutoencoderKL and Flux.2 use, over its down blocks alone.
+
+    The mirror of the 2D decoder adapter, which splits after its mid block rather than before.
+    Here the split is undone before the mid block, so the attention in it and the GroupNorm after
+    it see the whole feature map and need no sharding of their own. What that costs is running the
+    narrowest part of the encoder on every rank, and what it buys is that the down blocks, which
+    carry the image at full size and are the reason to encode in parallel at all, are the part
+    that gets split.
+    """
+
+    def __init__(
+        self,
+        encoder: Encoder,
+        vae_group: ProcessGroup = None,
+        *,
+        vae_scale_factor: int = 8,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        if patch_dim != -2:
+            # The resnet adapter this reaches through splits H and says nothing about which axis.
+            raise ValueError(f"{adapter} only supports patch_dim H (-2).")
+        for down_block in encoder.down_blocks:
+            assert isinstance(down_block, DownEncoderBlock2D), (
+                f"{adapter} does not support down block except DownEncoderBlock2D"
+            )
+        # A band has to be a whole multiple of what the encoder narrows by, and here that can be
+        # counted rather than taken on trust: one halving per stage that carries a downsampler.
+        # A caller working from a config default rather than from the blocks would otherwise cut
+        # bands that a later stage halves into a row it does not own.
+        counted = 2 ** sum(
+            1 for down_block in encoder.down_blocks if down_block.downsamplers
+        )
+        if vae_scale_factor != counted:
+            raise ValueError(
+                f"{adapter} was told this encoder narrows by {vae_scale_factor}, but its "
+                f"down blocks narrow by {counted}."
+            )
+        DistributedEnv.initialize(vae_group)
+        self.patch_dim = patch_dim
+        DistributedEnv.set_patch_dim(patch_dim)
+        self.encoder = encoder
+        encoder.conv_in = Conv2dAdapter(encoder.conv_in, block_size=conv_block_size)
+        encoder.down_blocks = nn.ModuleList([
+            DownEncoderBlock2DAdapter(
+                down_block, conv_block_size=conv_block_size, patch_dim=patch_dim
+            )
+            for down_block in encoder.down_blocks
+        ])
+        self.patchify = Patchify(patch_dim=patch_dim, scale_factor=vae_scale_factor)
+        self.depatchify = DePatchify(patch_dim=patch_dim)
+        self.vae_group = vae_group
+
+    def forward(self, sample: torch.FloatTensor):
+        sample = self.encoder.conv_in(self.patchify(sample))
+        for down_block in self.encoder.down_blocks:
+            sample = down_block(sample)
+        sample = self.encoder.mid_block(self.depatchify(sample))
+        sample = self.encoder.conv_act(self.encoder.conv_norm_out(sample))
+        return self.encoder.conv_out(sample)
 
 
 def _gathered(attention: nn.Module, **options) -> nn.Module:
@@ -71,10 +140,9 @@ class _CausalEncoderAdapter(nn.Module):
 
     The mirror of _CausalDecoderAdapter, over the same skeleton read the other way: a causal
     convolution in, a run of down blocks, a mid block, a normalisation, a causal convolution
-    out. What differs is the arithmetic at the end. An encoder narrows what it is handed, so the
-    rows a rank owns are divided by the VAE's spatial ratio where a decoder multiplies them by
-    what it upsampled, and the input is padded up to a multiple of that ratio times the rank
-    count so the division lands whole.
+    out. What differs is what a band has to be a multiple of. An encoder narrows what it is
+    handed, so a band is cut in whole multiples of the VAE's spatial ratio and the latent rows it
+    produces are its own, where a decoder cuts latent rows and multiplies.
     """
 
     _label = "Encoder"

@@ -27,6 +27,7 @@ from distvae.modules.adapters.resnet_adapters import (
     WanResidualBlockAdapter,
 )
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanResample, WanResidualDownBlock
+from diffusers.models.downsampling import Downsample2D
 
 QwenImageResample = block(QWEN_IMAGE, "QwenImageResample")
 HunyuanVideoDownsampleCausal3D = block(HUNYUAN_VIDEO, "HunyuanVideoDownsampleCausal3D")
@@ -36,6 +37,97 @@ HunyuanVideo15DownBlock3D = block(HUNYUAN_VIDEO_15, "HunyuanVideo15DownBlock3D")
 LTX2VideoCausalConv3d = block(LTX2_VIDEO, "LTX2VideoCausalConv3d")
 LTX2VideoDownsampler3d = block(LTX2_VIDEO, "LTX2VideoDownsampler3d")
 LTX2VideoDownBlock3D = block(LTX2_VIDEO, "LTX2VideoDownBlock3D")
+
+
+def _zero_pad_strided_conv(conv, conv_block_size, patch_dim, use_uniform_patch):
+    """A sharded stand-in for a (0, 1, 0, 1) zero pad followed by a stride-2 convolution
+
+    The pair cannot be split as written, because a rank's bottom row is padding only if it is the
+    bottom row of the whole image. One module that pads the outside edges and exchanges halos on
+    the inside ones settles it. Named for Wan, whose resample was the first to need it, but the
+    shape is just as much the one diffusers' own Downsample2D takes when told to pad by hand.
+    """
+    padding = conv.padding
+    if (isinstance(padding, int) and padding != 0) or (
+        isinstance(padding, tuple) and sum(padding) != 0
+    ):
+        raise ValueError(f"Unsupported padding: {padding}")
+    sharded = WanZeroPadConv2d(
+        in_channels=conv.in_channels,
+        out_channels=conv.out_channels,
+        kernel_size=conv.kernel_size,
+        stride=conv.stride,
+        dilation=conv.dilation,
+        groups=conv.groups,
+        bias=conv.bias is not None,
+        device=conv.weight.device,
+        dtype=conv.weight.dtype,
+        reversed_zero_padding=(0, 1, 0, 1),
+        block_size=conv_block_size,
+        patch_dim=patch_dim,
+        use_uniform_patch=use_uniform_patch,
+    )
+    sharded.weight.data = conv.weight.data
+    if conv.bias is not None:
+        sharded.bias.data = conv.bias.data
+    return sharded
+
+
+class Downsample2DAdapter(nn.Module):
+    """Shards the 2D downsampler AutoencoderKL and Flux.2 use, of which the convolution is the
+    only part that reaches across the split
+
+    Told to pad by hand, as the encoders here tell it, it pads (0, 1, 0, 1) and then strides over
+    the result with no padding of its own, which is the pair replaced above. Because the pad is
+    written into the downsampler's own forward rather than the convolution, that case runs the
+    pieces here instead of delegating, so the pad is not applied twice. Told to pad inside the
+    convolution it is an ordinary strided one. Told not to convolve at all it averages each 2x2,
+    which reads one input position per output one so long as a rank holds whole pairs of rows, and
+    the bands Patchify cuts do. Its norm, where it has one, reduces over channels, so it is left
+    alone either way.
+    """
+
+    def __init__(
+        self,
+        downsampler: Downsample2D,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        assert isinstance(downsampler, Downsample2D), (
+            "Downsample2DAdapter does not support downsampler except Downsample2D"
+        )
+        self.downsampler = downsampler
+        self.pads_by_hand = downsampler.use_conv and downsampler.padding == 0
+        if not downsampler.use_conv:
+            return
+        conv = downsampler.conv
+        if self.pads_by_hand:
+            sharded = _zero_pad_strided_conv(
+                conv, conv_block_size, patch_dim, use_uniform_patch
+            )
+        else:
+            sharded = Conv2dAdapter(
+                conv,
+                block_size=conv_block_size,
+                patch_dim=patch_dim,
+                use_uniform_patch=use_uniform_patch,
+            )
+        downsampler.conv = sharded
+        # Some configurations name the same convolution twice. Both have to move, or the original
+        # stays alive holding a second copy of the weights.
+        if getattr(downsampler, "Conv2d_0", None) is conv:
+            downsampler.Conv2d_0 = sharded
+
+    def forward(self, hidden_states, *args, **kwargs):
+        if not self.pads_by_hand:
+            return self.downsampler(hidden_states, *args, **kwargs)
+        if self.downsampler.norm is not None:
+            hidden_states = self.downsampler.norm(
+                hidden_states.permute(0, 2, 3, 1)
+            ).permute(0, 3, 1, 2)
+        return self.downsampler.conv(hidden_states)
 
 
 class _CausalResampleDownAdapter(nn.Module):
@@ -87,31 +179,9 @@ class _CausalResampleDownAdapter(nn.Module):
                     f"{adapter} expects a zero pad and one convolution, got "
                     f"{[type(layer).__name__ for layer in layers]}"
                 )
-            conv = convs[0]
-            padding = conv.padding
-            if (isinstance(padding, int) and padding != 0) or (
-                isinstance(padding, tuple) and sum(padding) != 0
-            ):
-                raise ValueError(f"Unsupported padding: {padding}")
-            sharded = WanZeroPadConv2d(
-                in_channels=conv.in_channels,
-                out_channels=conv.out_channels,
-                kernel_size=conv.kernel_size,
-                stride=conv.stride,
-                dilation=conv.dilation,
-                groups=conv.groups,
-                bias=conv.bias is not None,
-                device=conv.weight.device,
-                dtype=conv.weight.dtype,
-                reversed_zero_padding=(0, 1, 0, 1),
-                block_size=conv_block_size,
-                patch_dim=patch_dim,
-                use_uniform_patch=use_uniform_patch,
+            resample.resample = _zero_pad_strided_conv(
+                convs[0], conv_block_size, patch_dim, use_uniform_patch
             )
-            sharded.weight.data = conv.weight.data
-            if conv.bias is not None:
-                sharded.bias.data = conv.bias.data
-            resample.resample = sharded
         elif isinstance(resample.resample, nn.Conv2d):
             resample.resample = Conv2dAdapter(
                 resample.resample,

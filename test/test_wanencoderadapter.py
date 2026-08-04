@@ -103,7 +103,7 @@ def test_an_image_taller_than_it_is_wide_still_encodes(master_port, seed=42):
 
 @pytest.mark.gloo
 def test_rows_that_do_not_divide_by_the_rank_count_still_encode(master_port, seed=42):
-    # 80 rows over 3 ranks is where the padding Patchify adds and the crop that undoes it matter.
+    # 80 rows at a ratio of 8 is ten bands, which over 3 ranks leaves them different sizes.
     run_distributed(worker, 3, (4, 80, 64, False, 0, seed), master_port)
 
 

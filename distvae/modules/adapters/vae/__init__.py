@@ -10,6 +10,7 @@ from .decoder_adapters import (
 
 # Export encoder adapters
 from .encoder_adapters import (
+    EncoderAdapter,
     HunyuanVideo15EncoderAdapter,
     HunyuanVideoEncoderAdapter,
     LTX2VideoEncoderAdapter,
@@ -24,6 +25,7 @@ __all__ = [
     "LTX2VideoDecoderAdapter",
     "QwenImageDecoderAdapter",
     "WanDecoderAdapter",
+    "EncoderAdapter",
     "HunyuanVideo15EncoderAdapter",
     "HunyuanVideoEncoderAdapter",
     "LTX2VideoEncoderAdapter",
