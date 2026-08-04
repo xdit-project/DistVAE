@@ -13,20 +13,31 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 )
 
 from distvae.models.vae import PatchDecoder
-from distvae.modules.adapters.diffusers_blocks import QWEN_IMAGE, block
+from distvae.modules.adapters.diffusers_blocks import (
+    HUNYUAN_VIDEO,
+    HUNYUAN_VIDEO_15,
+    QWEN_IMAGE,
+    block,
+)
 from distvae.modules.adapters.layers.conv_adapters import (
     Conv2dAdapter,
+    HunyuanVideo15CausalConv3dAdapter,
+    HunyuanVideoCausalConv3dAdapter,
     QwenImageCausalConv3dAdapter,
     WanCausalConv3dAdapter,
 )
 from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from distvae.modules.adapters.unets.unet_2d_blocks_adapters import UpDecoderBlock2DAdapter
 from distvae.modules.adapters.upsampling_adapters import (
+    HunyuanVideo15UpBlockAdapter,
+    HunyuanVideoUpBlockAdapter,
     QwenImageUpBlockAdapter,
     WanResidualUpBlockAdapter,
     WanUpBlockAdapter,
 )
 from distvae.modules.adapters.midblock_adapters import (
+    HunyuanVideo15MidBlockAdapter,
+    HunyuanVideoMidBlockAdapter,
     QwenImageMidBlockAdapter,
     WanMidBlockAdapter,
 )
@@ -39,6 +50,8 @@ except ModuleNotFoundError:
     pass
 
 QwenImageUpBlock = block(QWEN_IMAGE, "QwenImageUpBlock")
+HunyuanVideoUpBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoUpBlock3D")
+HunyuanVideo15UpBlock3D = block(HUNYUAN_VIDEO_15, "HunyuanVideo15UpBlock3D")
 
 
 def _decode(run, label: str, *, use_profiler: bool, verbose: bool):
@@ -124,17 +137,22 @@ class DecoderAdapter(nn.Module):
 class _CausalDecoderAdapter(nn.Module):
     """Shards a causal 3D video decoder across ranks along one spatial axis.
 
-    These decoders share a skeleton: a causal convolution in, a mid block, a run of up blocks,
-    an RMS norm, and a causal convolution out. The norm is the one part that needs no sharding,
-    because RMS reduces over channels rather than over the axis being split. What differs
-    between the families is which classes fill the other slots, and whether the up blocks are
-    told that a chunk is the first one.
+    These decoders share a skeleton: a causal convolution in, a mid block, a run of up blocks, a
+    normalisation, and a causal convolution out. Where that norm is RMS it needs no sharding,
+    reducing over channels rather than over the axis being split; where it is a GroupNorm it
+    does, and gets wrapped below. What else differs between the families is which classes fill
+    the other slots, and how much of the temporal caching their forwards thread through.
     """
 
     _label = "Decoder"
     _conv_adapter = None
     _mid_adapter = None
     _up_block_adapters: Tuple[Tuple[Optional[type], type], ...] = ()
+    # Wan and the families forked from it thread a temporal cache through every forward so a
+    # decode can be split into chunks of frames. The HunyuanVideo decoders take a tensor and
+    # nothing else.
+    _takes_feature_cache = True
+    # Of those that do, Wan alone also passes first_chunk, to tell the cache it is starting over.
     _takes_first_chunk = True
 
     def __init__(
@@ -172,6 +190,10 @@ class _CausalDecoderAdapter(nn.Module):
         self.decoder.conv_out = self._conv_adapter(
             decoder.conv_out, block_size=conv_block_size, **options
         )
+        # HunyuanVideo ends on a GroupNorm, whose statistics span the axis being split. The RMS
+        # norms the other families end on do not, and are left as they are.
+        if isinstance(getattr(decoder, "conv_norm_out", None), nn.GroupNorm):
+            self.decoder.conv_norm_out = GroupNormAdapter(decoder.conv_norm_out)
         self.patchify = Patchify(patch_dim=patch_dim, use_uniform_patch=use_uniform_patch)
         self.depatchify = DePatchify(patch_dim=patch_dim, use_uniform_patch=use_uniform_patch)
         self.use_uniform_patch = use_uniform_patch
@@ -191,6 +213,8 @@ class _CausalDecoderAdapter(nn.Module):
         )
 
     def _run_decoder(self, sample, feat_cache, feat_idx, first_chunk):
+        if not self._takes_feature_cache:
+            return self.decoder(sample)
         if self._takes_first_chunk:
             return self.decoder(
                 sample, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk
@@ -261,3 +285,19 @@ class QwenImageDecoderAdapter(_CausalDecoderAdapter):
     _mid_adapter = QwenImageMidBlockAdapter
     _up_block_adapters = ((QwenImageUpBlock, QwenImageUpBlockAdapter),)
     _takes_first_chunk = False
+
+
+class HunyuanVideoDecoderAdapter(_CausalDecoderAdapter):
+    _label = "HunyuanVideoDecoder"
+    _conv_adapter = HunyuanVideoCausalConv3dAdapter
+    _mid_adapter = HunyuanVideoMidBlockAdapter
+    _up_block_adapters = ((HunyuanVideoUpBlock3D, HunyuanVideoUpBlockAdapter),)
+    _takes_feature_cache = False
+
+
+class HunyuanVideo15DecoderAdapter(_CausalDecoderAdapter):
+    _label = "HunyuanVideo15Decoder"
+    _conv_adapter = HunyuanVideo15CausalConv3dAdapter
+    _mid_adapter = HunyuanVideo15MidBlockAdapter
+    _up_block_adapters = ((HunyuanVideo15UpBlock3D, HunyuanVideo15UpBlockAdapter),)
+    _takes_feature_cache = False

@@ -6,6 +6,8 @@ import torch.nn as nn
 from distvae.utils import DistributedEnv
 from distvae.models.upsampling import PatchUpsample2D
 from distvae.modules.adapters.diffusers_blocks import (
+    HUNYUAN_VIDEO,
+    HUNYUAN_VIDEO_15,
     QWEN_IMAGE,
     block,
     require,
@@ -13,10 +15,14 @@ from distvae.modules.adapters.diffusers_blocks import (
 )
 from distvae.modules.adapters.layers.conv_adapters import (
     Conv2dAdapter,
+    HunyuanVideo15CausalConv3dAdapter,
+    HunyuanVideoCausalConv3dAdapter,
     QwenImageCausalConv3dAdapter,
     WanCausalConv3dAdapter,
 )
 from distvae.modules.adapters.resnet_adapters import (
+    HunyuanVideo15ResnetBlockAdapter,
+    HunyuanVideoResnetBlockAdapter,
     QwenImageResidualBlockAdapter,
     WanResidualBlockAdapter,
 )
@@ -25,6 +31,10 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import WanResample, WanRes
 
 QwenImageResample = block(QWEN_IMAGE, "QwenImageResample")
 QwenImageUpBlock = block(QWEN_IMAGE, "QwenImageUpBlock")
+HunyuanVideoUpsampleCausal3D = block(HUNYUAN_VIDEO, "HunyuanVideoUpsampleCausal3D")
+HunyuanVideoUpBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoUpBlock3D")
+HunyuanVideo15Upsample = block(HUNYUAN_VIDEO_15, "HunyuanVideo15Upsample")
+HunyuanVideo15UpBlock3D = block(HUNYUAN_VIDEO_15, "HunyuanVideo15UpBlock3D")
 
 
 class Upsample2DAdapter(nn.Module):
@@ -205,3 +215,105 @@ class QwenImageUpBlockAdapter(_CausalUpBlockAdapter):
     _resample_adapter = QwenImageResampleAdapter
     _resample_types = resolved(QwenImageResample)
     _takes_first_chunk = False
+
+
+class _PaddedCausalUpsampleAdapter(nn.Module):
+    """Shards a HunyuanVideo upsampler, which is only its convolution
+
+    What surrounds that convolution is nearest-neighbour interpolation in one family and a
+    channel-to-space shuffle in the other. Both read a single input position per output one, so
+    a rank can upsample its own rows knowing nothing about anyone else's.
+    """
+
+    _supported: Tuple[type, ...] = ()
+    _requires: str = ""
+    _conv_adapter = None
+
+    def __init__(
+        self,
+        upsampler: nn.Module,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
+        assert isinstance(upsampler, self._supported), (
+            f"{adapter} does not support upsampler except {self._requires}"
+        )
+        self.upsampler = upsampler
+        upsampler.conv = self._conv_adapter(
+            upsampler.conv,
+            block_size=conv_block_size,
+            patch_dim=patch_dim,
+            use_uniform_patch=use_uniform_patch,
+        )
+
+    def forward(self, hidden_states):
+        return self.upsampler(hidden_states)
+
+
+class HunyuanVideoUpsampleAdapter(_PaddedCausalUpsampleAdapter):
+    _supported = resolved(HunyuanVideoUpsampleCausal3D)
+    _requires = "HunyuanVideoUpsampleCausal3D"
+    _conv_adapter = HunyuanVideoCausalConv3dAdapter
+
+
+class HunyuanVideo15UpsampleAdapter(_PaddedCausalUpsampleAdapter):
+    _supported = resolved(HunyuanVideo15Upsample)
+    _requires = "HunyuanVideo15Upsample"
+    _conv_adapter = HunyuanVideo15CausalConv3dAdapter
+
+
+class _PaddedCausalUpBlockAdapter(nn.Module):
+    """Shards a HunyuanVideo up block: its residual blocks and its upsampler"""
+
+    _supported: Tuple[type, ...] = ()
+    _requires: str = ""
+    _resnet_adapter = None
+    _upsample_adapter = None
+
+    def __init__(
+        self,
+        up_block: nn.Module,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
+        assert isinstance(up_block, self._supported), (
+            f"{adapter} does not support up block except {self._requires}"
+        )
+        options = dict(
+            conv_block_size=conv_block_size,
+            patch_dim=patch_dim,
+            use_uniform_patch=use_uniform_patch,
+        )
+        self.up_block = up_block
+        up_block.resnets = nn.ModuleList(
+            [self._resnet_adapter(resnet, **options) for resnet in up_block.resnets]
+        )
+        if up_block.upsamplers is not None:
+            up_block.upsamplers = nn.ModuleList(
+                [self._upsample_adapter(up, **options) for up in up_block.upsamplers]
+            )
+
+    def forward(self, hidden_states):
+        return self.up_block(hidden_states)
+
+
+class HunyuanVideoUpBlockAdapter(_PaddedCausalUpBlockAdapter):
+    _supported = resolved(HunyuanVideoUpBlock3D)
+    _requires = "HunyuanVideoUpBlock3D"
+    _resnet_adapter = HunyuanVideoResnetBlockAdapter
+    _upsample_adapter = HunyuanVideoUpsampleAdapter
+
+
+class HunyuanVideo15UpBlockAdapter(_PaddedCausalUpBlockAdapter):
+    _supported = resolved(HunyuanVideo15UpBlock3D)
+    _requires = "HunyuanVideo15UpBlock3D"
+    _resnet_adapter = HunyuanVideo15ResnetBlockAdapter
+    _upsample_adapter = HunyuanVideo15UpsampleAdapter

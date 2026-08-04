@@ -4,6 +4,8 @@ import torch.nn as nn
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanMidBlock
 
 from distvae.modules.adapters.diffusers_blocks import (
+    HUNYUAN_VIDEO,
+    HUNYUAN_VIDEO_15,
     QWEN_IMAGE,
     block,
     require,
@@ -11,11 +13,15 @@ from distvae.modules.adapters.diffusers_blocks import (
 )
 from distvae.modules.adapters.layers.attn_adapters import GatheredAttentionAdapter
 from distvae.modules.adapters.resnet_adapters import (
+    HunyuanVideo15ResnetBlockAdapter,
+    HunyuanVideoResnetBlockAdapter,
     QwenImageResidualBlockAdapter,
     WanResidualBlockAdapter,
 )
 
 QwenImageMidBlock = block(QWEN_IMAGE, "QwenImageMidBlock")
+HunyuanVideoMidBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoMidBlock3D")
+HunyuanVideo15MidBlock = block(HUNYUAN_VIDEO_15, "HunyuanVideo15MidBlock")
 
 
 class _CausalMidBlockAdapter(nn.Module):
@@ -67,3 +73,81 @@ class QwenImageMidBlockAdapter(_CausalMidBlockAdapter):
     _supported = resolved(QwenImageMidBlock)
     _requires = "QwenImageMidBlock"
     _resnet_adapter = QwenImageResidualBlockAdapter
+
+
+class HunyuanVideo15MidBlockAdapter(nn.Module):
+    """Shards HunyuanVideo 1.5's mid block: residual blocks stay local, attentions gather"""
+
+    def __init__(
+        self,
+        mid_block: nn.Module,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        supported = resolved(HunyuanVideo15MidBlock)
+        require(supported, adapter, "HunyuanVideo15MidBlock")
+        assert isinstance(mid_block, supported), (
+            f"{adapter} does not support mid block except HunyuanVideo15MidBlock"
+        )
+        self.mid_block = mid_block
+        mid_block.resnets = nn.ModuleList([
+            HunyuanVideo15ResnetBlockAdapter(
+                resnet,
+                conv_block_size=conv_block_size,
+                patch_dim=patch_dim,
+                use_uniform_patch=use_uniform_patch,
+            ) for resnet in mid_block.resnets
+        ])
+        mid_block.attentions = nn.ModuleList([
+            GatheredAttentionAdapter(attn, patch_dim=patch_dim) if attn is not None else attn
+            for attn in mid_block.attentions
+        ])
+
+    def forward(self, hidden_states):
+        return self.mid_block(hidden_states)
+
+
+class HunyuanVideoMidBlockAdapter(nn.Module):
+    """Shards HunyuanVideo's mid block, or gathers around the whole of it when it has attention.
+
+    Its attention cannot be wrapped on its own the way every other family's can. The mid block
+    flattens (F, H, W) into a sequence and builds the causal mask itself, both from the height
+    it can see, so an attention handed a patch would also be handed a mask cut for a patch and
+    would quietly attend over the wrong span. Gathering around the entire block avoids
+    reimplementing that forward, and costs little: the mid block runs at the latent resolution,
+    which is the cheapest point in the decoder, and it is the up blocks after it that hold the
+    activations worth splitting.
+    """
+
+    def __init__(
+        self,
+        mid_block: nn.Module,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        supported = resolved(HunyuanVideoMidBlock3D)
+        require(supported, adapter, "HunyuanVideoMidBlock3D")
+        assert isinstance(mid_block, supported), (
+            f"{adapter} does not support mid block except HunyuanVideoMidBlock3D"
+        )
+        if any(attn is not None for attn in mid_block.attentions):
+            self.mid_block = GatheredAttentionAdapter(mid_block, patch_dim=patch_dim)
+        else:
+            mid_block.resnets = nn.ModuleList([
+                HunyuanVideoResnetBlockAdapter(
+                    resnet,
+                    conv_block_size=conv_block_size,
+                    patch_dim=patch_dim,
+                    use_uniform_patch=use_uniform_patch,
+                ) for resnet in mid_block.resnets
+            ])
+            self.mid_block = mid_block
+
+    def forward(self, hidden_states):
+        return self.mid_block(hidden_states)

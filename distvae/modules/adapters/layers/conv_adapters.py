@@ -8,6 +8,8 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
 from distvae.models.layers.conv2d import PatchConv2d
 from distvae.models.layers.conv3d import PatchConv3d
 from distvae.modules.adapters.diffusers_blocks import (
+    HUNYUAN_VIDEO,
+    HUNYUAN_VIDEO_15,
     QWEN_IMAGE,
     block,
     require,
@@ -15,6 +17,8 @@ from distvae.modules.adapters.diffusers_blocks import (
 )
 
 QwenImageCausalConv3d = block(QWEN_IMAGE, "QwenImageCausalConv3d")
+HunyuanVideoCausalConv3d = block(HUNYUAN_VIDEO, "HunyuanVideoCausalConv3d")
+HunyuanVideo15CausalConv3d = block(HUNYUAN_VIDEO_15, "HunyuanVideo15CausalConv3d")
 
 
 class Conv2dAdapter(nn.Module):
@@ -158,3 +162,78 @@ class QwenImageCausalConv3dAdapter(_CausalConv3dAdapter):
 
     _supported = resolved(QwenImageCausalConv3d)
     _requires = "QwenImageCausalConv3d"
+
+
+class _PaddedCausalConv3dAdapter(nn.Module):
+    """Shards a causal 3D convolution that holds a plain nn.Conv3d and pads in its own forward.
+
+    Unlike Wan's, these pad by replication rather than with zeros, which left alone would have
+    each rank repeat its own top and bottom rows where it ought to be reading its neighbour's.
+    Moving the spatial half of the padding into PatchConv3d settles that: it exchanges halos and
+    replicates only at the edges of the real image. The temporal half is applied here, because
+    the frame axis is not the one being split and its padding has to stay one-sided.
+    """
+
+    _supported: Tuple[type, ...] = ()
+    _requires: str = ""
+
+    def __init__(
+        self,
+        causal_conv3d: nn.Module,
+        *,
+        block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
+        assert isinstance(causal_conv3d, self._supported), (
+            f"{adapter} does not support causal_conv3d except {self._requires}"
+        )
+        conv = causal_conv3d.conv
+        for i in conv.dilation:
+            assert i == 1, f"dilation is not supported in {adapter}"
+        assert tuple(conv.padding) == (0, 0, 0), (
+            f"{adapter} expects all padding to live in time_causal_padding, but the "
+            f"convolution also pads by {tuple(conv.padding)}"
+        )
+        # F.pad orders its argument (W, W, H, H, F, F).
+        pad_w, _, pad_h, _, pad_front, pad_back = causal_conv3d.time_causal_padding
+        self.conv3d = PatchConv3d(
+            in_channels=conv.in_channels,
+            out_channels=conv.out_channels,
+            kernel_size=conv.kernel_size,
+            stride=conv.stride,
+            padding=(0, pad_h, pad_w),
+            dilation=conv.dilation,
+            groups=conv.groups,
+            bias=conv.bias is not None,
+            padding_mode=causal_conv3d.pad_mode,
+            device=conv.weight.device,
+            dtype=conv.weight.dtype,
+            block_size=block_size,
+            patch_dim=patch_dim,
+            use_uniform_patch=use_uniform_patch,
+        )
+        self.conv3d.weight.data = conv.weight.data
+        if conv.bias is not None:
+            self.conv3d.bias.data = conv.bias.data
+        self.pad_mode = causal_conv3d.pad_mode
+        self._padding = (0, 0, 0, 0, pad_front, pad_back)
+
+    def forward(self, hidden_states):
+        # Padding one axis and then the other reaches the same place as padding both at once:
+        # replication reads a clamped index per axis, and clamping them in turn is the same.
+        hidden_states = F.pad(hidden_states, self._padding, mode=self.pad_mode)
+        return self.conv3d(hidden_states)
+
+
+class HunyuanVideoCausalConv3dAdapter(_PaddedCausalConv3dAdapter):
+    _supported = resolved(HunyuanVideoCausalConv3d)
+    _requires = "HunyuanVideoCausalConv3d"
+
+
+class HunyuanVideo15CausalConv3dAdapter(_PaddedCausalConv3dAdapter):
+    _supported = resolved(HunyuanVideo15CausalConv3d)
+    _requires = "HunyuanVideo15CausalConv3d"

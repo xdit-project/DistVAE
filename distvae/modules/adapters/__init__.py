@@ -6,6 +6,10 @@ from .downsampling_adapters import (
 
 # Export upsampling adapters
 from .upsampling_adapters import (
+    HunyuanVideo15UpBlockAdapter,
+    HunyuanVideo15UpsampleAdapter,
+    HunyuanVideoUpBlockAdapter,
+    HunyuanVideoUpsampleAdapter,
     QwenImageResampleAdapter,
     QwenImageUpBlockAdapter,
     Upsample2DAdapter,
@@ -15,14 +19,28 @@ from .upsampling_adapters import (
 )
 
 # Export other adapters
-from .midblock_adapters import QwenImageMidBlockAdapter, WanMidBlockAdapter
-from .resnet_adapters import QwenImageResidualBlockAdapter, WanResidualBlockAdapter
+from .midblock_adapters import (
+    HunyuanVideo15MidBlockAdapter,
+    HunyuanVideoMidBlockAdapter,
+    QwenImageMidBlockAdapter,
+    WanMidBlockAdapter,
+)
+from .resnet_adapters import (
+    HunyuanVideo15ResnetBlockAdapter,
+    HunyuanVideoResnetBlockAdapter,
+    QwenImageResidualBlockAdapter,
+    WanResidualBlockAdapter,
+)
 
 __all__ = [
     # Downsampling
     "WanResampleDownAdapter",
     "WanResidualDownBlockAdapter",
     # Upsampling
+    "HunyuanVideo15UpBlockAdapter",
+    "HunyuanVideo15UpsampleAdapter",
+    "HunyuanVideoUpBlockAdapter",
+    "HunyuanVideoUpsampleAdapter",
     "QwenImageResampleAdapter",
     "QwenImageUpBlockAdapter",
     "Upsample2DAdapter",
@@ -30,8 +48,12 @@ __all__ = [
     "WanResidualUpBlockAdapter",
     "WanUpBlockAdapter",
     # Other
+    "HunyuanVideo15MidBlockAdapter",
+    "HunyuanVideoMidBlockAdapter",
     "QwenImageMidBlockAdapter",
-    "QwenImageResidualBlockAdapter",
     "WanMidBlockAdapter",
+    "HunyuanVideo15ResnetBlockAdapter",
+    "HunyuanVideoResnetBlockAdapter",
+    "QwenImageResidualBlockAdapter",
     "WanResidualBlockAdapter",
 ]

@@ -5,6 +5,8 @@ import torch.nn as nn
 
 from distvae.models.resnet import PatchResnetBlock2D
 from distvae.modules.adapters.diffusers_blocks import (
+    HUNYUAN_VIDEO,
+    HUNYUAN_VIDEO_15,
     QWEN_IMAGE,
     block,
     require,
@@ -12,6 +14,8 @@ from distvae.modules.adapters.diffusers_blocks import (
 )
 from distvae.modules.adapters.layers.conv_adapters import (
     Conv2dAdapter,
+    HunyuanVideo15CausalConv3dAdapter,
+    HunyuanVideoCausalConv3dAdapter,
     QwenImageCausalConv3dAdapter,
     WanCausalConv3dAdapter,
 )
@@ -20,6 +24,8 @@ from diffusers.models.resnet import ResnetBlock2D
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, WanResidualBlock
 
 QwenImageResidualBlock = block(QWEN_IMAGE, "QwenImageResidualBlock")
+HunyuanVideoResnetBlockCausal3D = block(HUNYUAN_VIDEO, "HunyuanVideoResnetBlockCausal3D")
+HunyuanVideo15ResnetBlock = block(HUNYUAN_VIDEO_15, "HunyuanVideo15ResnetBlock")
 
 
 class ResnetBlock2DAdapter(nn.Module):
@@ -122,3 +128,70 @@ class QwenImageResidualBlockAdapter(_CausalResidualBlockAdapter):
     _supported = resolved(QwenImageResidualBlock)
     _requires = "QwenImageResidualBlock"
     _conv_adapter = QwenImageCausalConv3dAdapter
+
+
+class _PaddedCausalResnetBlockAdapter(nn.Module):
+    """Shards a HunyuanVideo residual block: its two causal convolutions, and any GroupNorms
+
+    HunyuanVideo normalises with GroupNorm, whose statistics span the axis being split and so
+    have to be summed across ranks. HunyuanVideo 1.5 replaced those with RMS, which reduces over
+    channels and needs nothing from anyone; the isinstance check below is what tells them apart.
+    """
+
+    _supported: Tuple[type, ...] = ()
+    _requires: str = ""
+    _conv_adapter = None
+
+    def __init__(
+        self,
+        resnet: nn.Module,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
+        assert isinstance(resnet, self._supported), (
+            f"{adapter} does not support resnet except {self._requires}"
+        )
+        self.resnet = resnet
+        for name in ("conv1", "conv2"):
+            setattr(
+                resnet,
+                name,
+                self._conv_adapter(
+                    getattr(resnet, name),
+                    block_size=conv_block_size,
+                    patch_dim=patch_dim,
+                    use_uniform_patch=use_uniform_patch,
+                ),
+            )
+        for name in ("norm1", "norm2"):
+            norm = getattr(resnet, name)
+            if isinstance(norm, nn.GroupNorm):
+                setattr(resnet, name, GroupNormAdapter(norm))
+        # Where the shortcut is a causal convolution it needs the same treatment; where it is a
+        # bare 1x1x1 it reads one position per output and is already right on a patch.
+        if isinstance(resnet.conv_shortcut, self._conv_adapter._supported):
+            resnet.conv_shortcut = self._conv_adapter(
+                resnet.conv_shortcut,
+                block_size=conv_block_size,
+                patch_dim=patch_dim,
+                use_uniform_patch=use_uniform_patch,
+            )
+
+    def forward(self, hidden_states):
+        return self.resnet(hidden_states)
+
+
+class HunyuanVideoResnetBlockAdapter(_PaddedCausalResnetBlockAdapter):
+    _supported = resolved(HunyuanVideoResnetBlockCausal3D)
+    _requires = "HunyuanVideoResnetBlockCausal3D"
+    _conv_adapter = HunyuanVideoCausalConv3dAdapter
+
+
+class HunyuanVideo15ResnetBlockAdapter(_PaddedCausalResnetBlockAdapter):
+    _supported = resolved(HunyuanVideo15ResnetBlock)
+    _requires = "HunyuanVideo15ResnetBlock"
+    _conv_adapter = HunyuanVideo15CausalConv3dAdapter
