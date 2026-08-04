@@ -7,6 +7,7 @@ passed), and the same spawn call. Only the module under test differs.
 """
 
 import os
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -29,15 +30,16 @@ def init_gloo(rank: int, world_size: int, master_port: int) -> torch.device:
 def assert_matches_reference(
     rank: int,
     actual: torch.Tensor,
-    expected: torch.Tensor,
+    expected: Optional[torch.Tensor],
     what: str,
     atol: float = 1e-4,
     rtol: float = 1e-3,
 ) -> None:
     """Compare on rank 0, then raise on every rank
 
-    Only rank 0 holds the reference, but a failure raised there alone would leave the other
-    ranks waiting on the next collective, and the test would hang instead of failing.
+    Only rank 0 holds the reference, which is why expected is optional elsewhere. Raising there
+    alone would leave the other ranks waiting on the next collective, and the test would hang
+    instead of failing.
     """
     detail = ""
     ok = torch.ones(1, dtype=torch.int64)
