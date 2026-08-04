@@ -42,6 +42,21 @@ class PatchConvMixin:
             padding, rank, world_size, patch_dim, ndim=self._patch_ndim()
         )
 
+    def _check_padding_mode(self, group_world_size: int) -> None:
+        """Refuse a padding mode whose values a halo exchange cannot supply.
+
+        Zeros, replicate and reflect all read from within the patch or from nothing, so a rank
+        can produce them once its neighbours' rows have arrived. Circular reads from the far
+        edge of the image, which belongs to a rank this one does not border, and would
+        otherwise wrap silently within the patch and give an answer no one checked.
+        """
+        if group_world_size > 1 and self.padding_mode == "circular":
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot shard a convolution padded circularly: its "
+                f"padding wraps to the opposite edge of the image, which is not on a "
+                f"neighbouring rank. Use a single rank for this VAE, or tile it instead."
+            )
+
     def _use_direct_path(self, input: Tensor) -> bool:
         """Return True if we can run a single conv and crop (no chunking).
 
