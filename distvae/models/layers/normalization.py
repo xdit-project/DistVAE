@@ -151,10 +151,11 @@ class PatchGroupNorm(nn.GroupNorm):
         shape = x.shape
         patch_dim = self.patch_dim if self.patch_dim >= 0 else ndim + self.patch_dim
 
+        vae_group = DistributedEnv.get_vae_group()
         x = x.detach()
         # Support 4D (N,C,H,W) and 5D (N,C,F,H,W); patch dim is first spatial (index 2).
         patch_size = torch.tensor(shape[patch_dim], dtype=torch.int64, device=x.device)
-        dist.all_reduce(patch_size, group=DistributedEnv.get_vae_group())
+        dist.all_reduce(patch_size, group=vae_group)
         channels_per_group = shape[1] // self.num_groups
         nelements = (
             channels_per_group *
@@ -162,29 +163,27 @@ class PatchGroupNorm(nn.GroupNorm):
             patch_size *
             math.prod(shape[patch_dim + 1: ])
         )
-        nelements_rank = (nelements // patch_size) * shape[patch_dim]
 
         x = x.view(shape[0], self.num_groups, -1, *shape[2: ])
-        group_sum = x.mean(dim=tuple(range(2, x.ndim)), dtype=torch.float32)
-        group_sum = group_sum * nelements_rank
-        dist.all_reduce(group_sum, group=DistributedEnv.get_vae_group())
-        # shape: [bs, num_groups, 1, 1, 1] or [bs, num_groups, 1, 1, 1, 1]
-        E = (group_sum / nelements)[:, :, None, None, None].to(x.dtype)
-        group_var_sum = torch.empty(
-            (x.shape[0], self.num_groups),
-            dtype=torch.float32,
-            device=x.device
-        )
-        torch.var(x, dim=tuple(range(2, x.ndim)), out=group_var_sum)
-        group_var_sum = group_var_sum * nelements_rank
-        dist.all_reduce(group_var_sum, group=DistributedEnv.get_vae_group())
-        var = (group_var_sum / nelements)[:, :, None, None, None].to(x.dtype)
-        if ndim == 5:
-            E = E.unsqueeze(-1)
-            var = var.unsqueeze(-1)
+        reduced = tuple(range(2, x.ndim))
+        # [bs, num_groups, 1, 1, 1] for 4D input, one more 1 for 5D.
+        per_group = (shape[0], self.num_groups, *([1] * (x.ndim - 2)))
+
+        group_sum = x.sum(dim=reduced, dtype=torch.float32)
+        dist.all_reduce(group_sum, group=vae_group)
+        E = (group_sum / nelements).view(per_group).to(x.dtype)
+
+        # Squared about the mean of the whole group rather than this rank's share of it. A rank
+        # holding a brighter patch has a mean of its own, and deviations measured from that one
+        # leave out how far the patch itself sits from the middle, so the summed variance comes
+        # out short of the variance the unsharded norm computes.
+        group_square_sum = ((x - E) ** 2).sum(dim=reduced, dtype=torch.float32)
+        dist.all_reduce(group_square_sum, group=vae_group)
+        # Divided by the count, not one less than it, which is the estimator nn.GroupNorm uses.
+        var = (group_square_sum / nelements).view(per_group).to(x.dtype)
 
         x = (x - E) / torch.sqrt(var + self.eps)
-        x = x.view(x.shape[0], -1, *shape[2: ])
+        x = x.view(shape[0], -1, *shape[2: ])
         if self.weight is not None and self.bias is not None:
             weight = self.weight.view(1, -1, *([1] * (ndim - 2)))
             bias = self.bias.view(1, -1, *([1] * (ndim - 2)))
