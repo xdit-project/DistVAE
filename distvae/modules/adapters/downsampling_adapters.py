@@ -6,6 +6,7 @@ from distvae.models.layers.wan.zeropadconv2d import WanZeroPadConv2d
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
     HUNYUAN_VIDEO_15,
+    LTX2_VIDEO,
     QWEN_IMAGE,
     block,
     require,
@@ -15,12 +16,14 @@ from distvae.modules.adapters.layers.conv_adapters import (
     Conv2dAdapter,
     HunyuanVideo15CausalConv3dAdapter,
     HunyuanVideoCausalConv3dAdapter,
+    LTX2VideoCausalConv3dAdapter,
     QwenImageCausalConv3dAdapter,
     WanCausalConv3dAdapter,
 )
 from distvae.modules.adapters.resnet_adapters import (
     HunyuanVideo15ResnetBlockAdapter,
     HunyuanVideoResnetBlockAdapter,
+    LTX2VideoResnetBlockAdapter,
     WanResidualBlockAdapter,
 )
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanResample, WanResidualDownBlock
@@ -30,6 +33,9 @@ HunyuanVideoDownsampleCausal3D = block(HUNYUAN_VIDEO, "HunyuanVideoDownsampleCau
 HunyuanVideoDownBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoDownBlock3D")
 HunyuanVideo15Downsample = block(HUNYUAN_VIDEO_15, "HunyuanVideo15Downsample")
 HunyuanVideo15DownBlock3D = block(HUNYUAN_VIDEO_15, "HunyuanVideo15DownBlock3D")
+LTX2VideoCausalConv3d = block(LTX2_VIDEO, "LTX2VideoCausalConv3d")
+LTX2VideoDownsampler3d = block(LTX2_VIDEO, "LTX2VideoDownsampler3d")
+LTX2VideoDownBlock3D = block(LTX2_VIDEO, "LTX2VideoDownBlock3D")
 
 
 class _CausalResampleDownAdapter(nn.Module):
@@ -231,6 +237,107 @@ class HunyuanVideo15DownBlockAdapter(_PaddedCausalDownBlockAdapter):
     _requires = "HunyuanVideo15DownBlock3D"
     _resnet_adapter = HunyuanVideo15ResnetBlockAdapter
     _downsample_adapter = HunyuanVideo15DownsampleAdapter
+
+
+class LTX2VideoDownsamplerAdapter(nn.Module):
+    """Shards an LTX-2 downsampler, which is its convolution
+
+    What follows the convolution moves space into channels and averages the input the same way
+    for the residual, reading one input position per output one, so a rank can do it to its own
+    rows alone.
+    """
+
+    _supported = resolved(LTX2VideoDownsampler3d)
+    _requires = "LTX2VideoDownsampler3d"
+
+    def __init__(
+        self,
+        downsampler: nn.Module,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
+        assert isinstance(downsampler, self._supported), (
+            f"{adapter} does not support downsampler except {self._requires}"
+        )
+        self.downsampler = downsampler
+        downsampler.conv = LTX2VideoCausalConv3dAdapter(
+            downsampler.conv,
+            block_size=conv_block_size,
+            patch_dim=patch_dim,
+            use_uniform_patch=use_uniform_patch,
+        )
+
+    def forward(self, hidden_states, causal: bool = True):
+        return self.downsampler(hidden_states, causal=causal)
+
+
+class LTX2VideoDownBlockAdapter(nn.Module):
+    """Shards an LTX-2 down block: its residual blocks and its downsampler
+
+    Which downsampler that is depends on how the stage was configured: a strided causal
+    convolution where it downsamples by striding, or the space-to-channel downsampler where it
+    does so by folding. Both are handled because a checkpoint may hold either.
+    """
+
+    _supported = resolved(LTX2VideoDownBlock3D)
+    _requires = "LTX2VideoDownBlock3D"
+
+    def __init__(
+        self,
+        down_block: nn.Module,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
+        assert isinstance(down_block, self._supported), (
+            f"{adapter} does not support down block except {self._requires}"
+        )
+        options = dict(
+            conv_block_size=conv_block_size,
+            patch_dim=patch_dim,
+            use_uniform_patch=use_uniform_patch,
+        )
+        self.down_block = down_block
+        down_block.resnets = nn.ModuleList(
+            [LTX2VideoResnetBlockAdapter(resnet, **options) for resnet in down_block.resnets]
+        )
+        if down_block.downsamplers is not None:
+            down_block.downsamplers = nn.ModuleList(
+                [self._adapt_downsampler(down, adapter, conv_block_size, patch_dim,
+                                         use_uniform_patch)
+                 for down in down_block.downsamplers]
+            )
+
+    @staticmethod
+    def _adapt_downsampler(downsampler, adapter, conv_block_size, patch_dim, use_uniform_patch):
+        if LTX2VideoDownsampler3d is not None and isinstance(downsampler, LTX2VideoDownsampler3d):
+            return LTX2VideoDownsamplerAdapter(
+                downsampler,
+                conv_block_size=conv_block_size,
+                patch_dim=patch_dim,
+                use_uniform_patch=use_uniform_patch,
+            )
+        if LTX2VideoCausalConv3d is not None and isinstance(downsampler, LTX2VideoCausalConv3d):
+            return LTX2VideoCausalConv3dAdapter(
+                downsampler,
+                block_size=conv_block_size,
+                patch_dim=patch_dim,
+                use_uniform_patch=use_uniform_patch,
+            )
+        raise TypeError(
+            f"{adapter} cannot shard a downsampler of type {type(downsampler).__name__}. It "
+            f"handles LTX2VideoDownsampler3d and LTX2VideoCausalConv3d."
+        )
+
+    def forward(self, hidden_states, temb=None, generator=None, causal: bool = True):
+        return self.down_block(hidden_states, temb, generator, causal=causal)
 
 
 class WanResidualDownBlockAdapter(nn.Module):

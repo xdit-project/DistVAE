@@ -7,12 +7,14 @@ from torch.distributed import ProcessGroup
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
     HUNYUAN_VIDEO_15,
+    LTX2_VIDEO,
     QWEN_IMAGE,
     block,
 )
 from distvae.modules.adapters.downsampling_adapters import (
     HunyuanVideo15DownBlockAdapter,
     HunyuanVideoDownBlockAdapter,
+    LTX2VideoDownBlockAdapter,
     QwenImageResampleDownAdapter,
     WanResampleDownAdapter,
     WanResidualDownBlockAdapter,
@@ -21,6 +23,7 @@ from distvae.modules.adapters.layers.attn_adapters import GatheredAttentionAdapt
 from distvae.modules.adapters.layers.conv_adapters import (
     HunyuanVideo15CausalConv3dAdapter,
     HunyuanVideoCausalConv3dAdapter,
+    LTX2VideoCausalConv3dAdapter,
     QwenImageCausalConv3dAdapter,
     WanCausalConv3dAdapter,
 )
@@ -28,6 +31,7 @@ from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from distvae.modules.adapters.midblock_adapters import (
     HunyuanVideo15MidBlockAdapter,
     HunyuanVideoMidBlockAdapter,
+    LTX2VideoMidBlockAdapter,
     QwenImageMidBlockAdapter,
     WanMidBlockAdapter,
 )
@@ -50,6 +54,7 @@ QwenImageResample = block(QWEN_IMAGE, "QwenImageResample")
 QwenImageResidualBlock = block(QWEN_IMAGE, "QwenImageResidualBlock")
 HunyuanVideoDownBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoDownBlock3D")
 HunyuanVideo15DownBlock3D = block(HUNYUAN_VIDEO_15, "HunyuanVideo15DownBlock3D")
+LTX2VideoDownBlock3D = block(LTX2_VIDEO, "LTX2VideoDownBlock3D")
 
 
 def _gathered(attention: nn.Module, **options) -> nn.Module:
@@ -232,3 +237,24 @@ class HunyuanVideo15EncoderAdapter(_CausalEncoderAdapter):
     _mid_adapter = HunyuanVideo15MidBlockAdapter
     _down_block_adapters = ((HunyuanVideo15DownBlock3D, HunyuanVideo15DownBlockAdapter),)
     _takes_feature_cache = False
+
+
+class LTX2VideoEncoderAdapter(_CausalEncoderAdapter):
+    """LTX-2's encoder, which takes a causal flag where the others take a temporal cache
+
+    Its mid block holds no attention, so nothing here has to be gathered: every layer is a
+    convolution or a norm that reduces over channels.
+    """
+
+    _label = "LTX2VideoEncoder"
+    _conv_adapter = LTX2VideoCausalConv3dAdapter
+    _mid_adapter = LTX2VideoMidBlockAdapter
+    _down_block_adapters = ((LTX2VideoDownBlock3D, LTX2VideoDownBlockAdapter),)
+
+    def forward(
+        self,
+        hidden_states: torch.FloatTensor,
+        causal: Optional[bool] = None,
+        patchify: bool = True,
+    ):
+        return self._sharded_encode(hidden_states, patchify, lambda x: self.encoder(x, causal))
