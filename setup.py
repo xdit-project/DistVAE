@@ -12,6 +12,11 @@ if __name__ == "__main__":
         author="Jinzhe Pan",
         author_email="eigensystem1318@gmail.com",
         packages=find_packages(),
+        # 0.35 is where Wan's residual up block landed, and Wan's blocks are the only ones any
+        # module here imports at import time. The QwenImage, HunyuanVideo and LTX-2 families are
+        # resolved through distvae.modules.adapters.diffusers_blocks instead, so an install too
+        # old for one of them keeps every other adapter and is told which class it lacks only if
+        # it tries to shard that VAE. Raising this floor for them would cost more than it buys.
         install_requires=["torch>=2.2", "diffusers>=0.35.0", "transformers"],
         extras_require={
             "dev": [
