@@ -7,13 +7,18 @@ passed), and the same spawn call. Only the module under test differs.
 """
 
 import os
+import socket
 from typing import Optional
 
 import torch
 import torch.distributed as dist
 from torch.multiprocessing import spawn
+from torch.multiprocessing.spawn import ProcessRaisedException
 
 from distvae.utils import DistributedEnv
+
+# How many ports to try before giving up on finding a free one.
+_RENDEZVOUS_ATTEMPTS = 4
 
 
 def init_gloo(rank: int, world_size: int, master_port: int) -> torch.device:
@@ -60,6 +65,27 @@ def assert_matches_reference(
         raise AssertionError(f"{what} did not match the single-rank reference: {detail}")
 
 
+def _free_port() -> int:
+    """A port nothing is listening on, as of asking"""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
 def run_distributed(worker, world_size: int, args: tuple, master_port: int) -> None:
-    """Spawn world_size ranks running worker(rank, *args); raises if any rank does"""
-    spawn(worker, nprocs=world_size, args=(world_size, *args, master_port), join=True)
+    """Spawn world_size ranks running worker(rank, *args); raises if any rank does
+
+    Rank 0 opens the rendezvous socket, so a port taken between the fixture choosing it and rank 0
+    binding it fails the test for a reason that has nothing to do with sharding. Retried on a
+    fresh port, which is the only thing that can be done about it from here: no port can be held
+    open for the ranks, since rank 0 has to bind it itself.
+    """
+    for attempt in range(_RENDEZVOUS_ATTEMPTS):
+        try:
+            spawn(worker, nprocs=world_size, args=(world_size, *args, master_port), join=True)
+            return
+        except ProcessRaisedException as raised:
+            last = attempt == _RENDEZVOUS_ATTEMPTS - 1
+            if last or "EADDRINUSE" not in str(raised):
+                raise
+            master_port = _free_port()
