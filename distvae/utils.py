@@ -109,7 +109,10 @@ class DistributedEnv:
         elif hasattr(torch, "musa") and torch.musa.is_available():
             return "mccl"
         else:
-            raise NotImplementedError("No Accelerators(NV/MTT GPU accelerators) available")
+            # Sharding is correctness-testable without an accelerator, and gloo is the only
+            # backend that gets there. Raising instead would make every distributed entry point
+            # unreachable on a CPU-only machine, tests included.
+            return "gloo"
 
     @classmethod
     def record_memory_history(cls):
