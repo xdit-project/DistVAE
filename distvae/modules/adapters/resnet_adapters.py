@@ -1,11 +1,25 @@
+from typing import Tuple
+
 import torch
 import torch.nn as nn
 
 from distvae.models.resnet import PatchResnetBlock2D
-from distvae.modules.adapters.layers.conv_adapters import Conv2dAdapter, WanCausalConv3dAdapter
+from distvae.modules.adapters.diffusers_blocks import (
+    QWEN_IMAGE,
+    block,
+    require,
+    resolved,
+)
+from distvae.modules.adapters.layers.conv_adapters import (
+    Conv2dAdapter,
+    QwenImageCausalConv3dAdapter,
+    WanCausalConv3dAdapter,
+)
 from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from diffusers.models.resnet import ResnetBlock2D
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, WanResidualBlock
+
+QwenImageResidualBlock = block(QWEN_IMAGE, "QwenImageResidualBlock")
 
 
 class ResnetBlock2DAdapter(nn.Module):
@@ -49,36 +63,62 @@ class ResnetBlock2DAdapter(nn.Module):
         return self.resnet(x, temb, *args, **kwargs)
 
 
-class WanResidualBlockAdapter(nn.Module):
+class _CausalResidualBlockAdapter(nn.Module):
+    """Shards a residual block built from two causal 3D convolutions and an optional shortcut.
+
+    The norms either side of them are RMS, which reduces over channels and so needs nothing from
+    the other ranks; only the convolutions reach across the split.
+    """
+
+    _supported: Tuple[type, ...] = ()
+    _requires: str = ""
+    _conv_adapter = None
+
     def __init__(
         self,
-        wan_residual_block: WanResidualBlock,
+        residual_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
         use_uniform_patch: bool = False,
     ):
         super().__init__()
-        assert isinstance(wan_residual_block, WanResidualBlock), (
-            "WanResidualBlockAdapter does not support resnet except WanResidualBlock"
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
+        assert isinstance(residual_block, self._supported), (
+            f"{adapter} does not support resnet except {self._requires}"
         )
-        self.residual_block = wan_residual_block
-        self.residual_block.conv1 = WanCausalConv3dAdapter(
-            wan_residual_block.conv1,
-            block_size=conv_block_size,
-            patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch
-        )
-        self.residual_block.conv2 = WanCausalConv3dAdapter(
-            wan_residual_block.conv2,
-            block_size=conv_block_size,
-            patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch
-        )
+        self.residual_block = residual_block
+        for name in ("conv1", "conv2"):
+            setattr(
+                self.residual_block,
+                name,
+                self._conv_adapter(
+                    getattr(residual_block, name),
+                    block_size=conv_block_size,
+                    patch_dim=patch_dim,
+                    use_uniform_patch=use_uniform_patch,
+                ),
+            )
         # Adapt conv_shortcut if it's not nn.Identity
-        if not isinstance(wan_residual_block.conv_shortcut, nn.Identity):
-            self.residual_block.conv_shortcut = WanCausalConv3dAdapter(
-                wan_residual_block.conv_shortcut, block_size=conv_block_size, patch_dim=patch_dim
+        if not isinstance(residual_block.conv_shortcut, nn.Identity):
+            self.residual_block.conv_shortcut = self._conv_adapter(
+                residual_block.conv_shortcut,
+                block_size=conv_block_size,
+                patch_dim=patch_dim,
+                use_uniform_patch=use_uniform_patch,
             )
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         return self.residual_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
+
+
+class WanResidualBlockAdapter(_CausalResidualBlockAdapter):
+    _supported = resolved(WanResidualBlock)
+    _requires = "WanResidualBlock"
+    _conv_adapter = WanCausalConv3dAdapter
+
+
+class QwenImageResidualBlockAdapter(_CausalResidualBlockAdapter):
+    _supported = resolved(QwenImageResidualBlock)
+    _requires = "QwenImageResidualBlock"
+    _conv_adapter = QwenImageCausalConv3dAdapter

@@ -1,14 +1,30 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 from distvae.utils import DistributedEnv
 from distvae.models.upsampling import PatchUpsample2D
-from distvae.modules.adapters.layers.conv_adapters import Conv2dAdapter, WanCausalConv3dAdapter
-from distvae.modules.adapters.resnet_adapters import WanResidualBlockAdapter
+from distvae.modules.adapters.diffusers_blocks import (
+    QWEN_IMAGE,
+    block,
+    require,
+    resolved,
+)
+from distvae.modules.adapters.layers.conv_adapters import (
+    Conv2dAdapter,
+    QwenImageCausalConv3dAdapter,
+    WanCausalConv3dAdapter,
+)
+from distvae.modules.adapters.resnet_adapters import (
+    QwenImageResidualBlockAdapter,
+    WanResidualBlockAdapter,
+)
 from diffusers.models.upsampling import Upsample2D
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanResample, WanResidualUpBlock, WanUpBlock
+
+QwenImageResample = block(QWEN_IMAGE, "QwenImageResample")
+QwenImageUpBlock = block(QWEN_IMAGE, "QwenImageUpBlock")
 
 
 class Upsample2DAdapter(nn.Module):
@@ -46,139 +62,146 @@ class Upsample2DAdapter(nn.Module):
         return self.upsample2d(hidden_states, output_size, *args, **kwargs)
 
 
-class WanResampleAdapter(nn.Module):
+class _CausalResampleAdapter(nn.Module):
+    """Shards a resample block: the 2D convolution it upsamples with, and its temporal one.
+
+    The interpolation between them is nearest-neighbour, which reads a single input pixel per
+    output pixel, so a rank can upsample its own rows without hearing from its neighbours.
+    """
+
+    _supported: Tuple[type, ...] = ()
+    _requires: str = ""
+    _conv_adapter = None
+
     def __init__(
         self,
-        wan_resample: WanResample,
+        resample: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
         use_uniform_patch: bool = False,
     ):
         super().__init__()
-        assert isinstance(wan_resample, WanResample), (
-            "WanResampleAdapter does not support resample except WanResample"
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
+        assert isinstance(resample, self._supported), (
+            f"{adapter} does not support resample except {self._requires}"
         )
-        self.resample = wan_resample
         if patch_dim == -3:
-            raise ValueError("WanResampleAdapter does not support patch_dim F (-3); use H (-2) or W (-1).")
-        if hasattr(wan_resample, "time_conv"):
-            wan_resample.time_conv = WanCausalConv3dAdapter(
-                wan_resample.time_conv,
+            raise ValueError(
+                f"{adapter} does not support patch_dim F (-3); use H (-2) or W (-1)."
+            )
+        self.resample = resample
+        if hasattr(resample, "time_conv"):
+            resample.time_conv = self._conv_adapter(
+                resample.time_conv,
                 block_size=conv_block_size,
                 patch_dim=patch_dim,
-                use_uniform_patch=use_uniform_patch
-        )
-        if isinstance(wan_resample.resample, nn.Sequential):
-            resample = []
-            for layer in wan_resample.resample:
-                if isinstance(layer, nn.Conv2d):
-                    resample.append(
-                        Conv2dAdapter(
-                            layer,
-                            block_size=conv_block_size,
-                            patch_dim=patch_dim,
-                            use_uniform_patch=use_uniform_patch
-                        )
-                    )
-                else:
-                    resample.append(layer)
-            self.resample.resample = nn.Sequential(*resample)
-        else:
-            self.resample.resample = wan_resample.resample
+                use_uniform_patch=use_uniform_patch,
+            )
+        if isinstance(resample.resample, nn.Sequential):
+            self.resample.resample = nn.Sequential(*[
+                Conv2dAdapter(
+                    layer,
+                    block_size=conv_block_size,
+                    patch_dim=patch_dim,
+                    use_uniform_patch=use_uniform_patch,
+                ) if isinstance(layer, nn.Conv2d) else layer
+                for layer in resample.resample
+            ])
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         return self.resample(x, feat_cache=feat_cache, feat_idx=feat_idx)
 
 
-class WanResidualUpBlockAdapter(nn.Module):
+class WanResampleAdapter(_CausalResampleAdapter):
+    _supported = resolved(WanResample)
+    _requires = "WanResample"
+    _conv_adapter = WanCausalConv3dAdapter
+
+
+class QwenImageResampleAdapter(_CausalResampleAdapter):
+    _supported = resolved(QwenImageResample)
+    _requires = "QwenImageResample"
+    _conv_adapter = QwenImageCausalConv3dAdapter
+
+
+class _CausalUpBlockAdapter(nn.Module):
+    """Shards an up block: its residual blocks, and whichever resample it upsamples with"""
+
+    _supported: Tuple[type, ...] = ()
+    _requires: str = ""
+    _resnet_adapter = None
+    _resample_adapter = None
+    _resample_types: Tuple[type, ...] = ()
+    # Which attribute the wrapped block is kept under, since a decoder reaches back through it.
+    _attr = "up_block"
+    # Wan threads first_chunk through its up blocks to tell the temporal cache it is starting
+    # over. The families forked from it dropped that argument.
+    _takes_first_chunk = True
+
     def __init__(
         self,
-        wan_residual_up_block: WanResidualUpBlock,
+        up_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
         use_uniform_patch: bool = False,
     ):
         super().__init__()
-        assert isinstance(wan_residual_up_block, WanResidualUpBlock), (
-            "WanResidualUpBlockAdapter does not support up block except WanResidualUpBlock"
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
+        assert isinstance(up_block, self._supported), (
+            f"{adapter} does not support up block except {self._requires}"
         )
-        self.residual_up_block = wan_residual_up_block
-        self.residual_up_block.resnets = nn.ModuleList([
-            WanResidualBlockAdapter(
-                resnet,
-                conv_block_size=conv_block_size,
-                patch_dim=patch_dim,
-                use_uniform_patch=use_uniform_patch
-            ) for resnet in wan_residual_up_block.resnets
-        ])
-        if hasattr(wan_residual_up_block, "upsamplers"):
-            if wan_residual_up_block.upsamplers is not None:
-                self.residual_up_block.upsamplers = nn.ModuleList([
-                    WanResampleAdapter(
-                        upsampler,
-                        conv_block_size=conv_block_size,
-                        patch_dim=patch_dim,
-                        use_uniform_patch=use_uniform_patch
-                    ) if isinstance(upsampler, WanResample) else upsampler
-                    for upsampler in wan_residual_up_block.upsamplers
+        options = dict(
+            conv_block_size=conv_block_size,
+            patch_dim=patch_dim,
+            use_uniform_patch=use_uniform_patch,
+        )
+        up_block.resnets = nn.ModuleList(
+            [self._resnet_adapter(resnet, **options) for resnet in up_block.resnets]
+        )
+        if hasattr(up_block, "upsamplers"):
+            if up_block.upsamplers is not None:
+                up_block.upsamplers = nn.ModuleList([
+                    self._resample_adapter(upsampler, **options)
+                    if isinstance(upsampler, self._resample_types) else upsampler
+                    for upsampler in up_block.upsamplers
                 ])
-        elif hasattr(wan_residual_up_block, "upsampler"):
-            if wan_residual_up_block.upsampler is not None:
-                upsampler = wan_residual_up_block.upsampler
-                if isinstance(upsampler, WanResample):
-                    self.residual_up_block.upsampler = WanResampleAdapter(
-                        upsampler,
-                        conv_block_size=conv_block_size,
-                        patch_dim=patch_dim,
-                        use_uniform_patch=use_uniform_patch,
-                    )
+        elif hasattr(up_block, "upsampler"):
+            if isinstance(up_block.upsampler, self._resample_types):
+                up_block.upsampler = self._resample_adapter(up_block.upsampler, **options)
+        setattr(self, self._attr, up_block)
 
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
-        return self.residual_up_block(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
+        up_block = getattr(self, self._attr)
+        if self._takes_first_chunk:
+            return up_block(
+                x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk
+            )
+        return up_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
 
 
-class WanUpBlockAdapter(nn.Module):
-    def __init__(
-        self,
-        wan_up_block: WanUpBlock,
-        conv_block_size = 0,
-        patch_dim: int = -2,
-        use_uniform_patch: bool = False,
-    ):
-        super().__init__()
-        assert isinstance(wan_up_block, WanUpBlock), (
-            "WanUpBlockAdapter does not support up block except WanUpBlock"
-        )
-        self.up_block = wan_up_block
-        self.up_block.resnets = nn.ModuleList([
-            WanResidualBlockAdapter(
-                resnet,
-                conv_block_size=conv_block_size,
-                patch_dim=patch_dim,
-                use_uniform_patch=use_uniform_patch,
-            ) for resnet in wan_up_block.resnets
-        ])
-        if hasattr(wan_up_block, "upsamplers"):
-            if wan_up_block.upsamplers is not None:
-                self.up_block.upsamplers = nn.ModuleList([
-                    WanResampleAdapter(
-                        upsampler,
-                        conv_block_size=conv_block_size,
-                        patch_dim=patch_dim,
-                        use_uniform_patch=use_uniform_patch,
-                    ) if isinstance(upsampler, WanResample) else upsampler
-                    for upsampler in wan_up_block.upsamplers
-                ])
-        elif hasattr(wan_up_block, "upsampler"):
-            if wan_up_block.upsampler is not None:
-                upsampler = wan_up_block.upsampler
-                if isinstance(upsampler, WanResample):
-                    self.up_block.upsampler = WanResampleAdapter(
-                        upsampler,
-                        conv_block_size=conv_block_size,
-                        patch_dim=patch_dim,
-                        use_uniform_patch=use_uniform_patch,
-                    )
+class WanResidualUpBlockAdapter(_CausalUpBlockAdapter):
+    _supported = resolved(WanResidualUpBlock)
+    _requires = "WanResidualUpBlock"
+    _resnet_adapter = WanResidualBlockAdapter
+    _resample_adapter = WanResampleAdapter
+    _resample_types = resolved(WanResample)
+    _attr = "residual_up_block"
 
-    def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
-        return self.up_block(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
+
+class WanUpBlockAdapter(_CausalUpBlockAdapter):
+    _supported = resolved(WanUpBlock)
+    _requires = "WanUpBlock"
+    _resnet_adapter = WanResidualBlockAdapter
+    _resample_adapter = WanResampleAdapter
+    _resample_types = resolved(WanResample)
+
+
+class QwenImageUpBlockAdapter(_CausalUpBlockAdapter):
+    _supported = resolved(QwenImageUpBlock)
+    _requires = "QwenImageUpBlock"
+    _resnet_adapter = QwenImageResidualBlockAdapter
+    _resample_adapter = QwenImageResampleAdapter
+    _resample_types = resolved(QwenImageResample)
+    _takes_first_chunk = False

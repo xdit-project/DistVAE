@@ -7,8 +7,12 @@ import torch.nn as nn
 from distvae.utils import DistributedEnv
 
 
-class WanAttentionBlockAdapter(torch.nn.Module):
+class GatheredAttentionAdapter(torch.nn.Module):
     """Runs attention on the full sequence by gathering along the patch dim, then narrows back to the local patch.
+
+    Attention is the one layer in a VAE that relates every position to every other, so unlike a
+    convolution it cannot be satisfied with a halo. Nothing here reads the wrapped module, only
+    calls it, so this covers whichever attention block a family happens to use.
 
     Supports unequal patch sizes across ranks (e.g. after Patchify without padding).
     """
@@ -52,3 +56,7 @@ class WanAttentionBlockAdapter(torch.nn.Module):
             forward_output, patch_dim, start_idx, chunk_sizes[rank]
         )
         return local_output
+
+
+# The name this was introduced under, before other families turned out to need the same thing.
+WanAttentionBlockAdapter = GatheredAttentionAdapter

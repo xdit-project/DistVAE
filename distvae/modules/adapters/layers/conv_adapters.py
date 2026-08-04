@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,6 +7,14 @@ import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
 from distvae.models.layers.conv2d import PatchConv2d
 from distvae.models.layers.conv3d import PatchConv3d
+from distvae.modules.adapters.diffusers_blocks import (
+    QWEN_IMAGE,
+    block,
+    require,
+    resolved,
+)
+
+QwenImageCausalConv3d = block(QWEN_IMAGE, "QwenImageCausalConv3d")
 
 
 class Conv2dAdapter(nn.Module):
@@ -79,20 +89,33 @@ class Conv3dAdapter(nn.Module):
         return self.conv3d(x)
 
 
-class WanCausalConv3dAdapter(nn.Module):
+class _CausalConv3dAdapter(nn.Module):
+    """Shards a causal 3D convolution that subclasses nn.Conv3d and holds its padding in _padding.
+
+    Only the spatial half of that padding reaches PatchConv3d, which exchanges halos so a rank
+    pads where the image ends rather than where its own patch happens to. The temporal half is
+    applied here instead, before the convolution, because the frame axis is not the one split
+    across ranks and its causal padding has to stay one-sided.
+    """
+
+    _supported: Tuple[type, ...] = ()
+    _requires: str = ""
+
     def __init__(
-        self, 
-        causal_conv3d: WanCausalConv3d,
+        self,
+        causal_conv3d: nn.Conv3d,
         *,
         block_size = 0,
         patch_dim: int = -2,
         use_uniform_patch: bool = False,
     ):
         super().__init__()
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
         for i in causal_conv3d.dilation:
-            assert i == 1, "dilation is not supported in WanCausalConv3dAdapter"
-        assert isinstance(causal_conv3d, WanCausalConv3d), (
-            "WanCausalConv3dAdapter does not support causal_conv3d except WanCausalConv3d"
+            assert i == 1, f"dilation is not supported in {adapter}"
+        assert isinstance(causal_conv3d, self._supported), (
+            f"{adapter} does not support causal_conv3d except {self._requires}"
         )
         self.conv3d = PatchConv3d(
             in_channels=causal_conv3d.in_channels,
@@ -123,3 +146,15 @@ class WanCausalConv3dAdapter(nn.Module):
             padding[4] -= cache_x.shape[2]
         x = F.pad(x, padding)
         return self.conv3d(x)
+
+
+class WanCausalConv3dAdapter(_CausalConv3dAdapter):
+    _supported = resolved(WanCausalConv3d)
+    _requires = "WanCausalConv3d"
+
+
+class QwenImageCausalConv3dAdapter(_CausalConv3dAdapter):
+    """Qwen-Image's causal convolution, which is WanCausalConv3d under a different name"""
+
+    _supported = resolved(QwenImageCausalConv3d)
+    _requires = "QwenImageCausalConv3d"

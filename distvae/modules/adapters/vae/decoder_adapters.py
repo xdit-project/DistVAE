@@ -1,5 +1,5 @@
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -13,11 +13,23 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 )
 
 from distvae.models.vae import PatchDecoder
-from distvae.modules.adapters.layers.conv_adapters import Conv2dAdapter, WanCausalConv3dAdapter
+from distvae.modules.adapters.diffusers_blocks import QWEN_IMAGE, block
+from distvae.modules.adapters.layers.conv_adapters import (
+    Conv2dAdapter,
+    QwenImageCausalConv3dAdapter,
+    WanCausalConv3dAdapter,
+)
 from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from distvae.modules.adapters.unets.unet_2d_blocks_adapters import UpDecoderBlock2DAdapter
-from distvae.modules.adapters.upsampling_adapters import WanResidualUpBlockAdapter, WanUpBlockAdapter
-from distvae.modules.adapters.midblock_adapters import WanMidBlockAdapter
+from distvae.modules.adapters.upsampling_adapters import (
+    QwenImageUpBlockAdapter,
+    WanResidualUpBlockAdapter,
+    WanUpBlockAdapter,
+)
+from distvae.modules.adapters.midblock_adapters import (
+    QwenImageMidBlockAdapter,
+    WanMidBlockAdapter,
+)
 from distvae.modules.patch_utils import Patchify, DePatchify
 from distvae.utils import DistributedEnv
 
@@ -25,6 +37,47 @@ try:
     import torch_musa
 except ModuleNotFoundError:
     pass
+
+QwenImageUpBlock = block(QWEN_IMAGE, "QwenImageUpBlock")
+
+
+def _decode(run, label: str, *, use_profiler: bool, verbose: bool):
+    """Run a decode, optionally under the torch profiler, and report what it cost"""
+    rank = DistributedEnv.get_global_rank()
+    device_type = DistributedEnv.get_device_type()
+    start_time = time.time()
+    if use_profiler:
+        if device_type == "musa":
+            torch.musa.memory._record_memory_history(enabled=None)
+            activities = [ProfilerActivity.CPU, ProfilerActivity.MUSA]
+        else:
+            torch.cuda.memory._record_memory_history(enabled=None)
+            activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+
+        with profile(
+            activities=activities,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                f"./profile/patch_vae_{rank}"
+            ),
+            profile_memory=True,
+            with_stack=True,
+            record_shapes=True,
+        ) as prof:
+            output = run()
+        prof.export_memory_timeline(f"patch_vae_profiler_mem_{rank}.html")
+    else:
+        output = run()
+
+    elapsed_time = time.time() - start_time
+    peak_memory = DistributedEnv.get_peak_memory(device_type)
+
+    if verbose and rank == 0:
+        print(
+            f"{label}: [elapsed_time: {elapsed_time:.2f} sec, "
+            f"peak_memory: {peak_memory/1e9} GB]"
+        )
+    return output
+
 
 class DecoderAdapter(nn.Module):
     def __init__(
@@ -60,48 +113,33 @@ class DecoderAdapter(nn.Module):
         sample: torch.FloatTensor,
         latent_embeds: Optional[torch.FloatTensor] = None,
     ):
-        rank = DistributedEnv.get_global_rank()
-        device_type = DistributedEnv.get_device_type()
-        start_time = time.time()
-        elapsed_time = 0
-        if self.use_profiler:
-            if device_type == "musa":
-                torch.musa.memory._record_memory_history(enabled=None)
-                activities=[ProfilerActivity.CPU,ProfilerActivity.MUSA]
-            else:
-                torch.cuda.memory._record_memory_history(enabled=None)
-                activities=[ProfilerActivity.CPU,ProfilerActivity.CUDA]
-
-            with profile(
-                activities=activities,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    f"./profile/patch_vae_{rank}"
-                ),
-                profile_memory=True,
-                with_stack=True,
-                record_shapes=True,
-            ) as prof:
-                output = self.decoder(sample, latent_embeds)
-            prof.export_memory_timeline(f"patch_vae_profiler_mem_{rank}.html")
-        else:
-            output =  self.decoder(sample, latent_embeds)
-
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        peak_memory = DistributedEnv.get_peak_memory(device_type)
-
-        if self.verbose and rank == 0:
-            print(
-                f"Decoder: [elapsed_time: {elapsed_time:.2f} sec,"
-                f"peak_memory: {peak_memory/1e9} GB]"
-            )
-        return output
+        return _decode(
+            lambda: self.decoder(sample, latent_embeds),
+            "Decoder",
+            use_profiler=self.use_profiler,
+            verbose=self.verbose,
+        )
 
 
-class WanDecoderAdapter(nn.Module):
+class _CausalDecoderAdapter(nn.Module):
+    """Shards a causal 3D video decoder across ranks along one spatial axis.
+
+    These decoders share a skeleton: a causal convolution in, a mid block, a run of up blocks,
+    an RMS norm, and a causal convolution out. The norm is the one part that needs no sharding,
+    because RMS reduces over channels rather than over the axis being split. What differs
+    between the families is which classes fill the other slots, and whether the up blocks are
+    told that a chunk is the first one.
+    """
+
+    _label = "Decoder"
+    _conv_adapter = None
+    _mid_adapter = None
+    _up_block_adapters: Tuple[Tuple[Optional[type], type], ...] = ()
+    _takes_first_chunk = True
+
     def __init__(
-        self, 
-        decoder: Decoder, 
+        self,
+        decoder: nn.Module,
         vae_group: ProcessGroup = None,
         *,
         use_uniform_patch: bool = True,
@@ -111,41 +149,28 @@ class WanDecoderAdapter(nn.Module):
         patch_dim: int = -2,
     ):
         super().__init__()
+        adapter = type(self).__name__
         if patch_dim == -3:
-            raise ValueError("WanDecoderAdapter does not support patch_dim F (-3); use H (-2) or W (-1).")
+            raise ValueError(
+                f"{adapter} does not support patch_dim F (-3); use H (-2) or W (-1)."
+            )
         DistributedEnv.initialize(vae_group)
         self.patch_dim = patch_dim
         DistributedEnv.set_patch_dim(patch_dim)
+        options = dict(patch_dim=patch_dim, use_uniform_patch=use_uniform_patch)
         self.decoder = decoder
-        self.decoder.conv_in = WanCausalConv3dAdapter(
-            decoder.conv_in, block_size=conv_block_size, patch_dim=patch_dim, use_uniform_patch=use_uniform_patch
+        self.decoder.conv_in = self._conv_adapter(
+            decoder.conv_in, block_size=conv_block_size, **options
         )
-        self.decoder.mid_block = WanMidBlockAdapter(
-            decoder.mid_block, conv_block_size=conv_block_size, patch_dim=patch_dim, use_uniform_patch=use_uniform_patch
+        self.decoder.mid_block = self._mid_adapter(
+            decoder.mid_block, conv_block_size=conv_block_size, **options
         )
-        up_blocks = []
-        for up_block in decoder.up_blocks:
-            if isinstance(up_block, WanUpBlock):
-                up_blocks.append(
-                    WanUpBlockAdapter(
-                        up_block,
-                        conv_block_size=conv_block_size,
-                        patch_dim=patch_dim,
-                        use_uniform_patch=use_uniform_patch
-                    )
-                )
-            elif isinstance(up_block, WanResidualUpBlock):
-                up_blocks.append(
-                    WanResidualUpBlockAdapter(
-                        up_block,
-                        conv_block_size=conv_block_size,
-                        patch_dim=patch_dim,
-                        use_uniform_patch=use_uniform_patch
-                    )
-                )                
-        self.decoder.up_blocks = nn.ModuleList(up_blocks)
-        self.decoder.conv_out = WanCausalConv3dAdapter(
-            decoder.conv_out, block_size=conv_block_size, patch_dim=patch_dim, use_uniform_patch=use_uniform_patch
+        self.decoder.up_blocks = nn.ModuleList([
+            self._adapt_up_block(up_block, adapter, conv_block_size, options)
+            for up_block in decoder.up_blocks
+        ])
+        self.decoder.conv_out = self._conv_adapter(
+            decoder.conv_out, block_size=conv_block_size, **options
         )
         self.patchify = Patchify(patch_dim=patch_dim, use_uniform_patch=use_uniform_patch)
         self.depatchify = DePatchify(patch_dim=patch_dim, use_uniform_patch=use_uniform_patch)
@@ -153,6 +178,24 @@ class WanDecoderAdapter(nn.Module):
         self.use_profiler = use_profiler
         self.verbose = verbose
         self.vae_group = vae_group
+
+    @classmethod
+    def _adapt_up_block(cls, up_block, adapter, conv_block_size, options):
+        for block_type, block_adapter in cls._up_block_adapters:
+            if block_type is not None and isinstance(up_block, block_type):
+                return block_adapter(up_block, conv_block_size=conv_block_size, **options)
+        handled = ", ".join(t.__name__ for t, _ in cls._up_block_adapters if t is not None)
+        raise TypeError(
+            f"{adapter} cannot shard an up block of type {type(up_block).__name__}. "
+            f"It handles {handled or 'no up block type the installed diffusers provides'}."
+        )
+
+    def _run_decoder(self, sample, feat_cache, feat_idx, first_chunk):
+        if self._takes_first_chunk:
+            return self.decoder(
+                sample, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk
+            )
+        return self.decoder(sample, feat_cache=feat_cache, feat_idx=feat_idx)
 
     def _forward(
         self,
@@ -162,8 +205,11 @@ class WanDecoderAdapter(nn.Module):
         first_chunk: bool = False,
         patchify: bool = True
     ):
+        adapter = type(self).__name__
         if self.use_uniform_patch and not patchify:
-            raise ValueError("WanDecoderAdapter does not support use_uniform_patch for already patchified inputs.")
+            raise ValueError(
+                f"{adapter} does not support use_uniform_patch for already patchified inputs."
+            )
 
         if self.use_uniform_patch:
             patch_dim = self.patch_dim if self.patch_dim >= 0 else sample.ndim + self.patch_dim
@@ -171,7 +217,7 @@ class WanDecoderAdapter(nn.Module):
 
         if patchify:
             sample = self.patchify(sample)
-        output = self.decoder(sample, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
+        output = self._run_decoder(sample, feat_cache, feat_idx, first_chunk)
         output = self.depatchify(output)
 
         if self.use_uniform_patch:
@@ -189,39 +235,29 @@ class WanDecoderAdapter(nn.Module):
         first_chunk: bool = False,
         patchify: bool = True,
     ):
-        rank = DistributedEnv.get_global_rank()
-        device_type = DistributedEnv.get_device_type()
-        start_time = time.time()
-        elapsed_time = 0
-        if self.use_profiler:
-            if device_type == "musa":
-                torch.musa.memory._record_memory_history(enabled=None)
-                activities=[ProfilerActivity.CPU,ProfilerActivity.MUSA]
-            else:
-                torch.cuda.memory._record_memory_history(enabled=None)
-                activities=[ProfilerActivity.CPU,ProfilerActivity.CUDA]
+        return _decode(
+            lambda: self._forward(sample, feat_cache, feat_idx, first_chunk, patchify),
+            self._label,
+            use_profiler=self.use_profiler,
+            verbose=self.verbose,
+        )
 
-            with profile(
-                activities=activities,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    f"./profile/patch_vae_{rank}"
-                ),
-                profile_memory=True,
-                with_stack=True,
-                record_shapes=True,
-            ) as prof:
-                output = self._forward(sample, feat_cache, feat_idx, first_chunk, patchify)
-            prof.export_memory_timeline(f"patch_vae_profiler_mem_{rank}.html")
-        else:
-            output =  self._forward(sample, feat_cache, feat_idx, first_chunk, patchify)
 
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        peak_memory = DistributedEnv.get_peak_memory(device_type)
+class WanDecoderAdapter(_CausalDecoderAdapter):
+    _label = "WanDecoder"
+    _conv_adapter = WanCausalConv3dAdapter
+    _mid_adapter = WanMidBlockAdapter
+    _up_block_adapters = (
+        (WanUpBlock, WanUpBlockAdapter),
+        (WanResidualUpBlock, WanResidualUpBlockAdapter),
+    )
 
-        if self.verbose and rank == 0:
-            print(
-                f"WanDecoder: [elapsed_time: {elapsed_time:.2f} sec, "
-                f"peak_memory: {peak_memory/1e9} GB]"
-            )
-        return output
+
+class QwenImageDecoderAdapter(_CausalDecoderAdapter):
+    """Qwen-Image's decoder, which is Wan's without the first_chunk argument"""
+
+    _label = "QwenImageDecoder"
+    _conv_adapter = QwenImageCausalConv3dAdapter
+    _mid_adapter = QwenImageMidBlockAdapter
+    _up_block_adapters = ((QwenImageUpBlock, QwenImageUpBlockAdapter),)
+    _takes_first_chunk = False
