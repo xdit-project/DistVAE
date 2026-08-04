@@ -1,5 +1,6 @@
 # Export downsampling adapters
 from .downsampling_adapters import (
+    QwenImageResampleDownAdapter,
     WanResampleDownAdapter,
     WanResidualDownBlockAdapter,
 )
@@ -38,6 +39,7 @@ from .resnet_adapters import (
 
 __all__ = [
     # Downsampling
+    "QwenImageResampleDownAdapter",
     "WanResampleDownAdapter",
     "WanResidualDownBlockAdapter",
     # Upsampling
