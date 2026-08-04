@@ -4,6 +4,8 @@ import torch.nn as nn
 
 from distvae.models.layers.wan.zeropadconv2d import WanZeroPadConv2d
 from distvae.modules.adapters.diffusers_blocks import (
+    HUNYUAN_VIDEO,
+    HUNYUAN_VIDEO_15,
     QWEN_IMAGE,
     block,
     require,
@@ -11,13 +13,23 @@ from distvae.modules.adapters.diffusers_blocks import (
 )
 from distvae.modules.adapters.layers.conv_adapters import (
     Conv2dAdapter,
+    HunyuanVideo15CausalConv3dAdapter,
+    HunyuanVideoCausalConv3dAdapter,
     QwenImageCausalConv3dAdapter,
     WanCausalConv3dAdapter,
 )
-from distvae.modules.adapters.resnet_adapters import WanResidualBlockAdapter
+from distvae.modules.adapters.resnet_adapters import (
+    HunyuanVideo15ResnetBlockAdapter,
+    HunyuanVideoResnetBlockAdapter,
+    WanResidualBlockAdapter,
+)
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanResample, WanResidualDownBlock
 
 QwenImageResample = block(QWEN_IMAGE, "QwenImageResample")
+HunyuanVideoDownsampleCausal3D = block(HUNYUAN_VIDEO, "HunyuanVideoDownsampleCausal3D")
+HunyuanVideoDownBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoDownBlock3D")
+HunyuanVideo15Downsample = block(HUNYUAN_VIDEO_15, "HunyuanVideo15Downsample")
+HunyuanVideo15DownBlock3D = block(HUNYUAN_VIDEO_15, "HunyuanVideo15DownBlock3D")
 
 
 class _CausalResampleDownAdapter(nn.Module):
@@ -116,6 +128,109 @@ class QwenImageResampleDownAdapter(_CausalResampleDownAdapter):
     _supported = resolved(QwenImageResample)
     _requires = "QwenImageResample"
     _conv_adapter = QwenImageCausalConv3dAdapter
+
+
+class _PaddedCausalDownsampleAdapter(nn.Module):
+    """Shards a HunyuanVideo downsampler, of which the convolution is the only sharded part
+
+    Whatever the downsampler does after that convolution reads one input position per output
+    one: HunyuanVideo strides, and 1.5 folds each pair of rows and columns into channels. Either
+    way a rank can do it to its own rows, provided it holds whole pairs of them, which the bands
+    Patchify cuts guarantee by being whole multiples of what the encoder narrows by.
+    """
+
+    _supported: Tuple[type, ...] = ()
+    _requires: str = ""
+    _conv_adapter = None
+
+    def __init__(
+        self,
+        downsampler: nn.Module,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
+        assert isinstance(downsampler, self._supported), (
+            f"{adapter} does not support downsampler except {self._requires}"
+        )
+        self.downsampler = downsampler
+        downsampler.conv = self._conv_adapter(
+            downsampler.conv,
+            block_size=conv_block_size,
+            patch_dim=patch_dim,
+            use_uniform_patch=use_uniform_patch,
+        )
+
+    def forward(self, hidden_states):
+        return self.downsampler(hidden_states)
+
+
+class HunyuanVideoDownsampleAdapter(_PaddedCausalDownsampleAdapter):
+    _supported = resolved(HunyuanVideoDownsampleCausal3D)
+    _requires = "HunyuanVideoDownsampleCausal3D"
+    _conv_adapter = HunyuanVideoCausalConv3dAdapter
+
+
+class HunyuanVideo15DownsampleAdapter(_PaddedCausalDownsampleAdapter):
+    _supported = resolved(HunyuanVideo15Downsample)
+    _requires = "HunyuanVideo15Downsample"
+    _conv_adapter = HunyuanVideo15CausalConv3dAdapter
+
+
+class _PaddedCausalDownBlockAdapter(nn.Module):
+    """Shards a HunyuanVideo down block: its residual blocks and its downsampler"""
+
+    _supported: Tuple[type, ...] = ()
+    _requires: str = ""
+    _resnet_adapter = None
+    _downsample_adapter = None
+
+    def __init__(
+        self,
+        down_block: nn.Module,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
+        assert isinstance(down_block, self._supported), (
+            f"{adapter} does not support down block except {self._requires}"
+        )
+        options = dict(
+            conv_block_size=conv_block_size,
+            patch_dim=patch_dim,
+            use_uniform_patch=use_uniform_patch,
+        )
+        self.down_block = down_block
+        down_block.resnets = nn.ModuleList(
+            [self._resnet_adapter(resnet, **options) for resnet in down_block.resnets]
+        )
+        if down_block.downsamplers is not None:
+            down_block.downsamplers = nn.ModuleList(
+                [self._downsample_adapter(down, **options) for down in down_block.downsamplers]
+            )
+
+    def forward(self, hidden_states):
+        return self.down_block(hidden_states)
+
+
+class HunyuanVideoDownBlockAdapter(_PaddedCausalDownBlockAdapter):
+    _supported = resolved(HunyuanVideoDownBlock3D)
+    _requires = "HunyuanVideoDownBlock3D"
+    _resnet_adapter = HunyuanVideoResnetBlockAdapter
+    _downsample_adapter = HunyuanVideoDownsampleAdapter
+
+
+class HunyuanVideo15DownBlockAdapter(_PaddedCausalDownBlockAdapter):
+    _supported = resolved(HunyuanVideo15DownBlock3D)
+    _requires = "HunyuanVideo15DownBlock3D"
+    _resnet_adapter = HunyuanVideo15ResnetBlockAdapter
+    _downsample_adapter = HunyuanVideo15DownsampleAdapter
 
 
 class WanResidualDownBlockAdapter(nn.Module):

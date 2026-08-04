@@ -4,19 +4,30 @@ import torch
 import torch.nn as nn
 from torch.distributed import ProcessGroup
 
-from distvae.modules.adapters.diffusers_blocks import QWEN_IMAGE, block
+from distvae.modules.adapters.diffusers_blocks import (
+    HUNYUAN_VIDEO,
+    HUNYUAN_VIDEO_15,
+    QWEN_IMAGE,
+    block,
+)
 from distvae.modules.adapters.downsampling_adapters import (
+    HunyuanVideo15DownBlockAdapter,
+    HunyuanVideoDownBlockAdapter,
     QwenImageResampleDownAdapter,
     WanResampleDownAdapter,
     WanResidualDownBlockAdapter,
 )
 from distvae.modules.adapters.layers.attn_adapters import GatheredAttentionAdapter
 from distvae.modules.adapters.layers.conv_adapters import (
+    HunyuanVideo15CausalConv3dAdapter,
+    HunyuanVideoCausalConv3dAdapter,
     QwenImageCausalConv3dAdapter,
     WanCausalConv3dAdapter,
 )
 from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from distvae.modules.adapters.midblock_adapters import (
+    HunyuanVideo15MidBlockAdapter,
+    HunyuanVideoMidBlockAdapter,
     QwenImageMidBlockAdapter,
     WanMidBlockAdapter,
 )
@@ -37,6 +48,8 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 QwenImageAttentionBlock = block(QWEN_IMAGE, "QwenImageAttentionBlock")
 QwenImageResample = block(QWEN_IMAGE, "QwenImageResample")
 QwenImageResidualBlock = block(QWEN_IMAGE, "QwenImageResidualBlock")
+HunyuanVideoDownBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoDownBlock3D")
+HunyuanVideo15DownBlock3D = block(HUNYUAN_VIDEO_15, "HunyuanVideo15DownBlock3D")
 
 
 def _gathered(attention: nn.Module, **options) -> nn.Module:
@@ -189,3 +202,33 @@ class QwenImageEncoderAdapter(_CausalEncoderAdapter):
         (QwenImageResample, QwenImageResampleDownAdapter),
         (QwenImageAttentionBlock, _gathered),
     )
+
+
+class HunyuanVideoEncoderAdapter(_CausalEncoderAdapter):
+    """HunyuanVideo's encoder, which groups its stages and ends on a GroupNorm
+
+    That norm reduces over the axis being split, so the base wraps it. Its mid block holds
+    diffusers' own attention, flattened over frames and rows and columns together, which the mid
+    block adapter gathers around rather than trying to shard.
+    """
+
+    _label = "HunyuanVideoEncoder"
+    _conv_adapter = HunyuanVideoCausalConv3dAdapter
+    _mid_adapter = HunyuanVideoMidBlockAdapter
+    _down_block_adapters = ((HunyuanVideoDownBlock3D, HunyuanVideoDownBlockAdapter),)
+    _takes_feature_cache = False
+
+
+class HunyuanVideo15EncoderAdapter(_CausalEncoderAdapter):
+    """HunyuanVideo 1.5's encoder, which downsamples by folding space into channels
+
+    It ends on an RMS norm, which reduces over channels and so needs no sharding. Its downsampler
+    packs each pair of rows and columns into channels, which reads one input position per output
+    one so long as a rank holds whole pairs of rows, and the bands Patchify cuts do.
+    """
+
+    _label = "HunyuanVideo15Encoder"
+    _conv_adapter = HunyuanVideo15CausalConv3dAdapter
+    _mid_adapter = HunyuanVideo15MidBlockAdapter
+    _down_block_adapters = ((HunyuanVideo15DownBlock3D, HunyuanVideo15DownBlockAdapter),)
+    _takes_feature_cache = False

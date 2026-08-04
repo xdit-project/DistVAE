@@ -1,5 +1,9 @@
 # Export downsampling adapters
 from .downsampling_adapters import (
+    HunyuanVideo15DownBlockAdapter,
+    HunyuanVideo15DownsampleAdapter,
+    HunyuanVideoDownBlockAdapter,
+    HunyuanVideoDownsampleAdapter,
     QwenImageResampleDownAdapter,
     WanResampleDownAdapter,
     WanResidualDownBlockAdapter,
@@ -39,6 +43,10 @@ from .resnet_adapters import (
 
 __all__ = [
     # Downsampling
+    "HunyuanVideo15DownBlockAdapter",
+    "HunyuanVideo15DownsampleAdapter",
+    "HunyuanVideoDownBlockAdapter",
+    "HunyuanVideoDownsampleAdapter",
     "QwenImageResampleDownAdapter",
     "WanResampleDownAdapter",
     "WanResidualDownBlockAdapter",
