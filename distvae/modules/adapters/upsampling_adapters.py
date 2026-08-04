@@ -8,6 +8,7 @@ from distvae.models.upsampling import PatchUpsample2D
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
     HUNYUAN_VIDEO_15,
+    LTX2_VIDEO,
     QWEN_IMAGE,
     block,
     require,
@@ -17,12 +18,14 @@ from distvae.modules.adapters.layers.conv_adapters import (
     Conv2dAdapter,
     HunyuanVideo15CausalConv3dAdapter,
     HunyuanVideoCausalConv3dAdapter,
+    LTX2VideoCausalConv3dAdapter,
     QwenImageCausalConv3dAdapter,
     WanCausalConv3dAdapter,
 )
 from distvae.modules.adapters.resnet_adapters import (
     HunyuanVideo15ResnetBlockAdapter,
     HunyuanVideoResnetBlockAdapter,
+    LTX2VideoResnetBlockAdapter,
     QwenImageResidualBlockAdapter,
     WanResidualBlockAdapter,
 )
@@ -35,6 +38,8 @@ HunyuanVideoUpsampleCausal3D = block(HUNYUAN_VIDEO, "HunyuanVideoUpsampleCausal3
 HunyuanVideoUpBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoUpBlock3D")
 HunyuanVideo15Upsample = block(HUNYUAN_VIDEO_15, "HunyuanVideo15Upsample")
 HunyuanVideo15UpBlock3D = block(HUNYUAN_VIDEO_15, "HunyuanVideo15UpBlock3D")
+LTX2VideoUpsampler3d = block(LTX2_VIDEO, "LTX2VideoUpsampler3d")
+LTX2VideoUpBlock3d = block(LTX2_VIDEO, "LTX2VideoUpBlock3d")
 
 
 class Upsample2DAdapter(nn.Module):
@@ -317,3 +322,81 @@ class HunyuanVideo15UpBlockAdapter(_PaddedCausalUpBlockAdapter):
     _requires = "HunyuanVideo15UpBlock3D"
     _resnet_adapter = HunyuanVideo15ResnetBlockAdapter
     _upsample_adapter = HunyuanVideo15UpsampleAdapter
+
+
+class LTX2VideoUpsamplerAdapter(nn.Module):
+    """Shards an LTX-2 upsampler, which is its convolution
+
+    What follows the convolution moves channels into space, reading one input position per
+    output one, so a rank can do it to its own rows alone.
+    """
+
+    _supported = resolved(LTX2VideoUpsampler3d)
+    _requires = "LTX2VideoUpsampler3d"
+
+    def __init__(
+        self,
+        upsampler: nn.Module,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
+        assert isinstance(upsampler, self._supported), (
+            f"{adapter} does not support upsampler except {self._requires}"
+        )
+        self.upsampler = upsampler
+        upsampler.conv = LTX2VideoCausalConv3dAdapter(
+            upsampler.conv,
+            block_size=conv_block_size,
+            patch_dim=patch_dim,
+            use_uniform_patch=use_uniform_patch,
+        )
+
+    def forward(self, hidden_states, causal: bool = True):
+        return self.upsampler(hidden_states, causal=causal)
+
+
+class LTX2VideoUpBlockAdapter(nn.Module):
+    """Shards an LTX-2 up block: an optional leading residual block, an upsampler, and resnets
+
+    Unlike the other families the upsampler comes before the residual blocks rather than after,
+    which changes nothing about what has to be sharded, only the order it runs in.
+    """
+
+    _supported = resolved(LTX2VideoUpBlock3d)
+    _requires = "LTX2VideoUpBlock3d"
+
+    def __init__(
+        self,
+        up_block: nn.Module,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
+        assert isinstance(up_block, self._supported), (
+            f"{adapter} does not support up block except {self._requires}"
+        )
+        options = dict(
+            conv_block_size=conv_block_size,
+            patch_dim=patch_dim,
+            use_uniform_patch=use_uniform_patch,
+        )
+        self.up_block = up_block
+        if up_block.conv_in is not None:
+            up_block.conv_in = LTX2VideoResnetBlockAdapter(up_block.conv_in, **options)
+        if up_block.upsamplers is not None:
+            up_block.upsamplers = nn.ModuleList(
+                [LTX2VideoUpsamplerAdapter(up, **options) for up in up_block.upsamplers]
+            )
+        up_block.resnets = nn.ModuleList(
+            [LTX2VideoResnetBlockAdapter(resnet, **options) for resnet in up_block.resnets]
+        )
+
+    def forward(self, hidden_states, temb=None, generator=None, causal: bool = True):
+        return self.up_block(hidden_states, temb, generator, causal=causal)

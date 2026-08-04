@@ -16,6 +16,7 @@ from distvae.models.vae import PatchDecoder
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
     HUNYUAN_VIDEO_15,
+    LTX2_VIDEO,
     QWEN_IMAGE,
     block,
 )
@@ -23,6 +24,7 @@ from distvae.modules.adapters.layers.conv_adapters import (
     Conv2dAdapter,
     HunyuanVideo15CausalConv3dAdapter,
     HunyuanVideoCausalConv3dAdapter,
+    LTX2VideoCausalConv3dAdapter,
     QwenImageCausalConv3dAdapter,
     WanCausalConv3dAdapter,
 )
@@ -31,6 +33,7 @@ from distvae.modules.adapters.unets.unet_2d_blocks_adapters import UpDecoderBloc
 from distvae.modules.adapters.upsampling_adapters import (
     HunyuanVideo15UpBlockAdapter,
     HunyuanVideoUpBlockAdapter,
+    LTX2VideoUpBlockAdapter,
     QwenImageUpBlockAdapter,
     WanResidualUpBlockAdapter,
     WanUpBlockAdapter,
@@ -38,6 +41,7 @@ from distvae.modules.adapters.upsampling_adapters import (
 from distvae.modules.adapters.midblock_adapters import (
     HunyuanVideo15MidBlockAdapter,
     HunyuanVideoMidBlockAdapter,
+    LTX2VideoMidBlockAdapter,
     QwenImageMidBlockAdapter,
     WanMidBlockAdapter,
 )
@@ -52,6 +56,7 @@ except ModuleNotFoundError:
 QwenImageUpBlock = block(QWEN_IMAGE, "QwenImageUpBlock")
 HunyuanVideoUpBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoUpBlock3D")
 HunyuanVideo15UpBlock3D = block(HUNYUAN_VIDEO_15, "HunyuanVideo15UpBlock3D")
+LTX2VideoUpBlock3d = block(LTX2_VIDEO, "LTX2VideoUpBlock3d")
 
 
 def _decode(run, label: str, *, use_profiler: bool, verbose: bool):
@@ -221,14 +226,13 @@ class _CausalDecoderAdapter(nn.Module):
             )
         return self.decoder(sample, feat_cache=feat_cache, feat_idx=feat_idx)
 
-    def _forward(
-        self,
-        sample: torch.FloatTensor,
-        feat_cache: Optional[torch.FloatTensor] = None,
-        feat_idx: Optional[int] = 0,
-        first_chunk: bool = False,
-        patchify: bool = True
-    ):
+    def _sharded_decode(self, sample: torch.FloatTensor, patchify: bool, run):
+        """Split the sample across ranks, run the decoder on this rank's share, and reassemble
+
+        Kept apart from forward because the families do not agree on what a decoder call looks
+        like: some thread a temporal cache through it, LTX-2 a timestep embedding. Splitting and
+        reassembling is the same either way.
+        """
         adapter = type(self).__name__
         if self.use_uniform_patch and not patchify:
             raise ValueError(
@@ -241,8 +245,7 @@ class _CausalDecoderAdapter(nn.Module):
 
         if patchify:
             sample = self.patchify(sample)
-        output = self._run_decoder(sample, feat_cache, feat_idx, first_chunk)
-        output = self.depatchify(output)
+        output = self.depatchify(run(sample))
 
         if self.use_uniform_patch:
             group_world_size = DistributedEnv.get_group_world_size()
@@ -260,7 +263,11 @@ class _CausalDecoderAdapter(nn.Module):
         patchify: bool = True,
     ):
         return _decode(
-            lambda: self._forward(sample, feat_cache, feat_idx, first_chunk, patchify),
+            lambda: self._sharded_decode(
+                sample,
+                patchify,
+                lambda x: self._run_decoder(x, feat_cache, feat_idx, first_chunk),
+            ),
             self._label,
             use_profiler=self.use_profiler,
             verbose=self.verbose,
@@ -301,3 +308,32 @@ class HunyuanVideo15DecoderAdapter(_CausalDecoderAdapter):
     _mid_adapter = HunyuanVideo15MidBlockAdapter
     _up_block_adapters = ((HunyuanVideo15UpBlock3D, HunyuanVideo15UpBlockAdapter),)
     _takes_feature_cache = False
+
+
+class LTX2VideoDecoderAdapter(_CausalDecoderAdapter):
+    """LTX-2's decoder, which takes a timestep embedding where the others take a temporal cache
+
+    The embedding arrives shaped to broadcast over space, so it needs no sharding of its own,
+    and neither does the channel-to-space shuffle this decoder ends on.
+    """
+
+    _label = "LTX2VideoDecoder"
+    _conv_adapter = LTX2VideoCausalConv3dAdapter
+    _mid_adapter = LTX2VideoMidBlockAdapter
+    _up_block_adapters = ((LTX2VideoUpBlock3d, LTX2VideoUpBlockAdapter),)
+
+    def forward(
+        self,
+        hidden_states: torch.FloatTensor,
+        temb: Optional[torch.FloatTensor] = None,
+        causal: Optional[bool] = None,
+        patchify: bool = True,
+    ):
+        return _decode(
+            lambda: self._sharded_decode(
+                hidden_states, patchify, lambda x: self.decoder(x, temb, causal)
+            ),
+            self._label,
+            use_profiler=self.use_profiler,
+            verbose=self.verbose,
+        )

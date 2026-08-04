@@ -6,6 +6,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import WanMidBlock
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
     HUNYUAN_VIDEO_15,
+    LTX2_VIDEO,
     QWEN_IMAGE,
     block,
     require,
@@ -15,6 +16,7 @@ from distvae.modules.adapters.layers.attn_adapters import GatheredAttentionAdapt
 from distvae.modules.adapters.resnet_adapters import (
     HunyuanVideo15ResnetBlockAdapter,
     HunyuanVideoResnetBlockAdapter,
+    LTX2VideoResnetBlockAdapter,
     QwenImageResidualBlockAdapter,
     WanResidualBlockAdapter,
 )
@@ -22,6 +24,7 @@ from distvae.modules.adapters.resnet_adapters import (
 QwenImageMidBlock = block(QWEN_IMAGE, "QwenImageMidBlock")
 HunyuanVideoMidBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoMidBlock3D")
 HunyuanVideo15MidBlock = block(HUNYUAN_VIDEO_15, "HunyuanVideo15MidBlock")
+LTX2VideoMidBlock3d = block(LTX2_VIDEO, "LTX2VideoMidBlock3d")
 
 
 class _CausalMidBlockAdapter(nn.Module):
@@ -151,3 +154,38 @@ class HunyuanVideoMidBlockAdapter(nn.Module):
 
     def forward(self, hidden_states):
         return self.mid_block(hidden_states)
+
+
+class LTX2VideoMidBlockAdapter(nn.Module):
+    """Shards an LTX-2 mid block, which is only residual blocks
+
+    Alone among these families LTX-2 puts no attention in its mid block, so nothing here needs
+    to see the whole image and every rank can stay on its own patch throughout.
+    """
+
+    def __init__(
+        self,
+        mid_block: nn.Module,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        supported = resolved(LTX2VideoMidBlock3d)
+        require(supported, adapter, "LTX2VideoMidBlock3d")
+        assert isinstance(mid_block, supported), (
+            f"{adapter} does not support mid block except LTX2VideoMidBlock3d"
+        )
+        self.mid_block = mid_block
+        mid_block.resnets = nn.ModuleList([
+            LTX2VideoResnetBlockAdapter(
+                resnet,
+                conv_block_size=conv_block_size,
+                patch_dim=patch_dim,
+                use_uniform_patch=use_uniform_patch,
+            ) for resnet in mid_block.resnets
+        ])
+
+    def forward(self, hidden_states, temb=None, generator=None, causal: bool = True):
+        return self.mid_block(hidden_states, temb, generator, causal=causal)

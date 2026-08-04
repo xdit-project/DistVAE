@@ -7,6 +7,7 @@ from distvae.models.resnet import PatchResnetBlock2D
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
     HUNYUAN_VIDEO_15,
+    LTX2_VIDEO,
     QWEN_IMAGE,
     block,
     require,
@@ -16,6 +17,7 @@ from distvae.modules.adapters.layers.conv_adapters import (
     Conv2dAdapter,
     HunyuanVideo15CausalConv3dAdapter,
     HunyuanVideoCausalConv3dAdapter,
+    LTX2VideoCausalConv3dAdapter,
     QwenImageCausalConv3dAdapter,
     WanCausalConv3dAdapter,
 )
@@ -26,6 +28,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, Wa
 QwenImageResidualBlock = block(QWEN_IMAGE, "QwenImageResidualBlock")
 HunyuanVideoResnetBlockCausal3D = block(HUNYUAN_VIDEO, "HunyuanVideoResnetBlockCausal3D")
 HunyuanVideo15ResnetBlock = block(HUNYUAN_VIDEO_15, "HunyuanVideo15ResnetBlock")
+LTX2VideoResnetBlock3d = block(LTX2_VIDEO, "LTX2VideoResnetBlock3d")
 
 
 class ResnetBlock2DAdapter(nn.Module):
@@ -195,3 +198,52 @@ class HunyuanVideo15ResnetBlockAdapter(_PaddedCausalResnetBlockAdapter):
     _supported = resolved(HunyuanVideo15ResnetBlock)
     _requires = "HunyuanVideo15ResnetBlock"
     _conv_adapter = HunyuanVideo15CausalConv3dAdapter
+
+
+class LTX2VideoResnetBlockAdapter(nn.Module):
+    """Shards an LTX-2 residual block, which is its two convolutions and nothing else.
+
+    Both its norms reduce over channels, its shortcut is a 1x1x1 convolution reading one
+    position per output, and its timestep conditioning arrives shaped to broadcast over space.
+    """
+
+    _supported = resolved(LTX2VideoResnetBlock3d)
+    _requires = "LTX2VideoResnetBlock3d"
+
+    def __init__(
+        self,
+        resnet: nn.Module,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
+        assert isinstance(resnet, self._supported), (
+            f"{adapter} does not support resnet except {self._requires}"
+        )
+        if resnet.per_channel_scale1 is not None or resnet.per_channel_scale2 is not None:
+            # Each rank would draw its own noise for its own rows, and the ranks together would
+            # not reconstruct the field a single one draws, so a sharded decode could not match
+            # an unsharded one at all. No shipped LTX-2 or LTX-2.3 config turns this on.
+            raise NotImplementedError(
+                f"{adapter} cannot shard a residual block with inject_noise enabled: the noise "
+                f"is drawn per rank and would not add up to the noise one rank draws. Decode "
+                f"this VAE on a single rank, or tile it instead."
+            )
+        self.resnet = resnet
+        for name in ("conv1", "conv2"):
+            setattr(
+                resnet,
+                name,
+                LTX2VideoCausalConv3dAdapter(
+                    getattr(resnet, name),
+                    block_size=conv_block_size,
+                    patch_dim=patch_dim,
+                    use_uniform_patch=use_uniform_patch,
+                ),
+            )
+
+    def forward(self, inputs, temb=None, generator=None, causal: bool = True):
+        return self.resnet(inputs, temb, generator, causal=causal)

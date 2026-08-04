@@ -10,6 +10,7 @@ from distvae.models.layers.conv3d import PatchConv3d
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
     HUNYUAN_VIDEO_15,
+    LTX2_VIDEO,
     QWEN_IMAGE,
     block,
     require,
@@ -19,6 +20,7 @@ from distvae.modules.adapters.diffusers_blocks import (
 QwenImageCausalConv3d = block(QWEN_IMAGE, "QwenImageCausalConv3d")
 HunyuanVideoCausalConv3d = block(HUNYUAN_VIDEO, "HunyuanVideoCausalConv3d")
 HunyuanVideo15CausalConv3d = block(HUNYUAN_VIDEO_15, "HunyuanVideo15CausalConv3d")
+LTX2VideoCausalConv3d = block(LTX2_VIDEO, "LTX2VideoCausalConv3d")
 
 
 class Conv2dAdapter(nn.Module):
@@ -237,3 +239,58 @@ class HunyuanVideoCausalConv3dAdapter(_PaddedCausalConv3dAdapter):
 class HunyuanVideo15CausalConv3dAdapter(_PaddedCausalConv3dAdapter):
     _supported = resolved(HunyuanVideo15CausalConv3d)
     _requires = "HunyuanVideo15CausalConv3d"
+
+
+class LTX2VideoCausalConv3dAdapter(nn.Module):
+    """Shards LTX-2's causal convolution, which needs less rearranging than the others.
+
+    Its spatial padding already sits inside the nn.Conv3d rather than being applied around it,
+    so swapping that convolution for a PatchConv3d built from the same arguments is the whole of
+    it. The temporal padding repeats the first and last frames along an axis nobody splits, and
+    happens in the wrapped module's own forward, which is left to run as it is.
+    """
+
+    _supported = resolved(LTX2VideoCausalConv3d)
+    _requires = "LTX2VideoCausalConv3d"
+
+    def __init__(
+        self,
+        causal_conv3d: nn.Module,
+        *,
+        block_size = 0,
+        patch_dim: int = -2,
+        use_uniform_patch: bool = False,
+    ):
+        super().__init__()
+        adapter = type(self).__name__
+        require(self._supported, adapter, self._requires)
+        assert isinstance(causal_conv3d, self._supported), (
+            f"{adapter} does not support causal_conv3d except {self._requires}"
+        )
+        conv = causal_conv3d.conv
+        for i in conv.dilation:
+            assert i == 1, f"dilation is not supported in {adapter}"
+        self.causal_conv3d = causal_conv3d
+        sharded = PatchConv3d(
+            in_channels=conv.in_channels,
+            out_channels=conv.out_channels,
+            kernel_size=conv.kernel_size,
+            stride=conv.stride,
+            padding=conv.padding,
+            dilation=conv.dilation,
+            groups=conv.groups,
+            bias=conv.bias is not None,
+            padding_mode=conv.padding_mode,
+            device=conv.weight.device,
+            dtype=conv.weight.dtype,
+            block_size=block_size,
+            patch_dim=patch_dim,
+            use_uniform_patch=use_uniform_patch,
+        )
+        sharded.weight.data = conv.weight.data
+        if conv.bias is not None:
+            sharded.bias.data = conv.bias.data
+        causal_conv3d.conv = sharded
+
+    def forward(self, hidden_states, causal: bool = True):
+        return self.causal_conv3d(hidden_states, causal=causal)
