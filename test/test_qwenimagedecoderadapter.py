@@ -80,6 +80,14 @@ def test_more_than_one_frame_still_decodes(master_port, seed=42):
 
 
 @pytest.mark.gloo
+def test_latent_rows_that_do_not_divide_by_the_rank_count(master_port, seed=42):
+    # 16 rows over 3 ranks. This used to pad the latent up to a size that did divide and crop
+    # the decode afterwards, which is not the same computation: the pad stops being zeros at the
+    # first convolution and reaches every kept pixel through the mid block's attention.
+    run_distributed(worker, 3, (1, 16, 16, 0, seed), master_port)
+
+
+@pytest.mark.gloo
 def test_the_chunked_convolution_path_decodes_the_same(master_port, seed=42):
     run_distributed(worker, 2, (1, 16, 16, 32, seed), master_port)
 

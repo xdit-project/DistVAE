@@ -101,6 +101,12 @@ def test_the_chunked_convolution_path_decodes_the_same(master_port, seed=42):
     run_distributed(worker, 2, (1, 16, 16, True, 32, seed), master_port)
 
 
+@pytest.mark.gloo
+def test_latent_rows_that_do_not_divide_by_the_rank_count(master_port, seed=42):
+    # 16 rows over 3 ranks, the case the old pad-and-crop split got wrong everywhere at once.
+    run_distributed(worker, 3, (1, 16, 16, True, 0, seed), master_port)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="HunyuanVideoDecoderAdapter GLOO tests")
     parser.add_argument("--world_size", type=int, default=None)

@@ -28,7 +28,6 @@ class WanEncoderAdapter(nn.Module):
         encoder,
         vae_group: ProcessGroup = None,
         *,
-        use_uniform_patch: bool = True,
         vae_scale_factor: int = 8,
         conv_block_size = 0,
         patch_dim: int = -2,
@@ -48,7 +47,7 @@ class WanEncoderAdapter(nn.Module):
             encoder.conv_in,
             block_size=conv_block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
+            use_uniform_patch=False,
         )
         # Patch the down_blocks
         down_blocks = []
@@ -60,7 +59,7 @@ class WanEncoderAdapter(nn.Module):
                         down_block,
                         conv_block_size=conv_block_size,
                         patch_dim=patch_dim,
-                        use_uniform_patch=use_uniform_patch
+                        use_uniform_patch=False,
                     )
                 )
             elif isinstance(down_block, WanResidualBlock):
@@ -70,7 +69,7 @@ class WanEncoderAdapter(nn.Module):
                         down_block,
                         conv_block_size=conv_block_size,
                         patch_dim=patch_dim,
-                        use_uniform_patch=use_uniform_patch,
+                        use_uniform_patch=False,
                     )
                 )
             elif isinstance(down_block, WanResample):
@@ -80,7 +79,7 @@ class WanEncoderAdapter(nn.Module):
                         down_block,
                         conv_block_size=conv_block_size,
                         patch_dim=patch_dim,
-                        use_uniform_patch=use_uniform_patch
+                        use_uniform_patch=False,
                     )
                 )
             elif isinstance(down_block, WanAttentionBlock):
@@ -102,22 +101,19 @@ class WanEncoderAdapter(nn.Module):
             encoder.mid_block,
             conv_block_size=conv_block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
+            use_uniform_patch=False,
         )
         # Patch the conv_out layer
         self.encoder.conv_out = WanCausalConv3dAdapter(
             encoder.conv_out,
             block_size=conv_block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch
+            use_uniform_patch=False,
         )
-        self.use_uniform_patch = use_uniform_patch
-        self.patchify = Patchify(
-            patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
-            scale_factor=vae_scale_factor,
-        )
-        self.depatchify = DePatchify(patch_dim=patch_dim, use_uniform_patch=use_uniform_patch)
+        # Each band is a whole multiple of what the encoder narrows by, so it starts on the grid
+        # the strided convolutions step along and the latent rows it produces are its own.
+        self.patchify = Patchify(patch_dim=patch_dim, scale_factor=vae_scale_factor)
+        self.depatchify = DePatchify(patch_dim=patch_dim)
 
     def _forward(
         self,
@@ -127,23 +123,9 @@ class WanEncoderAdapter(nn.Module):
         patchify: bool = True,
     ):
         """Internal forward with optional patchify."""
-        if self.use_uniform_patch and not patchify:
-            raise ValueError("WanEncoderAdapter does not support use_uniform_patch for already patchified inputs.")
-
-        if self.use_uniform_patch:
-            patch_dim = self.patch_dim if self.patch_dim >= 0 else sample.ndim + self.patch_dim
-            patch_dim_size = sample.shape[patch_dim]
-
         if patchify:
             sample = self.patchify(sample)
-        output = self.encoder(sample, feat_cache=feat_cache, feat_idx=feat_idx)
-        output = self.depatchify(output)
-
-        if self.use_uniform_patch:
-            downsampling_factor = self.vae_scale_factor
-            output = output.narrow(patch_dim, 0, patch_dim_size // downsampling_factor)
-
-        return output
+        return self.depatchify(self.encoder(sample, feat_cache=feat_cache, feat_idx=feat_idx))
 
     def forward(
         self,

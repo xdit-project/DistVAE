@@ -32,8 +32,6 @@ class WanZeroPadConv2d(nn.Conv2d, PatchConvMixin):
         patch_dim: int = -2,
         use_uniform_patch: bool = True,
     ) -> None:
-        if not use_uniform_patch:
-            raise NotImplementedError("WanZeroPadConv2d not implemented for use_uniform_patch=False")
         if isinstance(dilation, int):
             assert dilation == 1, "dilation is not supported in WanZeroPadConv2d"
         else:
@@ -99,6 +97,8 @@ class WanZeroPadConv2d(nn.Conv2d, PatchConvMixin):
         reversed_zero_padding = tuple(self.reversed_zero_padding)
 
         patch_dim = self.patch_dim if self.patch_dim >= 0 else input.ndim + self.patch_dim
+        # The pad-then-stride-2 arithmetic below assumes each band halves cleanly. Bands are cut
+        # in multiples of what the whole encoder narrows by, so they are still even here.
         assert input.shape[patch_dim] % 2 == 0, "input.shape[patch_dim] must be even"
 
         # Single rank: use standard F.conv2d

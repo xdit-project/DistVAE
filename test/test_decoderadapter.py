@@ -79,6 +79,13 @@ def test_the_chunked_convolution_path_decodes_the_same(master_port, seed=42):
     run_distributed(worker, 2, (16, 16, 32, seed), master_port)
 
 
+@pytest.mark.gloo
+def test_latent_rows_that_do_not_divide_by_the_rank_count(master_port, seed=42):
+    # This adapter was never exposed to the pad-and-crop the causal ones used, because
+    # PatchDecoder splits after its mid block rather than before. Pinned so it stays that way.
+    run_distributed(worker, 3, (16, 16, 0, seed), master_port)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DecoderAdapter GLOO multi-rank tests")
     parser.add_argument("--world_size", type=int, default=None)

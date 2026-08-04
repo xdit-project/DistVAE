@@ -112,6 +112,12 @@ def test_the_chunked_convolution_path_decodes_the_same(master_port, seed=42):
 
 
 @pytest.mark.gloo
+def test_latent_rows_that_do_not_divide_by_the_rank_count(master_port, seed=42):
+    # 16 rows over 3 ranks, the case the old pad-and-crop split got wrong.
+    run_distributed(worker, 3, (1, 16, 16, "reflect", 0, seed), master_port)
+
+
+@pytest.mark.gloo
 def test_injected_noise_is_refused_rather_than_drawn_per_rank(master_port):
     # Each rank would draw noise for its own rows, and together they would not reconstruct what
     # one rank draws, so the decode could not match its reference. No shipped config enables it.

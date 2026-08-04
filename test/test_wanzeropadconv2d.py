@@ -85,8 +85,8 @@ def worker(
         use_uniform_patch=True,
     ).eval()
 
-    patchify = Patchify(patch_dim=patch_dim, use_uniform_patch=False)
-    depatchify = DePatchify(patch_dim=patch_dim, use_uniform_patch=False)
+    patchify = Patchify(patch_dim=patch_dim)
+    depatchify = DePatchify(patch_dim=patch_dim)
 
     try:
         with torch.no_grad():

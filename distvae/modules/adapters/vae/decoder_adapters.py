@@ -165,7 +165,6 @@ class _CausalDecoderAdapter(nn.Module):
         decoder: nn.Module,
         vae_group: ProcessGroup = None,
         *,
-        use_uniform_patch: bool = True,
         use_profiler: bool = False,
         verbose: bool = False,
         conv_block_size = 0,
@@ -180,7 +179,9 @@ class _CausalDecoderAdapter(nn.Module):
         DistributedEnv.initialize(vae_group)
         self.patch_dim = patch_dim
         DistributedEnv.set_patch_dim(patch_dim)
-        options = dict(patch_dim=patch_dim, use_uniform_patch=use_uniform_patch)
+        # Bands differ in size where the rows do not divide by the rank count, so every
+        # convolution has to read the sizes rather than assume its neighbours match it.
+        options = dict(patch_dim=patch_dim, use_uniform_patch=False)
         self.decoder = decoder
         self.decoder.conv_in = self._conv_adapter(
             decoder.conv_in, block_size=conv_block_size, **options
@@ -199,9 +200,8 @@ class _CausalDecoderAdapter(nn.Module):
         # norms the other families end on do not, and are left as they are.
         if isinstance(getattr(decoder, "conv_norm_out", None), nn.GroupNorm):
             self.decoder.conv_norm_out = GroupNormAdapter(decoder.conv_norm_out)
-        self.patchify = Patchify(patch_dim=patch_dim, use_uniform_patch=use_uniform_patch)
-        self.depatchify = DePatchify(patch_dim=patch_dim, use_uniform_patch=use_uniform_patch)
-        self.use_uniform_patch = use_uniform_patch
+        self.patchify = Patchify(patch_dim=patch_dim)
+        self.depatchify = DePatchify(patch_dim=patch_dim)
         self.use_profiler = use_profiler
         self.verbose = verbose
         self.vae_group = vae_group
@@ -233,26 +233,9 @@ class _CausalDecoderAdapter(nn.Module):
         like: some thread a temporal cache through it, LTX-2 a timestep embedding. Splitting and
         reassembling is the same either way.
         """
-        adapter = type(self).__name__
-        if self.use_uniform_patch and not patchify:
-            raise ValueError(
-                f"{adapter} does not support use_uniform_patch for already patchified inputs."
-            )
-
-        if self.use_uniform_patch:
-            patch_dim = self.patch_dim if self.patch_dim >= 0 else sample.ndim + self.patch_dim
-            patch_dim_size = sample.shape[patch_dim]
-
         if patchify:
             sample = self.patchify(sample)
-        output = self.depatchify(run(sample))
-
-        if self.use_uniform_patch:
-            group_world_size = DistributedEnv.get_group_world_size()
-            upsampling_factor = output.shape[patch_dim] // (sample.shape[patch_dim] * group_world_size)
-            output = output.narrow(patch_dim, 0, patch_dim_size * upsampling_factor)
-
-        return output
+        return self.depatchify(run(sample))
 
     def forward(
         self,
