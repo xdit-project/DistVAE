@@ -603,6 +603,14 @@ def main():
                              "implies --enable-tiling. Also takes 'half' or 'quarter', which is what "
                              "one matrix across families needs: each VAE has its own native window, "
                              "so a fixed number is a different fraction of it for every one of them")
+    parser.add_argument("--grid-arms", default=None,
+                        help="measure several arms in ONE process, comma separated, e.g. "
+                             "'none,pvae,tile,tile-half'. Most of a pod's wall clock is startup, "
+                             "install, imports and building the VAE, none of which a second arm "
+                             "needs to pay again, so a grid of 16 costs far less than 16 runs")
+    parser.add_argument("--grid-shapes", default=None,
+                        help="shapes to cross the arms with, comma separated, HxW or HxWxFRAMES, "
+                             "e.g. '1024x1024,2048x2048,4096x4096'. Defaults to --height/--width")
     parser.add_argument("--tile-batch", choices=["batched", "upstream"], default="batched",
                         help="batched installs xDiT's batched tiled_decode under the budget rule; "
                              "upstream leaves diffusers decoding one tile per call")
@@ -624,7 +632,8 @@ def main():
                         help="process group timeout; the first decode on a new shape pays MIOpen autotune")
     parser.add_argument("--out", default=None, help="write the report here as JSON")
     args = parser.parse_args()
-    tile_this_run = args.enable_tiling or args.vae_tile_size is not None
+    if args.grid_arms and not args.grid_shapes:
+        args.grid_shapes = f"{args.height}x{args.width}x{args.frames}"
 
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -654,7 +663,9 @@ def main():
     say(f"world_size={world_size} device={torch.cuda.get_device_name(local_rank)}")
     say(f"torch={torch.__version__} diffusers={diffusers.__version__} "
         f"distvae={getattr(distvae, '__version__', 'unknown')}")
-    say(f"family={args.family} half={args.half} {args.height}x{args.width} dtype={args.dtype}")
+    say(f"family={args.family} half={args.half} dtype={args.dtype} "
+        f"shapes={args.grid_shapes or f'{args.height}x{args.width}'} "
+        f"arms={args.grid_arms or 'single'}")
 
     # Before the VAE exists, because importing xfuser swaps torch.nn.GroupNorm for AITER's, and
     # both the adapters and xDiT's selection ask isinstance(norm, nn.GroupNorm). A VAE built
@@ -663,20 +674,123 @@ def main():
     _vae_parallel()
 
     spec = FAMILIES[args.family]
+    cells = grid_cells(args)
+    references = {}
+    reports = []
+
+    for index, cell in enumerate(cells):
+        if len(cells) > 1:
+            say(f"\n===== cell {index + 1}/{len(cells)}: {cell['name']} "
+                f"{cell['height']}x{cell['width']}"
+                f"{'x' + str(cell['frames']) + 'f' if spec['temporal'] else ''} =====")
+        # One failed cell costs that cell. Ranks agree on the verdict before anyone moves on,
+        # because a rank that carried on into the next cell's collectives while the others were
+        # unwinding an exception would hang the pod rather than lose a row.
+        try:
+            report = measure_cell(
+                args, spec, cell, device, dtype, group, world_size, rank, say, references
+            )
+            failed = None
+        except Exception as error:  # noqa: BLE001 - the whole point is to keep the grid going
+            report, failed = None, f"{type(error).__name__}: {error}"
+            say(f"cell failed: {failed}")
+        torch.cuda.empty_cache()
+        votes = torch.tensor([0.0 if failed else 1.0], device=device)
+        dist.all_reduce(votes)
+        if votes.item() < world_size:
+            reports.append({**cell, "error": failed or "another rank failed this cell"})
+            continue
+        reports.append(report)
+        if rank == 0:
+            print_report(report, args.half)
+
+    if rank == 0 and args.out:
+        with open(args.out, "w") as handle:
+            json.dump(reports if len(reports) > 1 else reports[0], handle, indent=2)
+        print(f"\nwrote {args.out}", flush=True)
+
+    dist.barrier()
+    dist.destroy_process_group()
+    # A grid is a measurement, not a gate: it is expected to contain arms that disagree with the
+    # reference, so only a single run answers with its exit code.
+    if len(reports) == 1:
+        agreement = (reports[0] or {}).get("agreement")
+        if reports[0] is None or (agreement is not None and not agreement["ok"]):
+            raise SystemExit(1)
+
+
+def grid_cells(args) -> list:
+    """The arms and shapes to measure, one dict each; a plain run is a grid of one"""
+    tiling = "native" if args.enable_tiling else None
+    if args.vae_tile_size is not None:
+        tiling = args.vae_tile_size
+    single = {
+        "name": "single",
+        "parallel_vae": not args.no_parallel_vae,
+        "tiling": tiling,
+        "height": args.height,
+        "width": args.width,
+        "frames": args.frames,
+    }
+    if not args.grid_arms:
+        return [single]
+
+    arms = {
+        # The four arms in the order they are read: each is the one above it plus one thing.
+        "none": {"parallel_vae": False, "tiling": None},
+        "pvae": {"parallel_vae": True, "tiling": None},
+        "tile": {"parallel_vae": True, "tiling": "native"},
+        "tile-half": {"parallel_vae": True, "tiling": "half"},
+        "tile-quarter": {"parallel_vae": True, "tiling": "quarter"},
+        # Tiling with nothing to amortise, which separates the collective saving from the plain
+        # effect of handing the GPU smaller convolutions.
+        "tile-nopvae": {"parallel_vae": False, "tiling": "native"},
+    }
+    shapes = []
+    for text in args.grid_shapes.split(","):
+        parts = text.strip().lower().split("x")
+        if len(parts) not in (2, 3):
+            raise SystemExit(f"--grid-shapes takes HxW or HxWxFRAMES, not {text!r}")
+        shapes.append(
+            {
+                "height": int(parts[0]),
+                "width": int(parts[1]),
+                "frames": int(parts[2]) if len(parts) == 3 else args.frames,
+            }
+        )
+
+    cells = []
+    for shape in shapes:
+        for name in args.grid_arms.split(","):
+            name = name.strip()
+            if name not in arms:
+                raise SystemExit(f"unknown arm {name!r}; pick from {sorted(arms)}")
+            cells.append({"name": name, **arms[name], **shape})
+    return cells
+
+
+def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, references):
+    """Build, optionally shard, optionally tile, and measure one arm at one shape
+
+    The VAE is rebuilt per cell rather than reused: sharding and the batched decode both replace
+    parts of it in place, and unpicking that reliably is harder than paying for a fresh one from
+    a fixed seed. What is reused is the reference, which depends only on the shape - and which is
+    the expensive part, being an unsharded decode of the whole thing.
+    """
     vae = build_vae(args.family, dtype, device)
     sample = sample_for(
-        spec, args.half, args.height, args.width, dtype, device, args.batch, args.frames
+        spec, args.half, cell["height"], cell["width"], dtype, device, args.batch, cell["frames"]
     )
     say(f"{'latent' if args.half == 'decoder' else 'input'} {tuple(sample.shape)}")
 
     built = describe(vae, args.half)
     say(f"{args.half}: {json.dumps(built)}")
-    if built["adapter"] is None and not args.no_parallel_vae:
+    if built["adapter"] is None and cell["parallel_vae"]:
         raise SystemExit(
             f"xDiT has no adapter for this {type(vae).__name__} {args.half}. Nothing to measure."
         )
     if args.describe_only:
-        return
+        return None
 
     # The reference has to be taken before sharding, which replaces the half in place. Every rank
     # computes it rather than rank 0 alone: the seeds match, so the weights match, and leaving it
@@ -687,18 +801,19 @@ def main():
         latent_area *= sample.shape[2]
     if args.half == "encoder":
         latent_area //= spec["spatial"] ** 2
+    key = (cell["height"], cell["width"], cell["frames"])
     take_reference = not args.skip_reference and latent_area <= args.reference_max_latent_elems
-    if not args.skip_reference and not take_reference:
+    if not args.skip_reference and not take_reference and key not in references:
         say(f"no single-rank reference: a {sample.shape[-2]}x{sample.shape[-1]} latent is over "
             f"--reference-max-latent-elems {args.reference_max_latent_elems}, and an unsharded "
             f"decode that size is what sharding exists to avoid. Check agreement at a smaller one.")
-    reference = None
-    if take_reference:
+    if take_reference and key not in references:
         with torch.no_grad():
-            reference = run_half(vae, args.half, sample).float().cpu()
+            references[key] = run_half(vae, args.half, sample).float().cpu()
+    reference = references.get(key)
 
     adapter = None
-    if args.no_parallel_vae:
+    if not cell["parallel_vae"]:
         say("parallel VAE off: every rank decodes the whole half, as an unsharded run does")
     else:
         adapter = parallelize(vae, group, args.half)
@@ -707,10 +822,11 @@ def main():
     # After sharding, which is the order the runner uses: _setup_parallel_vae runs during load and
     # _enable_options after it, so the batched decode is installed over an already-sharded decoder.
     tiling = {"enabled": False}
-    if tile_this_run:
+    if cell["tiling"]:
         if args.half != "decoder":
             raise SystemExit("tiling is a decode-side feature; --enable-tiling needs --half decoder")
-        tiling = setup_tiling(vae, args.vae_tile_size, args.tile_batch, world_size, say)
+        window = None if cell["tiling"] == "native" else cell["tiling"]
+        tiling = setup_tiling(vae, window, args.tile_batch, world_size, say)
         say(f"tiling: {json.dumps(tiling)}")
 
     def once():
@@ -771,15 +887,19 @@ def main():
                     "tiling changes the arithmetic; this is the size of that change, not a gate"
                 )
 
-    report = {
+    import diffusers
+    import distvae
+
+    return {
+        "arm": cell["name"],
         "family": args.family,
         "half": args.half,
-        "height": args.height,
-        "width": args.width,
-        "frames": args.frames if spec["temporal"] else None,
+        "height": cell["height"],
+        "width": cell["width"],
+        "frames": cell["frames"] if spec["temporal"] else None,
         "dtype": args.dtype,
         "world_size": world_size,
-        "parallel_vae": not args.no_parallel_vae,
+        "parallel_vae": cell["parallel_vae"],
         "adapter": adapter,
         "tiling": tiling,
         "latent_shape": list(sample.shape),
@@ -794,37 +914,32 @@ def main():
         },
     }
 
-    if rank == 0:
-        print(f"\n--- collectives per {args.half} call (rank 0, and the most any rank made) ---",
-              flush=True)
-        for name, entry in collectives["by_call"].items():
-            print(f"  {name:<24} {entry['calls']:>6} calls  "
-                  f"{collectives['by_call_max'][name]:>6} max  "
-                  f"{entry['bytes'] / 1e6:>10.2f} MB", flush=True)
-        print(f"  {'TOTAL':<24} {collectives['total_calls']:>6} calls  "
-              f"{collectives['total_calls_max']:>6} max  "
-              f"{collectives['total_bytes'] / 1e6:>10.2f} MB", flush=True)
-        print(f"  by rank: {collectives['total_calls_by_rank']}", flush=True)
-        print("\n--- top call sites ---", flush=True)
-        for site, entry in list(collectives["by_site"].items())[:12]:
-            print(f"  {entry['calls']:>6}  {site}", flush=True)
-        print(f"\nmedian {timing['median_s'] * 1000:.1f} ms   peak {peak_mb:.0f} MB", flush=True)
-        if agreement is not None:
-            verdict = "matches" if agreement["ok"] else "DIFFERS FROM"
-            print(f"output {verdict} the single-rank reference: {agreement}", flush=True)
-            print(f"error vs untiled unsharded: "
-                  f"max {agreement.get('max_rel_to_scale', 0) * 100:.2f}%  "
-                  f"mean {agreement.get('mean_rel_to_scale', 0) * 100:.3f}%  "
-                  f"share off by >1% {agreement.get('share_off_by_1pc', 0) * 100:.2f}%", flush=True)
-        if args.out:
-            with open(args.out, "w") as handle:
-                json.dump(report, handle, indent=2)
-            print(f"\nwrote {args.out}", flush=True)
 
-    dist.barrier()
-    dist.destroy_process_group()
-    if agreement is not None and not agreement["ok"]:
-        raise SystemExit(1)
+def print_report(report: dict, half: str) -> None:
+    """One cell's numbers, in the shape the collector reads them back out of"""
+    collectives, timing = report["collectives"], report["timing"]
+    print(f"\n--- collectives per {half} call (rank 0, and the most any rank made) ---", flush=True)
+    for name, entry in collectives["by_call"].items():
+        print(f"  {name:<24} {entry['calls']:>6} calls  "
+              f"{collectives['by_call_max'][name]:>6} max  "
+              f"{entry['bytes'] / 1e6:>10.2f} MB", flush=True)
+    print(f"  {'TOTAL':<24} {collectives['total_calls']:>6} calls  "
+          f"{collectives['total_calls_max']:>6} max  "
+          f"{collectives['total_bytes'] / 1e6:>10.2f} MB", flush=True)
+    print(f"  by rank: {collectives['total_calls_by_rank']}", flush=True)
+    print("\n--- top call sites ---", flush=True)
+    for site, entry in list(collectives["by_site"].items())[:12]:
+        print(f"  {entry['calls']:>6}  {site}", flush=True)
+    print(f"\nmedian {timing['median_s'] * 1000:.1f} ms   peak {report['peak_vram_mb']:.0f} MB",
+          flush=True)
+    agreement = report.get("agreement")
+    if agreement is not None:
+        verdict = "matches" if agreement["ok"] else "DIFFERS FROM"
+        print(f"output {verdict} the single-rank reference: {agreement}", flush=True)
+        print(f"error vs untiled unsharded: "
+              f"max {agreement.get('max_rel_to_scale', 0) * 100:.2f}%  "
+              f"mean {agreement.get('mean_rel_to_scale', 0) * 100:.3f}%  "
+              f"share off by >1% {agreement.get('share_off_by_1pc', 0) * 100:.2f}%", flush=True)
 
 
 if __name__ == "__main__":
