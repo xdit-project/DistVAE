@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import zlib
 
 import pytest
 import torch
@@ -98,6 +99,10 @@ def worker(
                 f"WanZeroPadConv2d distributed output mismatch "
                 f"(max diff {(y_ref - y_merged).abs().max().item():.6g})"
             )
+        # Leave together. A rank that tears its Gloo context down while another is still holding
+        # one exits through std::terminate, which pytest can only report as a spawned process
+        # dying on SIGABRT - a teardown race wearing the costume of a failed assertion.
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 
@@ -120,9 +125,11 @@ def _run_one(
 @pytest.fixture
 def master_port(request):
     """Unique port per test to avoid Address already in use when tests run sequentially."""
+    # crc32 rather than hash(): the built-in is salted per interpreter, so the port a test binds
+    # moved every run and a failure could not be reproduced by asking for that test again.
     base = 29600
     nodeid = request.node.nodeid
-    return base + (hash(nodeid) % 10000)
+    return base + (zlib.crc32(nodeid.encode()) % 10000)
 
 
 @pytest.mark.gloo
