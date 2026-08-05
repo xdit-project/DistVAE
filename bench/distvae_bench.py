@@ -27,9 +27,13 @@ import os
 import sys
 import time
 from collections import defaultdict
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+
+# Captured before anything can swap it out, which importing xfuser does.
+TORCH_GROUPNORM = torch.nn.GroupNorm
 
 
 # --------------------------------------------------------------------------------------------
@@ -198,30 +202,68 @@ def latent_for(vae, height, width, dtype, device):
 # --------------------------------------------------------------------------------------------
 
 
-def parallelize(vae, group, half):
-    """Shard one half of the VAE, returning the adapter's name
-
-    Routed through xDiT's vae_parallel when it is available, so the harness exercises the same
-    adapter-selection path a real run takes rather than a second copy of that judgement.
-    """
+def _vae_parallel():
+    """xDiT's adapter selection, which is the thing under test and not optional here"""
+    # Choosing an adapter here instead would measure this file's opinion of which one fits, and
+    # a run would keep going with the wrong one rather than say the installed xDiT is too old.
     try:
         from xfuser.core.utils import vae_parallel
-    except ImportError:
-        vae_parallel = None
+    except ImportError as e:
+        raise SystemExit(
+            "xfuser.core.utils.vae_parallel is not importable, so there is no adapter selection "
+            "to exercise. Point the runner at an xDiT that carries it (-XditBranch)."
+        ) from e
 
-    if vae_parallel is not None:
-        if half == "decoder":
-            return vae_parallel.parallelize_decoder(vae, group)
-        return vae_parallel.parallelize_encoder(vae, group)
+    # xDiT does this while validating --use_parallel_vae, before it loads a pipeline: DistVAE's
+    # GroupNormAdapter reads num_channels off the norm and AITER's GroupNorm does not carry it,
+    # while still subclassing nn.GroupNorm well enough to be selected. A VAE built here rather
+    # than by a runner model has to be brought to the same state by hand.
+    if torch.nn.GroupNorm.__module__ == "aiter.ops.groupnorm":
+        torch.nn.GroupNorm = TORCH_GROUPNORM
 
-    from distvae.modules.adapters.vae.decoder_adapters import DecoderAdapter
-    from distvae.modules.adapters.vae.encoder_adapters import EncoderAdapter
+    return vae_parallel
 
+
+def describe(vae, half):
+    """What this half is assembled from, and which adapter xDiT picks for it
+
+    Printed whether or not sharding then works, because a refusal or an assertion from inside a
+    half-replaced decoder is only readable next to the blocks it was looking at.
+    """
+    vae_parallel = _vae_parallel()
+    part = getattr(vae, half)
+    blocks = tuple(getattr(part, "up_blocks" if half == "decoder" else "down_blocks", None) or ())
+    chooser = (
+        vae_parallel.decoder_adapter_name if half == "decoder" else vae_parallel.encoder_adapter_name
+    )
+    norm = getattr(part, "conv_norm_out", None)
+
+    # Qualified, because selection is by isinstance and diffusers has more than one class per
+    # name: a decoder can report the blocks an adapter wants and still not be the one it means.
+    def named(obj):
+        cls = type(obj)
+        return f"{cls.__module__}.{cls.__name__}"
+
+    from diffusers.models.unets.unet_2d_blocks import DownEncoderBlock2D, UpDecoderBlock2D
+
+    wanted = UpDecoderBlock2D if half == "decoder" else DownEncoderBlock2D
+    return {
+        "class": named(part),
+        "blocks": sorted({named(b) for b in blocks}),
+        "blocks_are_2d": all(isinstance(b, wanted) for b in blocks) if blocks else False,
+        "mid_block": named(getattr(part, "mid_block", None)),
+        "conv_norm_out": named(norm),
+        "norm_is_nn_groupnorm": isinstance(norm, torch.nn.GroupNorm),
+        "adapter": chooser(vae),
+    }
+
+
+def parallelize(vae, group, half):
+    """Shard one half of the VAE, returning the adapter's name"""
+    vae_parallel = _vae_parallel()
     if half == "decoder":
-        vae.decoder = DecoderAdapter(vae.decoder, vae_group=group).to(vae.device)
-        return "DecoderAdapter"
-    vae.encoder = EncoderAdapter(vae.encoder, vae_group=group).to(vae.device)
-    return "EncoderAdapter"
+        return vae_parallel.parallelize_decoder(vae, group)
+    return vae_parallel.parallelize_encoder(vae, group)
 
 
 # --------------------------------------------------------------------------------------------
@@ -259,6 +301,13 @@ def main():
     parser.add_argument("--atol", type=float, default=2e-2)
     parser.add_argument("--skip-reference", action="store_true",
                         help="skip the single-rank comparison, which needs the whole half to fit on one GPU")
+    parser.add_argument("--reference-max-latent-elems", type=int, default=16384,
+                        help="above this latent area the reference is skipped on its own: an unsharded "
+                             "decode at that size is the thing sharding exists to avoid")
+    parser.add_argument("--describe-only", action="store_true",
+                        help="report the blocks and the adapter xDiT picks, then stop")
+    parser.add_argument("--timeout-min", type=int, default=30,
+                        help="process group timeout; the first decode on a new shape pays MIOpen autotune")
     parser.add_argument("--out", default=None, help="write the report here as JSON")
     args = parser.parse_args()
 
@@ -269,9 +318,16 @@ def main():
     device = torch.device("cuda", local_rank)
     dtype = getattr(torch, args.dtype)
 
-    dist.init_process_group(backend="nccl", init_method="env://")
+    dist.init_process_group(
+        backend="nccl", init_method="env://", timeout=timedelta(minutes=args.timeout_min)
+    )
     group = dist.group.WORLD
     LOG.install()
+
+    # Build the communicator here, while every rank is in the same place. The first collective is
+    # what creates it, so if that turns out to be a barrier one rank reaches minutes after the
+    # others, the others sit in init until the store times out rather than waiting on the barrier.
+    dist.all_reduce(torch.zeros(1, device=device))
 
     def say(*parts):
         if rank == 0:
@@ -285,16 +341,38 @@ def main():
         f"distvae={getattr(distvae, '__version__', 'unknown')}")
     say(f"family={args.family} half={args.half} {args.height}x{args.width} dtype={args.dtype}")
 
+    # Before the VAE exists, because importing xfuser swaps torch.nn.GroupNorm for AITER's, and
+    # both the adapters and xDiT's selection ask isinstance(norm, nn.GroupNorm). A VAE built
+    # first holds the class from before the swap and matches nothing. Real runs import xfuser
+    # long before they load a model, so this is the ordering being measured.
+    _vae_parallel()
+
     vae = build_vae(args.family, dtype, device)
     sample = latent_for(vae, args.height, args.width, dtype, device)
     say(f"latent {tuple(sample.shape)}")
 
-    # The reference before sharding, since sharding replaces the half in place.
+    built = describe(vae, args.half)
+    say(f"{args.half}: {json.dumps(built)}")
+    if built["adapter"] is None:
+        raise SystemExit(
+            f"xDiT has no adapter for this {type(vae).__name__} {args.half}. Nothing to measure."
+        )
+    if args.describe_only:
+        return
+
+    # The reference has to be taken before sharding, which replaces the half in place. Every rank
+    # computes it rather than rank 0 alone: the seeds match, so the weights match, and leaving it
+    # to one rank would strand the others in the next collective for as long as it takes.
+    latent_area = sample.shape[-2] * sample.shape[-1]
+    take_reference = not args.skip_reference and latent_area <= args.reference_max_latent_elems
+    if not args.skip_reference and not take_reference:
+        say(f"no single-rank reference: a {sample.shape[-2]}x{sample.shape[-1]} latent is over "
+            f"--reference-max-latent-elems {args.reference_max_latent_elems}, and an unsharded "
+            f"decode that size is what sharding exists to avoid. Check agreement at a smaller one.")
     reference = None
-    if not args.skip_reference and rank == 0:
+    if take_reference:
         with torch.no_grad():
             reference = vae.decode(sample).sample.float().cpu()
-    dist.barrier()
 
     adapter = parallelize(vae, group, args.half)
     say(f"adapter={adapter}")
@@ -325,10 +403,15 @@ def main():
             agreement = {"ok": False, "why": f"shape {tuple(actual.shape)} != {tuple(reference.shape)}"}
         else:
             diff = (actual - reference).abs()
+            # Against the reference's own scale, because an absolute tolerance means nothing on
+            # random weights, and in bf16 a step at magnitude 1 is already about 0.008.
+            scale = reference.abs().max().item()
             agreement = {
                 "ok": bool(diff.max().item() <= args.atol),
                 "max_abs": diff.max().item(),
                 "mean_abs": diff.mean().item(),
+                "reference_max_abs": scale,
+                "max_rel_to_scale": diff.max().item() / scale if scale else None,
                 "atol": args.atol,
             }
 
