@@ -87,7 +87,11 @@ class CollectiveLog:
                 frame = sys._getframe(1)
                 site = f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}"
                 size = self._nbytes(args)
-                entry = self.by_call[name]
+                # batch_isend_irecv runs its members through these same entry points, so counting
+                # them in the total would charge a batched exchange for the round trips batching
+                # is what avoids. They stay visible, under their own heading.
+                nested = os.path.basename(frame.f_code.co_filename) == "distributed_c10d.py"
+                entry = self.by_call[f"{name} (batched)" if nested else name]
                 entry["calls"] += 1
                 entry["bytes"] += size
                 entry = self.by_site[f"{name} @ {site}"]
@@ -127,7 +131,11 @@ class CollectiveLog:
                     self.by_site.items(), key=lambda kv: -kv[1]["calls"]
                 )
             },
-            "total_calls": sum(v["calls"] for v in self.by_call.values()),
+            "total_calls": sum(
+                v["calls"] for k, v in self.by_call.items() if "(batched)" not in k
+            ),
+            # Bytes from every entry, though: batch_isend_irecv is handed P2POps rather than
+            # tensors, so its members are the only place the halo volume can be read.
             "total_bytes": sum(v["bytes"] for v in self.by_call.values()),
         }
 
