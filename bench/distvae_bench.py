@@ -16,9 +16,23 @@ with random weights and measures three things per decode:
 Run under torchrun:
   torchrun --nproc_per_node=4 distvae_bench.py --family flux2 --height 2048 --width 2048
 
+The four arms a comparison usually wants, each differing from the one above it by one thing:
+
+  --no-parallel-vae                              unsharded, untiled: the baseline
+  (default)                                      sharded
+  --enable-tiling                                sharded and tiled at the VAE's own window
+  --vae-tile-size N                              the same, at a narrower window
+
+Tiling is installed by xDiT's own calls in xDiT's own order, so an arm measures the policy that
+ships rather than this file's reading of it. Pass --tile-batch upstream to hold the batched
+tiled_decode off and see what the tiling costs without it.
+
 What this cannot tell you: anything about real activation distributions (random weights give
 mean~0, variance~1, the easy case for any variance computation), anything about the pipeline
-around the VAE, and anything about host RAM. Those need a real model.
+around the VAE, and anything about host RAM. In particular the peak VRAM here is the VAE's own,
+which is the whole point of measuring it apart - but it is NOT a run's peak, and a window that
+halves the decode's memory moves a run's peak only while the VAE is what peaks. Those need a
+real model.
 """
 
 import argparse
@@ -451,6 +465,89 @@ def parallelize(vae, group, half):
 
 
 # --------------------------------------------------------------------------------------------
+# Tiling, in the order and by the calls the runner uses
+# --------------------------------------------------------------------------------------------
+
+
+def _vae_tiling():
+    """xDiT's tiling knowledge, which is the other half of what these arms measure"""
+    try:
+        from xfuser.core.utils import vae_tiling
+    except ImportError as e:
+        raise SystemExit(
+            "xfuser.core.utils.vae_tiling is not importable, so there is no tiling policy to "
+            "exercise. Point the runner at an xDiT that carries it (-XditBranch)."
+        ) from e
+    return vae_tiling
+
+
+def setup_tiling(vae, window, tile_batch, world_size, say):
+    """Turn tiling on the way the runner does, returning what it settled on
+
+    The runner's order is the thing under test and not an implementation detail: it reads the
+    VAE's own tile area *before* --vae_tile_size can narrow it, because the batch budget is
+    derived from both areas. Doing it the other way round would read the narrowed area twice and
+    budget a single tile per call at every window.
+    """
+    vae_tiling = _vae_tiling()
+    vae_tiling.require_vae_support(vae, "tiling", "--enable-tiling")
+    vae.enable_tiling()
+
+    default_area = vae_tiling.tile_latent_area(vae)
+    facts = {
+        "enabled": True,
+        "requested_window_px": window,
+        "window_px": vae_tiling.tile_window(vae),
+        "default_tile_latent_area": default_area,
+    }
+
+    if window is not None:
+        pixels, plan = vae_tiling.snap_tile_window(vae, window)
+        if plan is None:
+            raise SystemExit(
+                f"no workable tile window at or below {window}px for this "
+                f"{type(vae).__name__}: every candidate divides its tiling attributes into "
+                f"something fractional."
+            )
+        # A tile is sharded over its rows, so a tile thinner than the group leaves some rank
+        # holding nothing. The runner refuses rather than deadlocking inside the decoder.
+        rows = vae_tiling.latent_rows(vae, plan)
+        if world_size > 1 and rows is not None and rows < world_size:
+            raise SystemExit(
+                f"a {pixels}px tile holds {rows} latent rows, fewer than the {world_size} ranks "
+                f"sharding it. Ask for a wider window."
+            )
+        vae_tiling.apply_tile_plan(vae, plan)
+        facts.update(snapped_window_px=pixels, tile_latent_rows=rows)
+        if pixels != window:
+            say(f"tile window snapped {window} -> {pixels}px, the widest that lands whole")
+
+    tile_area = vae_tiling.tile_latent_area(vae)
+    facts["tile_latent_area"] = tile_area
+    facts["batched"] = False
+
+    if tile_batch == "upstream":
+        facts["budget_elems"] = None
+        return facts
+
+    budget = vae_tiling.tile_batch_budget(default_area, tile_area)
+    facts["budget_elems"] = budget
+    if budget is None:
+        return facts
+    batched = vae_tiling.batched_tiled_decode(vae, budget)
+    if batched is None:
+        # The stride-tiling families keep their own loop, so there is nothing to install and the
+        # arm still measures upstream tiling rather than silently measuring nothing.
+        say(f"no batched tiled_decode for {type(vae).__name__}: it tiles by a stride it stores "
+            f"outright, not by an overlap fraction. Measuring upstream tiling.")
+        return facts
+    vae.tiled_decode = batched
+    facts["batched"] = True
+    facts["tiles_per_call"] = budget // tile_area if tile_area else None
+    return facts
+
+
+# --------------------------------------------------------------------------------------------
 
 
 def timed(run, iters, device):
@@ -483,7 +580,19 @@ def main():
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--batch", type=int, default=1,
-                        help="latents to decode in one call, standing in for batched tiles")
+                        help="latents to decode in one call. Not tile batching, which happens "
+                             "inside tiled_decode: this stacks whole independent latents")
+    parser.add_argument("--no-parallel-vae", action="store_true",
+                        help="leave the VAE unsharded, for the baseline arm every other arm is "
+                             "measured against. Every rank then decodes the whole thing")
+    parser.add_argument("--enable-tiling", action="store_true",
+                        help="tile the decode at the VAE's own window, as --enable_tiling does")
+    parser.add_argument("--vae-tile-size", type=int, default=None,
+                        help="narrow the tile window to this many pixels, as --vae_tile_size "
+                             "does; implies --enable-tiling")
+    parser.add_argument("--tile-batch", choices=["batched", "upstream"], default="batched",
+                        help="batched installs xDiT's batched tiled_decode under the budget rule; "
+                             "upstream leaves diffusers decoding one tile per call")
     parser.add_argument("--frames", type=int, default=17,
                         help="frames, for the VAEs that have a frame axis; ignored by the rest")
     parser.add_argument("--max-rel", type=float, default=None,
@@ -500,6 +609,7 @@ def main():
                         help="process group timeout; the first decode on a new shape pays MIOpen autotune")
     parser.add_argument("--out", default=None, help="write the report here as JSON")
     args = parser.parse_args()
+    tile_this_run = args.enable_tiling or args.vae_tile_size is not None
 
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -546,7 +656,7 @@ def main():
 
     built = describe(vae, args.half)
     say(f"{args.half}: {json.dumps(built)}")
-    if built["adapter"] is None:
+    if built["adapter"] is None and not args.no_parallel_vae:
         raise SystemExit(
             f"xDiT has no adapter for this {type(vae).__name__} {args.half}. Nothing to measure."
         )
@@ -572,8 +682,21 @@ def main():
         with torch.no_grad():
             reference = run_half(vae, args.half, sample).float().cpu()
 
-    adapter = parallelize(vae, group, args.half)
-    say(f"adapter={adapter}")
+    adapter = None
+    if args.no_parallel_vae:
+        say("parallel VAE off: every rank decodes the whole half, as an unsharded run does")
+    else:
+        adapter = parallelize(vae, group, args.half)
+        say(f"adapter={adapter}")
+
+    # After sharding, which is the order the runner uses: _setup_parallel_vae runs during load and
+    # _enable_options after it, so the batched decode is installed over an already-sharded decoder.
+    tiling = {"enabled": False}
+    if tile_this_run:
+        if args.half != "decoder":
+            raise SystemExit("tiling is a decode-side feature; --enable-tiling needs --half decoder")
+        tiling = setup_tiling(vae, args.vae_tile_size, args.tile_batch, world_size, say)
+        say(f"tiling: {json.dumps(tiling)}")
 
     def once():
         with torch.no_grad():
@@ -624,7 +747,9 @@ def main():
         "frames": args.frames if spec["temporal"] else None,
         "dtype": args.dtype,
         "world_size": world_size,
+        "parallel_vae": not args.no_parallel_vae,
         "adapter": adapter,
+        "tiling": tiling,
         "latent_shape": list(sample.shape),
         "collectives": collectives,
         "timing": timing,
