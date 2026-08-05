@@ -117,7 +117,7 @@ class WanZeroPadConv2d(nn.Conv2d, PatchConvMixin):
             )
 
             return output
-        # Multi-rank: get extended input and metadata from mixin (patch_index, halo_width, etc.), then choose direct or chunked path.
+        # Multi-rank: get extended input and metadata from mixin (halo_width, global_start, etc.), then choose direct or chunked path.
         else:
             # Metadata and halo exchange
             (
@@ -128,7 +128,7 @@ class WanZeroPadConv2d(nn.Conv2d, PatchConvMixin):
                 kernel_size_patch_dim,
                 padding_patch_dim,
                 stride_patch_dim,
-                patch_index,
+                global_start,
                 group_world_size,
                 rank_in_group,
                 _,

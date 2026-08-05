@@ -9,6 +9,7 @@ from distvae.models.layers.conv_utils import (
     calc_top_halo_width,
     calc_bottom_halo_width,
     calc_halo_width,
+    calc_halo_width_unit_stride,
     correct_end,
     correct_start,
     build_crop_slice,
@@ -126,6 +127,47 @@ class TestCalcHaloWidth:
         expected_bottom = calc_bottom_halo_width(1, height_index, 3, 1, 1)
         assert top == expected_top
         assert bottom == expected_bottom
+
+
+class TestCalcHaloWidthUnitStride:
+    """The stride-1 shortcut has to answer exactly what the gathered boundaries answer.
+
+    It is what every unit-stride convolution uses in place of an all_gather, so if it ever
+    disagreed with calc_halo_width the ranks would exchange the wrong rows and the seam
+    between two patches would be quietly wrong rather than loudly broken.
+    """
+
+    @pytest.mark.parametrize("kernel_size", [1, 2, 3, 4, 5, 7])
+    @pytest.mark.parametrize("padding", [0, 1, 2, 3])
+    @pytest.mark.parametrize(
+        "patch_sizes",
+        [
+            [8, 8],
+            [8, 8, 8, 8],
+            [9, 8, 8, 8],  # the uneven split Patchify makes when rows do not divide by ranks
+            [3, 2, 2],  # patches barely wider than the kernel
+            [64, 63, 63, 63],
+        ],
+    )
+    @patch("distvae.models.layers.conv_utils.DistributedEnv.get_group_world_size")
+    def test_it_agrees_with_the_gathered_boundaries(
+        self, mock_world_size, patch_sizes, padding, kernel_size
+    ):
+        world_size = len(patch_sizes)
+        mock_world_size.return_value = world_size
+        height_index = calc_patch_index([torch.tensor([s]) for s in patch_sizes])
+
+        for rank in range(world_size):
+            assert calc_halo_width_unit_stride(rank, world_size, kernel_size) == calc_halo_width(
+                rank, height_index, kernel_size, padding, 1
+            )
+
+    def test_the_edge_ranks_have_nothing_beyond_them(self):
+        assert calc_halo_width_unit_stride(0, 4, 3)[0] == 0
+        assert calc_halo_width_unit_stride(3, 4, 3)[1] == 0
+
+    def test_a_lone_rank_needs_no_halo_at_all(self):
+        assert calc_halo_width_unit_stride(0, 1, 7) == (0, 0)
 
 
 class TestCorrectEnd:

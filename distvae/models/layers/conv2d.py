@@ -75,7 +75,7 @@ class PatchConv2d(nn.Conv2d, PatchConvMixin):
                 kernel_size_patch_dim,
                 padding_patch_dim,
                 stride_patch_dim,
-                patch_index,
+                global_start,
                 group_world_size,
                 rank_in_group,
                 stride_shift,
@@ -115,7 +115,7 @@ class PatchConv2d(nn.Conv2d, PatchConvMixin):
                 if halo_width[0] > 0 or halo_width[1] > 0:
                     crop_slice = build_crop_slice(
                         patch_dim, patch_size, halo_width, conv_res.shape[patch_dim], ndim=4,
-                        global_start=patch_index[rank_in_group],
+                        global_start=global_start,
                         kernel_size=kernel_size_patch_dim,
                         padding=padding_patch_dim,
                         stride=stride_patch_dim,
@@ -194,8 +194,6 @@ class PatchConv2d(nn.Conv2d, PatchConvMixin):
                         )
                     outputs.append(torch.cat(inner_output, dim=-1))
                 outputs = torch.cat(outputs, dim=-2)
-                # Get global position for precise output cropping when stride > 1
-                global_start = patch_index[rank_in_group]
                 # Note: patch_size here is the LOCAL patch size (before halo exchange)
                 # but after stride_shift trimming
                 crop_slice = build_crop_slice(

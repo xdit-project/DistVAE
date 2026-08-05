@@ -83,7 +83,7 @@ class PatchConv3d(nn.Conv3d, PatchConvMixin):
                                 _triple(0), self.dilation, self.groups)
             return F.conv3d(input, weight, bias, self.stride,
                             self.padding, self.dilation, self.groups)
-        # Multi-rank: get extended input and metadata from mixin (patch_index, halo_width, etc.), then choose direct or chunked path.
+        # Multi-rank: get extended input and metadata from mixin (halo_width, global_start, etc.), then choose direct or chunked path.
         else:
             self._check_padding_mode(group_world_size)
             (
@@ -94,7 +94,7 @@ class PatchConv3d(nn.Conv3d, PatchConvMixin):
                 kernel_size_patch_dim,
                 padding_patch_dim,
                 stride_patch_dim,
-                patch_index,
+                global_start,
                 group_world_size,
                 rank_in_group,
                 stride_shift,
@@ -136,7 +136,7 @@ class PatchConv3d(nn.Conv3d, PatchConvMixin):
                 if halo_width[0] > 0 or halo_width[1] > 0:
                     crop_slice = build_crop_slice(
                         patch_dim, patch_size, halo_width, conv_res.shape[patch_dim], ndim=5,
-                        global_start=patch_index[rank_in_group],
+                        global_start=global_start,
                         kernel_size=kernel_size_patch_dim,
                         padding=padding_patch_dim,
                         stride=stride_patch_dim,
@@ -219,8 +219,6 @@ class PatchConv3d(nn.Conv3d, PatchConvMixin):
                         outer_output.append(torch.cat(inner_output, dim=-1))
                     outputs.append(torch.cat(outer_output, dim=-2))
                 outputs = torch.cat(outputs, dim=-3)
-                # Get global position for precise output cropping when stride > 1
-                global_start = patch_index[rank_in_group]
                 crop_slice = build_crop_slice(
                     patch_dim, patch_size, halo_width, outputs.shape[patch_dim], ndim=5,
                     global_start=global_start,

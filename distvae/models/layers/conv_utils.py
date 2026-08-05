@@ -131,6 +131,31 @@ def calc_halo_width(rank, height_index, kernel_size, padding=0, stride=1):
     return tuple(halo_width)
 
 
+def calc_halo_width_unit_stride(rank, world_size, kernel_size):
+    """Compute (top, bottom) halo widths for a stride-1 conv, asking no other rank anything.
+
+    Under unit stride every term that mentions where a patch sits cancels out of
+    calc_top_halo_width and calc_bottom_halo_width, and the halo comes down to the kernel:
+    a rank needs the (kernel_size - 1) // 2 rows above it that its first output row reads,
+    and kernel_size // 2 rows below it for its last. Padding cancels too, because it shifts
+    the output grid and the patch start by the same amount.
+
+    That matters because the alternative is an all_gather of one integer per convolution,
+    and on a Wan decode those gathers are half of every collective the model makes.
+
+    Args:
+        rank: This rank's index within the VAE group.
+        world_size: Size of the VAE group.
+        kernel_size: Kernel size along the patch dimension.
+
+    Returns:
+        Tuple (top_halo_width, bottom_halo_width), matching calc_halo_width at stride 1.
+    """
+    top = 0 if rank == 0 else (kernel_size - 1) // 2
+    bottom = 0 if rank == world_size - 1 else kernel_size // 2
+    return top, bottom
+
+
 def correct_end(end, kernel_size, stride):
     """Adjust chunk end so conv output at that boundary aligns with stride.
 
@@ -296,6 +321,9 @@ def exchange_halo(
     batch and waited on together.
 
     Args:
+        patch_index: Cumulative patch boundaries, or None when the caller never gathered them.
+            They only serve the bounds checks here, which are skipped in that case rather than
+            paid for with a collective.
         halo_buffer: Optional dict to cache/reuse comms buffers for better performance
     """
     ndim = input.ndim
@@ -328,9 +356,9 @@ def exchange_halo(
         bottom_halo_send = input[tuple(indices_end)].contiguous()
         ops.append(dist.P2POp(dist.isend, bottom_halo_send, global_rank_of_next, group=vae_group))
     if halo_width[0] > 0:
-        assert patch_index[rank_in_group] - halo_width[0] >= patch_index[rank_in_group - 1], (
-            "width of top halo region is larger than the input tensor of prev rank"
-        )
+        assert patch_index is None or (
+            patch_index[rank_in_group] - halo_width[0] >= patch_index[rank_in_group - 1]
+        ), "width of top halo region is larger than the input tensor of prev rank"
         top_halo_recv = recv_buffer("top_recv", halo_width[0])
         global_rank_of_prev = DistributedEnv.get_global_rank_from_group_rank(rank_in_group - 1)
         ops.append(dist.P2POp(dist.irecv, top_halo_recv, global_rank_of_prev, group=vae_group))
@@ -340,9 +368,9 @@ def exchange_halo(
             global_rank_of_prev = DistributedEnv.get_global_rank_from_group_rank(rank_in_group - 1)
         ops.append(dist.P2POp(dist.isend, top_halo_send, global_rank_of_prev, group=vae_group))
     if halo_width[1] > 0:
-        assert patch_index[rank_in_group + 1] + halo_width[1] <= patch_index[rank_in_group + 2], (
-            "width of bottom halo region is larger than the input tensor of next rank"
-        )
+        assert patch_index is None or (
+            patch_index[rank_in_group + 1] + halo_width[1] <= patch_index[rank_in_group + 2]
+        ), "width of bottom halo region is larger than the input tensor of next rank"
         bottom_halo_recv = recv_buffer("bottom_recv", halo_width[1])
         if global_rank_of_next is None:
             global_rank_of_next = DistributedEnv.get_global_rank_from_group_rank(rank_in_group + 1)
