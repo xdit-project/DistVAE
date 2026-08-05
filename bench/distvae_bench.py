@@ -142,6 +142,12 @@ class CollectiveLog:
 
 LOG = CollectiveLog()
 
+# What sharding is allowed to move the output by, as a fraction of its largest value. Sharding
+# changes the order operations happen in, and in bf16 that alone is worth a few percent: the
+# measured 0.037 here is the same number whether or not the collectives have been optimised, so
+# a tighter bound would only ever catch the dtype. Test the arithmetic in float32.
+MAX_REL = {"float32": 1e-4, "float16": 2e-2, "bfloat16": 5e-2}
+
 
 # --------------------------------------------------------------------------------------------
 # VAE architectures, taken from the shipped checkpoints' vae/config.json - weights are random
@@ -315,7 +321,9 @@ def main():
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
-    parser.add_argument("--atol", type=float, default=2e-2)
+    parser.add_argument("--max-rel", type=float, default=None,
+                        help="agreement tolerance, as a fraction of the reference's largest "
+                             "value; defaults by dtype")
     parser.add_argument("--skip-reference", action="store_true",
                         help="skip the single-rank comparison, which needs the whole half to fit on one GPU")
     parser.add_argument("--reference-max-latent-elems", type=int, default=16384,
@@ -423,13 +431,15 @@ def main():
             # Against the reference's own scale, because an absolute tolerance means nothing on
             # random weights, and in bf16 a step at magnitude 1 is already about 0.008.
             scale = reference.abs().max().item()
+            relative = diff.max().item() / scale if scale else 0.0
+            tolerance = args.max_rel if args.max_rel is not None else MAX_REL[args.dtype]
             agreement = {
-                "ok": bool(diff.max().item() <= args.atol),
+                "ok": bool(relative <= tolerance),
                 "max_abs": diff.max().item(),
                 "mean_abs": diff.mean().item(),
                 "reference_max_abs": scale,
-                "max_rel_to_scale": diff.max().item() / scale if scale else None,
-                "atol": args.atol,
+                "max_rel_to_scale": relative,
+                "max_rel_allowed": tolerance,
             }
 
     report = {
