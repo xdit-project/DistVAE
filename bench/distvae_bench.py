@@ -205,8 +205,13 @@ def build_vae(family, dtype, device):
     return cls(**spec["config"]).eval().to(device=device, dtype=dtype)
 
 
-def latent_for(vae, height, width, dtype, device):
-    """A latent of the shape this VAE would decode into height x width"""
+def latent_for(vae, height, width, dtype, device, batch=1):
+    """A latent of the shape this VAE would decode into batch x height x width
+
+    A batch stands in for xDiT's tile batching, where same-shaped tiles are stacked so that one
+    decoder call covers many of them. What that is worth depends on the collective count staying
+    flat as the batch grows, which is the thing to read off a run with --batch.
+    """
     ratio = getattr(vae, "spatial_compression_ratio", None) or 8
     if height % ratio or width % ratio:
         raise SystemExit(
@@ -216,7 +221,7 @@ def latent_for(vae, height, width, dtype, device):
     channels = vae.config.latent_channels
     torch.manual_seed(1)
     return torch.randn(
-        1, channels, height // ratio, width // ratio, dtype=dtype, device=device
+        batch, channels, height // ratio, width // ratio, dtype=dtype, device=device
     )
 
 
@@ -321,6 +326,8 @@ def main():
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
+    parser.add_argument("--batch", type=int, default=1,
+                        help="latents to decode in one call, standing in for batched tiles")
     parser.add_argument("--max-rel", type=float, default=None,
                         help="agreement tolerance, as a fraction of the reference's largest "
                              "value; defaults by dtype")
@@ -373,7 +380,7 @@ def main():
     _vae_parallel()
 
     vae = build_vae(args.family, dtype, device)
-    sample = latent_for(vae, args.height, args.width, dtype, device)
+    sample = latent_for(vae, args.height, args.width, dtype, device, args.batch)
     say(f"latent {tuple(sample.shape)}")
 
     built = describe(vae, args.half)
@@ -388,7 +395,7 @@ def main():
     # The reference has to be taken before sharding, which replaces the half in place. Every rank
     # computes it rather than rank 0 alone: the seeds match, so the weights match, and leaving it
     # to one rank would strand the others in the next collective for as long as it takes.
-    latent_area = sample.shape[-2] * sample.shape[-1]
+    latent_area = sample.shape[0] * sample.shape[-2] * sample.shape[-1]
     take_reference = not args.skip_reference and latent_area <= args.reference_max_latent_elems
     if not args.skip_reference and not take_reference:
         say(f"no single-rank reference: a {sample.shape[-2]}x{sample.shape[-1]} latent is over "
