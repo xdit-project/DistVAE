@@ -22,6 +22,12 @@ def gather_patches(patch: torch.Tensor, patch_dim: int) -> Tuple[List[torch.Tens
     group = DistributedEnv.get_vae_group()
     world_size = DistributedEnv.get_group_world_size()
 
+    # One rank already holds the whole thing, so there is nothing to collect and no other size to
+    # discover. Both gathers below would be round trips whose answer is the argument. Callers
+    # concatenate what comes back, and cat copies, so handing back the input itself aliases nothing.
+    if world_size == 1:
+        return [patch], [patch.shape[patch_dim]]
+
     gathered_sizes = [
         torch.empty(1, dtype=torch.int64, device=patch.device) for _ in range(world_size)
     ]

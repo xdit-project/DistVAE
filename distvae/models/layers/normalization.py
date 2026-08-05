@@ -83,6 +83,7 @@ class PatchGroupNorm(nn.GroupNorm):
         patch_dim = self.patch_dim if self.patch_dim >= 0 else ndim + self.patch_dim
 
         vae_group = DistributedEnv.get_vae_group()
+        group_world_size = DistributedEnv.get_group_world_size()
         x = x.detach()
         channels_per_group = shape[1] // self.num_groups
 
@@ -100,7 +101,11 @@ class PatchGroupNorm(nn.GroupNorm):
         )
         totals[0] = shape[patch_dim]
         totals[1:] = x.sum(dim=reduced, dtype=torch.float32).flatten()
-        dist.all_reduce(totals, group=vae_group)
+        # Summing one rank's numbers across one rank returns them unchanged, so on a single-rank
+        # group both reductions here are the identity. They are still real collectives, though:
+        # a decode of a VAE with twenty-five group norms issued fifty of them to talk to nobody.
+        if group_world_size > 1:
+            dist.all_reduce(totals, group=vae_group)
 
         patch_size = totals[0]
         nelements = (
@@ -117,7 +122,8 @@ class PatchGroupNorm(nn.GroupNorm):
         # leave out how far the patch itself sits from the middle, so the summed variance comes
         # out short of the variance the unsharded norm computes.
         group_square_sum = ((x - E) ** 2).sum(dim=reduced, dtype=torch.float32)
-        dist.all_reduce(group_square_sum, group=vae_group)
+        if group_world_size > 1:
+            dist.all_reduce(group_square_sum, group=vae_group)
         # Divided by the count, not one less than it, which is the estimator nn.GroupNorm uses.
         var = (group_square_sum / nelements).view(per_group).to(x.dtype)
 

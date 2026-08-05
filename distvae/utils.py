@@ -37,11 +37,18 @@ class DistributedEnv:
     @classmethod
     def _init_rank_mapping(cls):
         """Initialize the mapping between group ranks and global ranks"""
-        if cls._rank_mapping is None:
-            # Get all ranks in the group
-            ranks = [None] * cls.get_group_world_size() 
-            dist.all_gather_object(ranks, cls.get_global_rank(), group=cls.get_vae_group())
-            cls._rank_mapping = ranks
+        if cls._rank_mapping is not None:
+            return
+        # The only member of a one-rank group is this rank, which it can answer without asking.
+        # Worth the branch because initialize() clears the mapping and every adapter constructor
+        # calls it, so the gather is paid once per adapter rather than once per model.
+        if cls.get_group_world_size() == 1:
+            cls._rank_mapping = [cls.get_global_rank()]
+            return
+        # Get all ranks in the group
+        ranks = [None] * cls.get_group_world_size()
+        dist.all_gather_object(ranks, cls.get_global_rank(), group=cls.get_vae_group())
+        cls._rank_mapping = ranks
 
     @classmethod
     def get_global_rank_from_group_rank(cls, group_rank: int) -> int:
