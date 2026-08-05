@@ -153,24 +153,32 @@ class PatchGroupNorm(nn.GroupNorm):
 
         vae_group = DistributedEnv.get_vae_group()
         x = x.detach()
-        # Support 4D (N,C,H,W) and 5D (N,C,F,H,W); patch dim is first spatial (index 2).
-        patch_size = torch.tensor(shape[patch_dim], dtype=torch.int64, device=x.device)
-        dist.all_reduce(patch_size, group=vae_group)
         channels_per_group = shape[1] // self.num_groups
-        nelements = (
-            channels_per_group *
-            math.prod(shape[2: patch_dim]) *
-            patch_size *
-            math.prod(shape[patch_dim + 1: ])
-        )
 
         x = x.view(shape[0], self.num_groups, -1, *shape[2: ])
         reduced = tuple(range(2, x.ndim))
         # [bs, num_groups, 1, 1, 1] for 4D input, one more 1 for 5D.
         per_group = (shape[0], self.num_groups, *([1] * (x.ndim - 2)))
 
-        group_sum = x.sum(dim=reduced, dtype=torch.float32)
-        dist.all_reduce(group_sum, group=vae_group)
+        # This rank's row count travels with its group sums. Both are sums over the same group of
+        # ranks, so combining them changes no arithmetic, and sent alone the row count costs a
+        # whole round trip to move one number. Float32 holds a row count exactly either way.
+        # Support 4D (N,C,H,W) and 5D (N,C,F,H,W); patch dim is first spatial (index 2).
+        totals = torch.empty(
+            1 + shape[0] * self.num_groups, dtype=torch.float32, device=x.device
+        )
+        totals[0] = shape[patch_dim]
+        totals[1:] = x.sum(dim=reduced, dtype=torch.float32).flatten()
+        dist.all_reduce(totals, group=vae_group)
+
+        patch_size = totals[0]
+        nelements = (
+            channels_per_group *
+            math.prod(shape[2: patch_dim]) *
+            patch_size *
+            math.prod(shape[patch_dim + 1: ])
+        )
+        group_sum = totals[1:].view(shape[0], self.num_groups)
         E = (group_sum / nelements).view(per_group).to(x.dtype)
 
         # Squared about the mean of the whole group rather than this rank's share of it. A rank
