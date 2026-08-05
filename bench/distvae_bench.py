@@ -142,6 +142,27 @@ class CollectiveLog:
 
 LOG = CollectiveLog()
 
+
+def across_ranks(by_call, world_size):
+    """The same counts as the busiest rank sees them, rather than as rank 0 does
+
+    Rank 0 borders one neighbour where the ranks in the middle border two, so it sends and
+    receives less of a halo than they do and its count understates the decode. What bounds the
+    decode is the rank doing the most, since every collective is one they all wait on.
+    """
+    gathered = [None] * world_size
+    dist.all_gather_object(gathered, {name: entry["calls"] for name, entry in by_call.items()})
+
+    def total(counts):
+        return sum(calls for name, calls in counts.items() if "(batched)" not in name)
+
+    names = sorted({name for counts in gathered for name in counts})
+    return {
+        "by_call_max": {name: max(counts.get(name, 0) for counts in gathered) for name in names},
+        "total_calls_max": max(total(counts) for counts in gathered),
+        "total_calls_by_rank": [total(counts) for counts in gathered],
+    }
+
 # What sharding is allowed to move the output by, as a fraction of its largest value. Sharding
 # changes the order operations happen in, and in bf16 that alone is worth a few percent: the
 # measured 0.037 here is the same number whether or not the collectives have been optimised, so
@@ -155,6 +176,10 @@ MAX_REL = {"float32": 1e-4, "float16": 2e-2, "bfloat16": 5e-2}
 
 # Only the fields that change the shape of the work. Anything a class defaults sensibly is left
 # out so a diffusers upgrade does not have to be chased here.
+#
+# spatial and temporal are the compression ratios, and latent_channels the width of the latent.
+# They are all readable off a built VAE on some classes and not on others, under a different name
+# again on Wan, so they are stated here where the config they came from states them.
 FAMILIES = {
     "flux2": dict(
         cls="AutoencoderKLFlux2",
@@ -172,6 +197,9 @@ FAMILIES = {
             use_quant_conv=True,
             use_post_quant_conv=True,
         ),
+        latent_channels=32,
+        spatial=8,
+        temporal=None,
         note="black-forest-labs/FLUX.2-dev and FLUX.2-klein-*",
     ),
     "kl": dict(
@@ -186,7 +214,109 @@ FAMILIES = {
             down_block_types=["DownEncoderBlock2D"] * 4,
             up_block_types=["UpDecoderBlock2D"] * 4,
         ),
+        latent_channels=16,
+        spatial=8,
+        temporal=None,
         note="the plain 2D VAE: SD3, Z-Image and friends",
+    ),
+    "wan": dict(
+        cls="AutoencoderKLWan",
+        config=dict(
+            base_dim=96,
+            z_dim=16,
+            dim_mult=[1, 2, 4, 4],
+            num_res_blocks=2,
+            attn_scales=[],
+            temperal_downsample=[False, True, True],
+        ),
+        latent_channels=16,
+        spatial=8,
+        temporal=4,
+        note="Wan2.1 and Wan2.2 ship the same VAE config",
+    ),
+    "qwen_image": dict(
+        cls="AutoencoderKLQwenImage",
+        config=dict(
+            base_dim=96,
+            z_dim=16,
+            dim_mult=[1, 2, 4, 4],
+            num_res_blocks=2,
+            attn_scales=[],
+            temperal_downsample=[False, True, True],
+        ),
+        latent_channels=16,
+        spatial=8,
+        # Qwen-Image's VAE is Wan's down to the numbers, frame axis included, and a still image
+        # goes through it as a clip of one frame: run it with --frames 1.
+        temporal=4,
+        note="Qwen/Qwen-Image-2512 and Qwen-Image-Edit",
+    ),
+    "hunyuan_video": dict(
+        cls="AutoencoderKLHunyuanVideo",
+        config=dict(
+            in_channels=3,
+            out_channels=3,
+            latent_channels=16,
+            block_out_channels=[128, 256, 512, 512],
+            layers_per_block=2,
+            norm_num_groups=32,
+            mid_block_add_attention=True,
+            spatial_compression_ratio=8,
+            temporal_compression_ratio=4,
+        ),
+        latent_channels=16,
+        spatial=8,
+        temporal=4,
+        note="hunyuanvideo-community/HunyuanVideo",
+    ),
+    "hunyuan_video_15": dict(
+        cls="AutoencoderKLHunyuanVideo15",
+        config=dict(
+            in_channels=3,
+            out_channels=3,
+            latent_channels=32,
+            block_out_channels=[128, 256, 512, 1024, 1024],
+            layers_per_block=2,
+            downsample_match_channel=True,
+            upsample_match_channel=True,
+            spatial_compression_ratio=16,
+            temporal_compression_ratio=4,
+        ),
+        latent_channels=32,
+        spatial=16,
+        temporal=4,
+        note="hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-*",
+    ),
+    "ltx2": dict(
+        cls="AutoencoderKLLTX2Video",
+        config=dict(
+            in_channels=3,
+            out_channels=3,
+            latent_channels=128,
+            block_out_channels=[256, 512, 1024, 2048],
+            decoder_block_out_channels=[256, 512, 1024],
+            layers_per_block=[4, 6, 6, 2, 2],
+            decoder_layers_per_block=[5, 5, 5, 5],
+            spatio_temporal_scaling=[True, True, True, True],
+            decoder_spatio_temporal_scaling=[True, True, True],
+            decoder_inject_noise=[False, False, False, False],
+            downsample_type=["spatial", "temporal", "spatiotemporal", "spatiotemporal"],
+            upsample_factor=[2, 2, 2],
+            upsample_residual=[True, True, True],
+            encoder_causal=True,
+            decoder_causal=False,
+            encoder_spatial_padding_mode="zeros",
+            decoder_spatial_padding_mode="reflect",
+            patch_size=4,
+            patch_size_t=1,
+            resnet_norm_eps=1e-06,
+            spatial_compression_ratio=32,
+            temporal_compression_ratio=8,
+        ),
+        latent_channels=128,
+        spatial=32,
+        temporal=8,
+        note="Lightricks/LTX-2; the 2.3 checkpoint differs in the decoder's shape",
     ),
 }
 
@@ -205,24 +335,50 @@ def build_vae(family, dtype, device):
     return cls(**spec["config"]).eval().to(device=device, dtype=dtype)
 
 
-def latent_for(vae, height, width, dtype, device, batch=1):
-    """A latent of the shape this VAE would decode into batch x height x width
+def sample_for(spec, half, height, width, dtype, device, batch=1, frames=1):
+    """What this half is handed: a latent for the decoder, an image or clip for the encoder
 
     A batch stands in for xDiT's tile batching, where same-shaped tiles are stacked so that one
-    decoder call covers many of them. What that is worth depends on the collective count staying
-    flat as the batch grows, which is the thing to read off a run with --batch.
+    call covers many of them. What that is worth depends on the collective count staying flat as
+    the batch grows, which is the thing to read off a run with --batch.
     """
-    ratio = getattr(vae, "spatial_compression_ratio", None) or 8
+    ratio = spec["spatial"]
     if height % ratio or width % ratio:
         raise SystemExit(
             f"{height}x{width} is not a whole number of latent rows at a compression "
             f"ratio of {ratio}"
         )
-    channels = vae.config.latent_channels
+    temporal = spec["temporal"]
+    if temporal and (frames - 1) % temporal:
+        raise SystemExit(
+            f"--frames {frames} does not land on a whole number of latent frames: these VAEs "
+            f"keep the first frame and compress the rest by {temporal}, so ask for "
+            f"1 + a multiple of {temporal}"
+        )
+    if half == "decoder":
+        channels = spec["latent_channels"]
+        rows, columns = height // ratio, width // ratio
+        depth = 1 + (frames - 1) // temporal if temporal else None
+    else:
+        channels = spec["config"].get("in_channels", 3)
+        rows, columns = height, width
+        depth = frames if temporal else None
+    shape = (batch, channels, rows, columns)
+    if depth is not None:
+        shape = (batch, channels, depth, rows, columns)
     torch.manual_seed(1)
-    return torch.randn(
-        batch, channels, height // ratio, width // ratio, dtype=dtype, device=device
-    )
+    return torch.randn(*shape, dtype=dtype, device=device)
+
+
+def run_half(vae, half, sample):
+    """One call through the half under test, returning the tensor to compare"""
+    if half == "decoder":
+        return vae.decode(sample).sample
+    encoded = vae.encode(sample)
+    # Take the mean rather than a draw from it: two runs have to be comparable, and the sampling
+    # is not what sharding changes. Newer classes hand back the latent directly.
+    distribution = getattr(encoded, "latent_dist", None)
+    return distribution.mean if distribution is not None else encoded.latent
 
 
 # --------------------------------------------------------------------------------------------
@@ -328,6 +484,8 @@ def main():
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--batch", type=int, default=1,
                         help="latents to decode in one call, standing in for batched tiles")
+    parser.add_argument("--frames", type=int, default=17,
+                        help="frames, for the VAEs that have a frame axis; ignored by the rest")
     parser.add_argument("--max-rel", type=float, default=None,
                         help="agreement tolerance, as a fraction of the reference's largest "
                              "value; defaults by dtype")
@@ -379,9 +537,12 @@ def main():
     # long before they load a model, so this is the ordering being measured.
     _vae_parallel()
 
+    spec = FAMILIES[args.family]
     vae = build_vae(args.family, dtype, device)
-    sample = latent_for(vae, args.height, args.width, dtype, device, args.batch)
-    say(f"latent {tuple(sample.shape)}")
+    sample = sample_for(
+        spec, args.half, args.height, args.width, dtype, device, args.batch, args.frames
+    )
+    say(f"{'latent' if args.half == 'decoder' else 'input'} {tuple(sample.shape)}")
 
     built = describe(vae, args.half)
     say(f"{args.half}: {json.dumps(built)}")
@@ -395,7 +556,12 @@ def main():
     # The reference has to be taken before sharding, which replaces the half in place. Every rank
     # computes it rather than rank 0 alone: the seeds match, so the weights match, and leaving it
     # to one rank would strand the others in the next collective for as long as it takes.
+    # In latent space for both halves, so the one threshold means the same thing either way.
     latent_area = sample.shape[0] * sample.shape[-2] * sample.shape[-1]
+    if sample.ndim == 5:
+        latent_area *= sample.shape[2]
+    if args.half == "encoder":
+        latent_area //= spec["spatial"] ** 2
     take_reference = not args.skip_reference and latent_area <= args.reference_max_latent_elems
     if not args.skip_reference and not take_reference:
         say(f"no single-rank reference: a {sample.shape[-2]}x{sample.shape[-1]} latent is over "
@@ -404,28 +570,29 @@ def main():
     reference = None
     if take_reference:
         with torch.no_grad():
-            reference = vae.decode(sample).sample.float().cpu()
+            reference = run_half(vae, args.half, sample).float().cpu()
 
     adapter = parallelize(vae, group, args.half)
     say(f"adapter={adapter}")
 
-    def decode():
+    def once():
         with torch.no_grad():
-            return vae.decode(sample).sample
+            return run_half(vae, args.half, sample)
 
     for _ in range(args.warmup):
-        decode()
+        once()
     torch.cuda.synchronize(device)
 
-    # Counted over one decode, so the numbers read per decode rather than per run.
+    # Counted over one call, so the numbers read per decode rather than per run.
     LOG.reset()
     LOG.enabled = True
-    output = decode()
+    output = once()
     LOG.enabled = False
     collectives = LOG.report()
+    collectives.update(across_ranks(LOG.by_call, world_size))
 
     torch.cuda.reset_peak_memory_stats(device)
-    timing = timed(decode, args.iters, device)
+    timing = timed(once, args.iters, device)
     peak_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
 
     agreement = None
@@ -454,6 +621,7 @@ def main():
         "half": args.half,
         "height": args.height,
         "width": args.width,
+        "frames": args.frames if spec["temporal"] else None,
         "dtype": args.dtype,
         "world_size": world_size,
         "adapter": adapter,
@@ -470,12 +638,16 @@ def main():
     }
 
     if rank == 0:
-        print("\n--- collectives per decode ---", flush=True)
+        print(f"\n--- collectives per {args.half} call (rank 0, and the most any rank made) ---",
+              flush=True)
         for name, entry in collectives["by_call"].items():
-            print(f"  {name:<24} {entry['calls']:>6} calls  {entry['bytes'] / 1e6:>10.2f} MB",
-                  flush=True)
+            print(f"  {name:<24} {entry['calls']:>6} calls  "
+                  f"{collectives['by_call_max'][name]:>6} max  "
+                  f"{entry['bytes'] / 1e6:>10.2f} MB", flush=True)
         print(f"  {'TOTAL':<24} {collectives['total_calls']:>6} calls  "
+              f"{collectives['total_calls_max']:>6} max  "
               f"{collectives['total_bytes'] / 1e6:>10.2f} MB", flush=True)
+        print(f"  by rank: {collectives['total_calls_by_rank']}", flush=True)
         print("\n--- top call sites ---", flush=True)
         for site, entry in list(collectives["by_site"].items())[:12]:
             print(f"  {entry['calls']:>6}  {site}", flush=True)
