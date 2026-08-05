@@ -98,12 +98,21 @@ class CollectiveLog:
         return wrapper
 
     def install(self):
+        # Both the package and the module it re-exports from. P2POp checks the op it is handed
+        # against distributed_c10d's own isend and irecv, so wrapping only the re-export would
+        # make dist.P2POp(dist.isend, ...) - which is how a batched halo exchange is written -
+        # fail as an invalid op the moment counting was switched on.
+        from torch.distributed import distributed_c10d
+
         for name in self.WRAPPED:
             original = getattr(dist, name, None)
             if original is None:
                 continue
             self._originals[name] = original
-            setattr(dist, name, self._wrap(name, original))
+            wrapper = self._wrap(name, original)
+            setattr(dist, name, wrapper)
+            if getattr(distributed_c10d, name, None) is original:
+                setattr(distributed_c10d, name, wrapper)
 
     def reset(self):
         self.by_call.clear()

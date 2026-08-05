@@ -292,8 +292,8 @@ def exchange_halo(
     Send: bottom halo to next rank (size next_top_halo_width), top halo to prev
     (size prev_bottom_halo_width). Receive: top halo from prev (halo_width[0]),
     bottom halo from next (halo_width[1]). Concatenate [top_halo_recv, input,
-    bottom_halo_recv] along patch_dim and return. Uses non-blocking isend and
-    blocking recv, then wait on sends.
+    bottom_halo_recv] along patch_dim and return. All four are issued as one
+    batch and waited on together.
 
     Args:
         halo_buffer: Optional dict to cache/reuse comms buffers for better performance
@@ -304,77 +304,58 @@ def exchange_halo(
     indices_start = [slice(None)] * ndim
     indices_start[patch_dim] = slice(0, prev_bottom_halo_width)
 
-    to_next = None
-    to_prev = None
+    vae_group = DistributedEnv.get_vae_group()
+    ops = []
     top_halo_recv = None
     bottom_halo_recv = None
     global_rank_of_next = None
     global_rank_of_prev = None
 
+    def recv_buffer(name: str, width: int) -> Tensor:
+        recv_shape = list(input.shape)
+        recv_shape[patch_dim] = width
+        if halo_buffer is None:
+            return torch.empty(recv_shape, dtype=input.dtype, device=input.device)
+        key = (name, tuple(recv_shape), input.dtype, input.device)
+        if key not in halo_buffer:
+            halo_buffer[key] = torch.empty(
+                recv_shape, dtype=input.dtype, device=input.device
+            )
+        return halo_buffer[key]
+
     if next_top_halo_width > 0:
         global_rank_of_next = DistributedEnv.get_global_rank_from_group_rank(rank_in_group + 1)
         bottom_halo_send = input[tuple(indices_end)].contiguous()
-        to_next = dist.isend(
-            bottom_halo_send,
-            global_rank_of_next,
-            group=DistributedEnv.get_vae_group(),
-        )
+        ops.append(dist.P2POp(dist.isend, bottom_halo_send, global_rank_of_next, group=vae_group))
     if halo_width[0] > 0:
         assert patch_index[rank_in_group] - halo_width[0] >= patch_index[rank_in_group - 1], (
             "width of top halo region is larger than the input tensor of prev rank"
         )
-        recv_shape = list(input.shape)
-        recv_shape[patch_dim] = halo_width[0]
-        if halo_buffer is None:
-            top_halo_recv = torch.empty(
-                recv_shape, dtype=input.dtype, device=input.device
-            )
-        else:
-            key = ("top_recv", tuple(recv_shape), input.dtype, input.device)
-            if key in halo_buffer:
-                top_halo_recv = halo_buffer[key]
-            else:
-                top_halo_recv = torch.empty(
-                    recv_shape, dtype=input.dtype, device=input.device
-                )
-                halo_buffer[key] = top_halo_recv
+        top_halo_recv = recv_buffer("top_recv", halo_width[0])
         global_rank_of_prev = DistributedEnv.get_global_rank_from_group_rank(rank_in_group - 1)
-        dist.recv(top_halo_recv, global_rank_of_prev, group=DistributedEnv.get_vae_group())
+        ops.append(dist.P2POp(dist.irecv, top_halo_recv, global_rank_of_prev, group=vae_group))
     if prev_bottom_halo_width > 0:
         top_halo_send = input[tuple(indices_start)].contiguous()
         if global_rank_of_prev is None:
             global_rank_of_prev = DistributedEnv.get_global_rank_from_group_rank(rank_in_group - 1)
-        to_prev = dist.isend(
-            top_halo_send,
-            global_rank_of_prev,
-            group=DistributedEnv.get_vae_group(),
-        )
+        ops.append(dist.P2POp(dist.isend, top_halo_send, global_rank_of_prev, group=vae_group))
     if halo_width[1] > 0:
         assert patch_index[rank_in_group + 1] + halo_width[1] <= patch_index[rank_in_group + 2], (
             "width of bottom halo region is larger than the input tensor of next rank"
         )
-        recv_shape = list(input.shape)
-        recv_shape[patch_dim] = halo_width[1]
-        if halo_buffer is None:
-            bottom_halo_recv = torch.empty(
-                recv_shape, dtype=input.dtype, device=input.device
-            )
-        else:
-            key = ("bottom_recv", tuple(recv_shape), input.dtype, input.device)
-            if key in halo_buffer:
-                bottom_halo_recv = halo_buffer[key]
-            else:
-                bottom_halo_recv = torch.empty(
-                    recv_shape, dtype=input.dtype, device=input.device
-                )
-                halo_buffer[key] = bottom_halo_recv
+        bottom_halo_recv = recv_buffer("bottom_recv", halo_width[1])
         if global_rank_of_next is None:
             global_rank_of_next = DistributedEnv.get_global_rank_from_group_rank(rank_in_group + 1)
-        dist.recv(
-            bottom_halo_recv,
-            global_rank_of_next,
-            group=DistributedEnv.get_vae_group(),
-        )
+        ops.append(dist.P2POp(dist.irecv, bottom_halo_recv, global_rank_of_next, group=vae_group))
+
+    # One batch rather than four separate calls. The two directions are independent, so blocking
+    # in the receive from the previous rank before even offering the send to the previous rank
+    # exposed a round trip that did not have to be exposed; and NCCL builds a fresh two-rank
+    # communicator for every unbatched point-to-point op issued on a wider group.
+    if ops:
+        for work in dist.batch_isend_irecv(ops):
+            work.wait()
+
     if halo_width[0] < 0:
         trim_slice = [slice(None)] * ndim
         trim_slice[patch_dim] = slice(-halo_width[0], None)
@@ -383,9 +364,5 @@ def exchange_halo(
         input = torch.cat([top_halo_recv, input], dim=patch_dim)
     if bottom_halo_recv is not None:
         input = torch.cat([input, bottom_halo_recv], dim=patch_dim)
-    if to_next is not None:
-        to_next.wait()
-    if to_prev is not None:
-        to_prev.wait()
     return input
 
