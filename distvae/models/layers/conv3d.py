@@ -49,7 +49,6 @@ class PatchConv3d(nn.Conv3d, PatchConvMixin):
         dtype=None,
         block_size: Union[int, Tuple[int, int, int]] = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ) -> None:
         """patch_dim: which spatial dim is split (F=-3/3, H=-2/2, W=-1/4). block_size: 0 => prefer direct path; int or (F,H,W) => chunked when any spatial > block_size."""
         if isinstance(dilation, int):
@@ -62,7 +61,6 @@ class PatchConv3d(nn.Conv3d, PatchConvMixin):
         )
         self.block_size = block_size
         self.patch_dim = patch_dim
-        self.use_uniform_patch = use_uniform_patch
         self.halo_buffer = {}
         super().__init__(
             in_channels, out_channels, kernel_size, stride, padding, dilation,
@@ -100,7 +98,7 @@ class PatchConv3d(nn.Conv3d, PatchConvMixin):
                 group_world_size,
                 rank_in_group,
                 stride_shift,
-            ) = self._multi_rank_metadata_and_halo(input, self.use_uniform_patch, self.halo_buffer)
+            ) = self._multi_rank_metadata_and_halo(input, self.halo_buffer)
             conv_res: Tensor
             padding = self._adjust_padding_for_patch(
                 self._reversed_padding_repeated_twice,

@@ -39,7 +39,6 @@ class _CausalMidBlockAdapter(nn.Module):
         mid_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
 
@@ -54,7 +53,6 @@ class _CausalMidBlockAdapter(nn.Module):
                 resnet,
                 conv_block_size=conv_block_size,
                 patch_dim=patch_dim,
-                use_uniform_patch=use_uniform_patch,
             ) for resnet in mid_block.resnets
         ])
         self.mid_block.attentions = nn.ModuleList([
@@ -86,7 +84,6 @@ class HunyuanVideo15MidBlockAdapter(nn.Module):
         mid_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -101,7 +98,6 @@ class HunyuanVideo15MidBlockAdapter(nn.Module):
                 resnet,
                 conv_block_size=conv_block_size,
                 patch_dim=patch_dim,
-                use_uniform_patch=use_uniform_patch,
             ) for resnet in mid_block.resnets
         ])
         mid_block.attentions = nn.ModuleList([
@@ -130,7 +126,6 @@ class HunyuanVideoMidBlockAdapter(nn.Module):
         mid_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -147,7 +142,6 @@ class HunyuanVideoMidBlockAdapter(nn.Module):
                     resnet,
                     conv_block_size=conv_block_size,
                     patch_dim=patch_dim,
-                    use_uniform_patch=use_uniform_patch,
                 ) for resnet in mid_block.resnets
             ])
             self.mid_block = mid_block
@@ -168,7 +162,6 @@ class LTX2VideoMidBlockAdapter(nn.Module):
         mid_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -183,7 +176,6 @@ class LTX2VideoMidBlockAdapter(nn.Module):
                 resnet,
                 conv_block_size=conv_block_size,
                 patch_dim=patch_dim,
-                use_uniform_patch=use_uniform_patch,
             ) for resnet in mid_block.resnets
         ])
 

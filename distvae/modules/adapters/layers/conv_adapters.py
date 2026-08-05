@@ -30,7 +30,6 @@ class Conv2dAdapter(nn.Module):
         *,
         block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         for i in conv2d.dilation:
@@ -49,7 +48,6 @@ class Conv2dAdapter(nn.Module):
             dtype=conv2d.weight.dtype,
             block_size=block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
         )
         self.conv2d.weight.data = conv2d.weight.data
         if conv2d.bias is not None:
@@ -66,7 +64,6 @@ class Conv3dAdapter(nn.Module):
         *,
         block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         for i in conv3d.dilation:
@@ -85,7 +82,6 @@ class Conv3dAdapter(nn.Module):
             dtype=conv3d.weight.dtype,
             block_size=block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
         )
         self.conv3d.weight.data = conv3d.weight.data
         if conv3d.bias is not None:
@@ -113,7 +109,6 @@ class _CausalConv3dAdapter(nn.Module):
         *,
         block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -137,7 +132,6 @@ class _CausalConv3dAdapter(nn.Module):
             dtype=causal_conv3d.weight.dtype,
             block_size=block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
         )
         self.conv3d.weight.data = causal_conv3d.weight.data
         if causal_conv3d.bias is not None:
@@ -185,7 +179,6 @@ class _PaddedCausalConv3dAdapter(nn.Module):
         *,
         block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -216,7 +209,6 @@ class _PaddedCausalConv3dAdapter(nn.Module):
             dtype=conv.weight.dtype,
             block_size=block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
         )
         self.conv3d.weight.data = conv.weight.data
         if conv.bias is not None:
@@ -259,7 +251,6 @@ class LTX2VideoCausalConv3dAdapter(nn.Module):
         *,
         block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -285,7 +276,6 @@ class LTX2VideoCausalConv3dAdapter(nn.Module):
             dtype=conv.weight.dtype,
             block_size=block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
         )
         sharded.weight.data = conv.weight.data
         if conv.bias is not None:

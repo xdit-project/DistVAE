@@ -56,7 +56,6 @@ class DownEncoderBlock2DAdapter(nn.Module):
         *,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         assert isinstance(down_block, DownEncoderBlock2D), (
@@ -73,7 +72,6 @@ class DownEncoderBlock2DAdapter(nn.Module):
                     downsampler,
                     conv_block_size=conv_block_size,
                     patch_dim=patch_dim,
-                    use_uniform_patch=use_uniform_patch,
                 )
                 for downsampler in down_block.downsamplers
             ])

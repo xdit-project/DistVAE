@@ -88,7 +88,6 @@ class _CausalResidualBlockAdapter(nn.Module):
         residual_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -105,7 +104,6 @@ class _CausalResidualBlockAdapter(nn.Module):
                     getattr(residual_block, name),
                     block_size=conv_block_size,
                     patch_dim=patch_dim,
-                    use_uniform_patch=use_uniform_patch,
                 ),
             )
         # Adapt conv_shortcut if it's not nn.Identity
@@ -114,7 +112,6 @@ class _CausalResidualBlockAdapter(nn.Module):
                 residual_block.conv_shortcut,
                 block_size=conv_block_size,
                 patch_dim=patch_dim,
-                use_uniform_patch=use_uniform_patch,
             )
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
@@ -150,7 +147,6 @@ class _PaddedCausalResnetBlockAdapter(nn.Module):
         resnet: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -167,7 +163,6 @@ class _PaddedCausalResnetBlockAdapter(nn.Module):
                     getattr(resnet, name),
                     block_size=conv_block_size,
                     patch_dim=patch_dim,
-                    use_uniform_patch=use_uniform_patch,
                 ),
             )
         for name in ("norm1", "norm2"):
@@ -181,7 +176,6 @@ class _PaddedCausalResnetBlockAdapter(nn.Module):
                 resnet.conv_shortcut,
                 block_size=conv_block_size,
                 patch_dim=patch_dim,
-                use_uniform_patch=use_uniform_patch,
             )
 
     def forward(self, hidden_states):
@@ -215,7 +209,6 @@ class LTX2VideoResnetBlockAdapter(nn.Module):
         resnet: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -241,7 +234,6 @@ class LTX2VideoResnetBlockAdapter(nn.Module):
                     getattr(resnet, name),
                     block_size=conv_block_size,
                     patch_dim=patch_dim,
-                    use_uniform_patch=use_uniform_patch,
                 ),
             )
 

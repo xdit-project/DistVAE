@@ -39,7 +39,7 @@ LTX2VideoDownsampler3d = block(LTX2_VIDEO, "LTX2VideoDownsampler3d")
 LTX2VideoDownBlock3D = block(LTX2_VIDEO, "LTX2VideoDownBlock3D")
 
 
-def _zero_pad_strided_conv(conv, conv_block_size, patch_dim, use_uniform_patch):
+def _zero_pad_strided_conv(conv, conv_block_size, patch_dim):
     """A sharded stand-in for a (0, 1, 0, 1) zero pad followed by a stride-2 convolution
 
     The pair cannot be split as written, because a rank's bottom row is padding only if it is the
@@ -65,7 +65,6 @@ def _zero_pad_strided_conv(conv, conv_block_size, patch_dim, use_uniform_patch):
         reversed_zero_padding=(0, 1, 0, 1),
         block_size=conv_block_size,
         patch_dim=patch_dim,
-        use_uniform_patch=use_uniform_patch,
     )
     sharded.weight.data = conv.weight.data
     if conv.bias is not None:
@@ -92,7 +91,6 @@ class Downsample2DAdapter(nn.Module):
         downsampler: Downsample2D,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         assert isinstance(downsampler, Downsample2D), (
@@ -104,15 +102,12 @@ class Downsample2DAdapter(nn.Module):
             return
         conv = downsampler.conv
         if self.pads_by_hand:
-            sharded = _zero_pad_strided_conv(
-                conv, conv_block_size, patch_dim, use_uniform_patch
-            )
+            sharded = _zero_pad_strided_conv(conv, conv_block_size, patch_dim)
         else:
             sharded = Conv2dAdapter(
                 conv,
                 block_size=conv_block_size,
                 patch_dim=patch_dim,
-                use_uniform_patch=use_uniform_patch,
             )
         downsampler.conv = sharded
         # Some configurations name the same convolution twice. Both have to move, or the original
@@ -148,7 +143,6 @@ class _CausalResampleDownAdapter(nn.Module):
         resample: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = True,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -167,7 +161,6 @@ class _CausalResampleDownAdapter(nn.Module):
                 resample.time_conv,
                 block_size=conv_block_size,
                 patch_dim=patch_dim,
-                use_uniform_patch=use_uniform_patch,
             )
 
         if isinstance(resample.resample, nn.Sequential):
@@ -179,15 +172,12 @@ class _CausalResampleDownAdapter(nn.Module):
                     f"{adapter} expects a zero pad and one convolution, got "
                     f"{[type(layer).__name__ for layer in layers]}"
                 )
-            resample.resample = _zero_pad_strided_conv(
-                convs[0], conv_block_size, patch_dim, use_uniform_patch
-            )
+            resample.resample = _zero_pad_strided_conv(convs[0], conv_block_size, patch_dim)
         elif isinstance(resample.resample, nn.Conv2d):
             resample.resample = Conv2dAdapter(
                 resample.resample,
                 block_size=conv_block_size,
                 patch_dim=patch_dim,
-                use_uniform_patch=use_uniform_patch,
             )
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
@@ -224,7 +214,6 @@ class _PaddedCausalDownsampleAdapter(nn.Module):
         downsampler: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -237,7 +226,6 @@ class _PaddedCausalDownsampleAdapter(nn.Module):
             downsampler.conv,
             block_size=conv_block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
         )
 
     def forward(self, hidden_states):
@@ -269,7 +257,6 @@ class _PaddedCausalDownBlockAdapter(nn.Module):
         down_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -280,7 +267,6 @@ class _PaddedCausalDownBlockAdapter(nn.Module):
         options = dict(
             conv_block_size=conv_block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
         )
         self.down_block = down_block
         down_block.resnets = nn.ModuleList(
@@ -325,7 +311,6 @@ class LTX2VideoDownsamplerAdapter(nn.Module):
         downsampler: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -338,7 +323,6 @@ class LTX2VideoDownsamplerAdapter(nn.Module):
             downsampler.conv,
             block_size=conv_block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
         )
 
     def forward(self, hidden_states, causal: bool = True):
@@ -361,7 +345,6 @@ class LTX2VideoDownBlockAdapter(nn.Module):
         down_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -372,7 +355,6 @@ class LTX2VideoDownBlockAdapter(nn.Module):
         options = dict(
             conv_block_size=conv_block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
         )
         self.down_block = down_block
         down_block.resnets = nn.ModuleList(
@@ -380,26 +362,23 @@ class LTX2VideoDownBlockAdapter(nn.Module):
         )
         if down_block.downsamplers is not None:
             down_block.downsamplers = nn.ModuleList(
-                [self._adapt_downsampler(down, adapter, conv_block_size, patch_dim,
-                                         use_uniform_patch)
+                [self._adapt_downsampler(down, adapter, conv_block_size, patch_dim)
                  for down in down_block.downsamplers]
             )
 
     @staticmethod
-    def _adapt_downsampler(downsampler, adapter, conv_block_size, patch_dim, use_uniform_patch):
+    def _adapt_downsampler(downsampler, adapter, conv_block_size, patch_dim):
         if LTX2VideoDownsampler3d is not None and isinstance(downsampler, LTX2VideoDownsampler3d):
             return LTX2VideoDownsamplerAdapter(
                 downsampler,
                 conv_block_size=conv_block_size,
                 patch_dim=patch_dim,
-                use_uniform_patch=use_uniform_patch,
             )
         if LTX2VideoCausalConv3d is not None and isinstance(downsampler, LTX2VideoCausalConv3d):
             return LTX2VideoCausalConv3dAdapter(
                 downsampler,
                 block_size=conv_block_size,
                 patch_dim=patch_dim,
-                use_uniform_patch=use_uniform_patch,
             )
         raise TypeError(
             f"{adapter} cannot shard a downsampler of type {type(downsampler).__name__}. It "
@@ -420,7 +399,6 @@ class WanResidualDownBlockAdapter(nn.Module):
         wan_residual_down_block: WanResidualDownBlock,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = True,
     ):
         super().__init__()
         assert isinstance(wan_residual_down_block, WanResidualDownBlock), (
@@ -438,7 +416,6 @@ class WanResidualDownBlockAdapter(nn.Module):
                         resnet,
                         conv_block_size=conv_block_size,
                         patch_dim=patch_dim,
-                        use_uniform_patch=use_uniform_patch
                     )
                 )
             self.down_block.resnets = nn.ModuleList(adapted_resnets)
@@ -448,7 +425,6 @@ class WanResidualDownBlockAdapter(nn.Module):
                     wan_residual_down_block.downsampler,
                     conv_block_size=conv_block_size,
                     patch_dim=patch_dim,
-                    use_uniform_patch=use_uniform_patch
                 )
 
     def forward(self, hidden_states, feat_cache=None, feat_idx=[0]):

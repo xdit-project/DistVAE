@@ -30,7 +30,6 @@ class WanZeroPadConv2d(nn.Conv2d, PatchConvMixin):
         reversed_zero_padding: Union[int, _size_4_t] = 0,
         block_size: Union[int, Tuple[int, int, int]] = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = True,
     ) -> None:
         if isinstance(dilation, int):
             assert dilation == 1, "dilation is not supported in WanZeroPadConv2d"
@@ -70,7 +69,6 @@ class WanZeroPadConv2d(nn.Conv2d, PatchConvMixin):
         self.reversed_zero_padding = reversed_zero_padding
         self.block_size = block_size
         self.patch_dim = patch_dim
-        self.use_uniform_patch = use_uniform_patch
         self.halo_buffer = {}
         super().__init__(
             in_channels,
@@ -134,7 +132,7 @@ class WanZeroPadConv2d(nn.Conv2d, PatchConvMixin):
                 group_world_size,
                 rank_in_group,
                 _,
-            ) = self._multi_rank_metadata_and_halo(input, self.use_uniform_patch, self.halo_buffer)
+            ) = self._multi_rank_metadata_and_halo(input, self.halo_buffer)
 
             # ZeroPad2d
             if rank_in_group == 0:

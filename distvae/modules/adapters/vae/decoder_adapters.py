@@ -181,7 +181,7 @@ class _CausalDecoderAdapter(nn.Module):
         DistributedEnv.set_patch_dim(patch_dim)
         # Bands differ in size where the rows do not divide by the rank count, so every
         # convolution has to read the sizes rather than assume its neighbours match it.
-        options = dict(patch_dim=patch_dim, use_uniform_patch=False)
+        options = dict(patch_dim=patch_dim)
         self.decoder = decoder
         self.decoder.conv_in = self._conv_adapter(
             decoder.conv_in, block_size=conv_block_size, **options

@@ -93,7 +93,6 @@ class _CausalResampleAdapter(nn.Module):
         resample: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -111,7 +110,6 @@ class _CausalResampleAdapter(nn.Module):
                 resample.time_conv,
                 block_size=conv_block_size,
                 patch_dim=patch_dim,
-                use_uniform_patch=use_uniform_patch,
             )
         if isinstance(resample.resample, nn.Sequential):
             self.resample.resample = nn.Sequential(*[
@@ -119,7 +117,6 @@ class _CausalResampleAdapter(nn.Module):
                     layer,
                     block_size=conv_block_size,
                     patch_dim=patch_dim,
-                    use_uniform_patch=use_uniform_patch,
                 ) if isinstance(layer, nn.Conv2d) else layer
                 for layer in resample.resample
             ])
@@ -159,7 +156,6 @@ class _CausalUpBlockAdapter(nn.Module):
         up_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -170,7 +166,6 @@ class _CausalUpBlockAdapter(nn.Module):
         options = dict(
             conv_block_size=conv_block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
         )
         up_block.resnets = nn.ModuleList(
             [self._resnet_adapter(resnet, **options) for resnet in up_block.resnets]
@@ -239,7 +234,6 @@ class _PaddedCausalUpsampleAdapter(nn.Module):
         upsampler: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -252,7 +246,6 @@ class _PaddedCausalUpsampleAdapter(nn.Module):
             upsampler.conv,
             block_size=conv_block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
         )
 
     def forward(self, hidden_states):
@@ -284,7 +277,6 @@ class _PaddedCausalUpBlockAdapter(nn.Module):
         up_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -295,7 +287,6 @@ class _PaddedCausalUpBlockAdapter(nn.Module):
         options = dict(
             conv_block_size=conv_block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
         )
         self.up_block = up_block
         up_block.resnets = nn.ModuleList(
@@ -339,7 +330,6 @@ class LTX2VideoUpsamplerAdapter(nn.Module):
         upsampler: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -352,7 +342,6 @@ class LTX2VideoUpsamplerAdapter(nn.Module):
             upsampler.conv,
             block_size=conv_block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
         )
 
     def forward(self, hidden_states, causal: bool = True):
@@ -374,7 +363,6 @@ class LTX2VideoUpBlockAdapter(nn.Module):
         up_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
-        use_uniform_patch: bool = False,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -385,7 +373,6 @@ class LTX2VideoUpBlockAdapter(nn.Module):
         options = dict(
             conv_block_size=conv_block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
         )
         self.up_block = up_block
         if up_block.conv_in is not None:

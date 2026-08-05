@@ -82,7 +82,6 @@ def worker(
         reversed_zero_padding=(0, 1, 0, 1),
         block_size=block_size,
         patch_dim=patch_dim,
-        use_uniform_patch=True,
     ).eval()
 
     patchify = Patchify(patch_dim=patch_dim)
