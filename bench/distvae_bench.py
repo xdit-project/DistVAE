@@ -1079,7 +1079,13 @@ def main():
         # until its timeout rather than lose the one row.
         except (Exception, SystemExit) as error:  # noqa: BLE001 - keeping the grid going is the point
             report, failed = None, f"{type(error).__name__}: {error}"
-            say(f"cell failed: {failed}")
+            # From whichever rank raised, not only from rank 0. A cell that fails on some ranks
+            # and not others is the case most worth seeing and the one `say` hides, and it is
+            # also the case the vote below cannot rescue: a rank still inside the decode is in
+            # that decode's collectives, not in this all_reduce, so the two sit until the
+            # watchdog fires and the only evidence left is a timeout naming two different
+            # collectives. Printed before the vote so it survives the deadlock.
+            print(f"[rank {rank}] cell failed: {failed}", flush=True)
         torch.cuda.empty_cache()
         votes = torch.tensor([0.0 if failed else 1.0], device=device)
         dist.all_reduce(votes)
