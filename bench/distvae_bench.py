@@ -500,34 +500,32 @@ def deals_tiles_out(vae) -> bool:
 PHASES = Counter()
 
 
-def timing_dispatch(base, device):
-    """A dispatcher that records what its calls cost, and what the rest of the dispatch cost
+def time_the_decoder(vae, device):
+    """Record what every decoder call costs, wherever in the loop it was made from
 
     The question this answers is where a tiled decode's time actually goes: into the decoder, or
-    into the parts either side of it that dealing tiles out does nothing to divide. Everything a
-    tiled_decode does other than dispatch - slicing the latent, and blending every decoded tile
-    into the canvas - is what the caller gets by subtracting these from the whole.
+    into everything either side of it - slicing the latent, blending each tile into the canvas,
+    and the exchanges. Wrapping the decoder rather than the dispatcher is what lets the three
+    ways of splitting a decode be read against each other, since only one of them routes its
+    calls through a dispatcher at all.
     """
-    def dispatch(calls):
-        def timing(call):
-            def timed_call():
-                torch.cuda.synchronize(device)
-                start = time.perf_counter()
-                out = call()
-                torch.cuda.synchronize(device)
-                PHASES["decode_s"] += time.perf_counter() - start
-                return out
-            return timed_call
+    import torch.nn as nn
 
-        torch.cuda.synchronize(device)
-        start = time.perf_counter()
-        made = base([timing(call) for call in calls])
-        torch.cuda.synchronize(device)
-        PHASES["dispatch_s"] += time.perf_counter() - start
-        PHASES["calls"] += len(calls)
-        return made
+    class Timed(nn.Module):
+        def __init__(self, decoder):
+            super().__init__()
+            self.decoder = decoder
 
-    return dispatch
+        def forward(self, *args, **kwargs):
+            torch.cuda.synchronize(device)
+            start = time.perf_counter()
+            out = self.decoder(*args, **kwargs)
+            torch.cuda.synchronize(device)
+            PHASES["decode_s"] += time.perf_counter() - start
+            PHASES["calls"] += 1
+            return out
+
+    vae.decoder = Timed(vae.decoder)
 
 
 def timing_decode(tiled_decode, device):
@@ -544,28 +542,39 @@ def timing_decode(tiled_decode, device):
     return timed_decode
 
 
-def phase_report():
+def phase_report(group=None, world_size=1):
     """What one tiled decode spent in each phase, in ms, empty unless --phase-timing asked
 
-    `rest_ms` is the whole decode less the dispatch: slicing the latent, and blending every
-    decoded tile into the canvas. Dealing tiles out divides the decoder calls between the ranks
-    and leaves that remainder on every one of them, so it is the number that says whether dealing
-    can pay at a given tile count.
+    `rest_ms` is the whole decode less the decoder itself: slicing the latent, blending each tile
+    into the canvas, and the exchanges. That remainder is the part no scheme here divides by
+    adding ranks unless it divides the blending, so it is what says whether one can.
+
+    The spread of `decoder_ms` across the ranks is the other half of the story. Every scheme ends
+    in a gather, so the slowest rank sets the pace, and a split that hands one rank more tiles
+    than another pays that difference whatever it saved elsewhere.
     """
     decodes = PHASES.get("decodes", 0)
     if not decodes:
         return {}
     total = PHASES["decode_total_s"] / decodes
-    dispatch = PHASES["dispatch_s"] / decodes
     decode = PHASES["decode_s"] / decodes
-    return {
+    report = {
         "total_ms": round(total * 1e3, 1),
-        "dispatch_ms": round(dispatch * 1e3, 1),
         "decoder_ms": round(decode * 1e3, 1),
-        "gather_ms": round((dispatch - decode) * 1e3, 1),
-        "rest_ms": round((total - dispatch) * 1e3, 1),
+        "rest_ms": round((total - decode) * 1e3, 1),
         "calls_per_decode": round(PHASES["calls"] / decodes, 1),
     }
+    if world_size > 1:
+        share = [None] * world_size
+        dist.all_gather_object(share, (decode, PHASES["calls"] / decodes), group=group)
+        report["decoder_ms_by_rank"] = [round(one * 1e3, 1) for one, _ in share]
+        report["calls_by_rank"] = [round(many, 1) for _, many in share]
+        # One rank waiting on another is time no rank spends decoding. Stated as a share of the
+        # slowest rank, so it reads the same whatever the shape costs.
+        slowest = max(one for one, _ in share)
+        idle = sum(slowest - one for one, _ in share) / (world_size * slowest or 1)
+        report["idle_share"] = round(idle, 3)
+    return report
 
 
 def setup_tiling(
@@ -645,17 +654,8 @@ def setup_tiling(
             # against each other rather than argued about.
             assemble = None
         facts["tile_split"] = tile_split
-    elif phase_timing and vae_tiling.tiles_by_overlap_factor(vae):
-        # With no group there is nothing to deal to, so the timing dispatcher makes every call
-        # itself in order, which is what this arm's decode did anyway. That keeps a rows arm the
-        # same arm it was and lets the two splits be read against one another phase by phase.
-        # Only the overlap-fraction family can be timed this way: handing the stride-walked family
-        # a dispatcher swaps diffusers' loop for xDiT's, which is a different arm.
-        dispatch = lambda calls: [call() for call in calls]  # noqa: E731
-    if phase_timing and dispatch is not None:
-        dispatch = timing_dispatch(dispatch, vae.device)
-    elif phase_timing:
-        say(f"--phase-timing has no loop to time on this {type(vae).__name__} without a group")
+    if phase_timing:
+        time_the_decoder(vae, vae.device)
 
     budget = vae_tiling.tile_batch_budget(default_area, tile_area)
     # Upstream's one tile per call is what isolates the dealing from the batching: the two are
@@ -677,6 +677,8 @@ def setup_tiling(
         # install and the arm still measures upstream tiling rather than silently measuring
         # nothing.
         say(f"no reimplemented tiled_decode for {type(vae).__name__}. Measuring upstream tiling.")
+        if phase_timing:
+            vae.tiled_decode = timing_decode(vae.tiled_decode, vae.device)
         return facts
     vae.tiled_decode = timing_decode(batched, vae.device) if phase_timing else batched
     facts["batched"] = budget > 0
@@ -1008,7 +1010,7 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
     torch.cuda.reset_peak_memory_stats(device)
     timing = timed(once, args.iters, device)
     peak_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
-    phases = phase_report()
+    phases = phase_report(group, world_size)
     if phases:
         say(f"phases: {json.dumps(phases)}")
 
@@ -1098,9 +1100,13 @@ def print_report(report: dict, half: str) -> None:
           flush=True)
     phases = report.get("phases")
     if phases:
-        print(f"phases: decoder {phases['decoder_ms']:.1f} ms   gather {phases['gather_ms']:.1f} ms"
-              f"   rest {phases['rest_ms']:.1f} ms   of {phases['total_ms']:.1f} ms"
+        print(f"phases: decoder {phases['decoder_ms']:.1f} ms   rest {phases['rest_ms']:.1f} ms"
+              f"   of {phases['total_ms']:.1f} ms"
               f"   over {phases['calls_per_decode']:.0f} calls", flush=True)
+        if "decoder_ms_by_rank" in phases:
+            print(f"  decoder by rank {phases['decoder_ms_by_rank']}   "
+                  f"calls by rank {phases['calls_by_rank']}   "
+                  f"idle {phases['idle_share'] * 100:.1f}%", flush=True)
     agreement = report.get("agreement")
     if agreement is not None:
         verdict = "matches" if agreement["ok"] else "DIFFERS FROM"
