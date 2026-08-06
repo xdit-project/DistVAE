@@ -568,7 +568,10 @@ def phase_report():
     }
 
 
-def setup_tiling(vae, window, tile_batch, world_size, say, group=None, phase_timing=False):
+def setup_tiling(
+    vae, window, tile_batch, world_size, say, group=None, phase_timing=False,
+    tile_split="tiles",
+):
     """Turn tiling on the way the runner does, returning what it settled on
 
     The runner's order is the thing under test and not an implementation detail: it reads the
@@ -631,11 +634,17 @@ def setup_tiling(vae, window, tile_batch, world_size, say, group=None, phase_tim
     facts["tile_parallel"] = group is not None
 
     dealing = group is not None
-    dispatch = None
+    dispatch = assemble = None
     if dealing:
         from xfuser.core.utils import vae_tile_parallel
 
-        dispatch = vae_tile_parallel.dispatch_over(group)
+        dispatch, assemble = vae_tile_parallel.sharing(group)
+        if tile_split == "scattered":
+            # The tiles still go out whole, but scattered through the grid rather than in a band,
+            # which is what leaves the blending on every rank. Kept so the two can be measured
+            # against each other rather than argued about.
+            assemble = None
+        facts["tile_split"] = tile_split
     elif phase_timing and vae_tiling.tiles_by_overlap_factor(vae):
         # With no group there is nothing to deal to, so the timing dispatcher makes every call
         # itself in order, which is what this arm's decode did anyway. That keeps a rows arm the
@@ -660,7 +669,7 @@ def setup_tiling(vae, window, tile_batch, world_size, say, group=None, phase_tim
     facts["budget_elems"] = budget or None
 
     if dealing:
-        batched = vae_tiling.tiled_decode_for(vae, budget, dispatch)
+        batched = vae_tiling.tiled_decode_for(vae, budget, dispatch, assemble)
     else:
         batched = vae_tiling.batched_tiled_decode(vae, budget, dispatch)
     if batched is None:
@@ -731,11 +740,14 @@ def main():
     parser.add_argument("--tile-batch", choices=["batched", "upstream"], default="batched",
                         help="batched installs xDiT's batched tiled_decode under the budget rule; "
                              "upstream leaves diffusers decoding one tile per call")
-    parser.add_argument("--tile-split", choices=["tiles", "rows"], default="tiles",
-                        help="what the group divides when both tiling and parallel VAE are on: "
-                             "whole tiles, a rank to each, or the rows inside every tile. Rows is "
-                             "what composing the two flags did before whole tiles were an option, "
-                             "and is kept so that the two can be measured against each other")
+    parser.add_argument("--tile-split", choices=["tiles", "scattered", "rows"], default="tiles",
+                        help="what the group divides when both tiling and parallel VAE are on. "
+                             "tiles gives each rank a band of tile rows, which divides the "
+                             "blending too; scattered deals whole tiles round-robin, which "
+                             "leaves the blending on every rank; rows shards inside every tile, "
+                             "which is what composing the two flags did before either was an "
+                             "option. All three are kept so they can be measured against "
+                             "each other")
     parser.add_argument("--phase-timing", action="store_true",
                         help="split a tiled decode into the decoder calls and everything else, "
                              "which is where the blending lives. Diagnostic only: it synchronises "
@@ -939,14 +951,15 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
             references[key] = run_half(vae, args.half, sample).float().cpu()
     reference = references.get(key)
 
-    # Two ways for a group to divide a tiled decode, and the runner picks the same one this does:
-    # whole tiles to a rank each, leaving the decoder unsharded, wherever the tiling loop is one
-    # xDiT owns. --tile-split rows is the other, which shards inside every tile.
+    # Three ways for a group to divide a tiled decode, and the runner picks the first one wherever
+    # the tiling loop is one xDiT owns: a band of tile rows to a rank, leaving the decoder
+    # unsharded. --tile-split scattered deals whole tiles without the bands, and rows shards
+    # inside every tile.
     tile_parallel = bool(
         cell["parallel_vae"]
         and cell["tiling"]
         and args.half == "decoder"
-        and args.tile_split == "tiles"
+        and args.tile_split in ("tiles", "scattered")
         and deals_tiles_out(vae)
     )
 
@@ -954,8 +967,8 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
     if not cell["parallel_vae"]:
         say("parallel VAE off: every rank decodes the whole half, as an unsharded run does")
     elif tile_parallel:
-        say("parallel VAE by whole tiles: the decoder is left unsharded and each rank decodes "
-            "the tiles it is dealt")
+        say(f"parallel VAE by whole tiles ({args.tile_split}): the decoder is left unsharded and "
+            f"each rank decodes the tiles it is given")
     else:
         adapter = parallelize(vae, group, args.half)
         say(f"adapter={adapter}")
@@ -971,6 +984,7 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
             vae, window, args.tile_batch, world_size, say,
             group=group if tile_parallel else None,
             phase_timing=args.phase_timing,
+            tile_split=args.tile_split,
         )
         say(f"tiling: {json.dumps(tiling)}")
 
