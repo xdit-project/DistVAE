@@ -228,6 +228,11 @@ FAMILIES = {
             norm_num_groups=32,
             down_block_types=["DownEncoderBlock2D"] * 4,
             up_block_types=["UpDecoderBlock2D"] * 4,
+            # The tile window IS this number: AutoencoderKL assigns tile_sample_min_size from it
+            # outright. The class defaults it to 32, which no shipped checkpoint carries, and a
+            # 2048x2048 decode at a 32px window is four thousand tiles of nothing. SD3 and SDXL
+            # both ship 1024.
+            sample_size=1024,
         ),
         latent_channels=16,
         spatial=8,
