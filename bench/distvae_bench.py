@@ -24,8 +24,9 @@ The four arms a comparison usually wants, each differing from the one above it b
   --vae-tile-size N                              the same, at a narrower window
 
 Tiling is installed by xDiT's own calls in xDiT's own order, so an arm measures the policy that
-ships rather than this file's reading of it. Pass --tile-batch upstream to hold the batched
-tiled_decode off and see what the tiling costs without it.
+ships rather than this file's reading of it - with one deliberate exception: --vae-tile-size is
+not held at the useful floor the runner clamps to, since measuring below it is how that floor
+gets checked. A run down there says so in its tiling facts.
 
 What this cannot tell you: anything about real activation distributions (random weights give
 mean~0, variance~1, the easy case for any variance computation), anything about the pipeline
@@ -400,6 +401,18 @@ def run_half(vae, half, sample):
 # --------------------------------------------------------------------------------------------
 
 
+def _restore_torch_groupnorm():
+    """Undo AITER's GroupNorm swap, which importing xfuser performs
+
+    xDiT does this while validating --use_parallel_vae, before it loads a pipeline: DistVAE's
+    GroupNormAdapter reads num_channels off the norm and AITER's GroupNorm does not carry it,
+    while still subclassing nn.GroupNorm well enough to be selected. A VAE built here rather than
+    by a runner model has to be brought to the same state by hand.
+    """
+    if torch.nn.GroupNorm.__module__ == "aiter.ops.groupnorm":
+        torch.nn.GroupNorm = TORCH_GROUPNORM
+
+
 def _vae_parallel():
     """xDiT's adapter selection, which is the thing under test and not optional here"""
     # Choosing an adapter here instead would measure this file's opinion of which one fits, and
@@ -409,31 +422,100 @@ def _vae_parallel():
     except ImportError as e:
         raise SystemExit(
             "xfuser.core.utils.vae_parallel is not importable, so there is no adapter selection "
-            "to exercise. Point the runner at an xDiT that carries it (-XditBranch)."
+            "to exercise. Point the runner at an xDiT that carries it (-XditBranch), or ask for "
+            "the `main` arm, which is what an xDiT without it can still do."
         ) from e
 
-    # xDiT does this while validating --use_parallel_vae, before it loads a pipeline: DistVAE's
-    # GroupNormAdapter reads num_channels off the norm and AITER's GroupNorm does not carry it,
-    # while still subclassing nn.GroupNorm well enough to be selected. A VAE built here rather
-    # than by a runner model has to be brought to the same state by hand.
-    if torch.nn.GroupNorm.__module__ == "aiter.ops.groupnorm":
-        torch.nn.GroupNorm = TORCH_GROUPNORM
-
+    _restore_torch_groupnorm()
     return vae_parallel
 
 
-def describe(vae, half):
+# --------------------------------------------------------------------------------------------
+# The same two features as xDiT main composes them, which is the baseline everything else moves
+# --------------------------------------------------------------------------------------------
+
+# main has no adapter selection: each runner model names the DistVAE class it wants in its own
+# _setup_parallel_vae, and DistVAE main carries only these two. The families missing here are not
+# an omission - no runner model on main names an adapter for them, and DistVAE main has none to
+# name, so there is no baseline to measure and the branch is the first thing that can do it.
+MAIN_ADAPTERS = {
+    "flux2": "DecoderAdapter",       # xFuserFlux2Model, via flux.py's _setup_parallel_vae
+    "kl": "DecoderAdapter",          # the same call in every 2D runner model
+    "wan": "WanDecoderAdapter",      # wan.py's own copy of it
+}
+
+
+def parallelize_as_main_does(vae, group, family, half):
+    """Shard the decoder by naming a class, as main's runner models do"""
+    if half != "decoder":
+        raise ValueError(
+            "main shards no encoder for these families, so there is no encoder baseline"
+        )
+    name = MAIN_ADAPTERS.get(family)
+    if name is None:
+        raise ValueError(
+            f"nothing on xDiT main shards a {family} VAE: DistVAE main carries only "
+            f"{sorted(set(MAIN_ADAPTERS.values()))} and no runner model names one for this "
+            f"family, so this cell has no baseline rather than a slow one"
+        )
+    from distvae.modules.adapters.vae import decoder_adapters
+
+    adapter = getattr(decoder_adapters, name, None)
+    if adapter is None:
+        raise ValueError(
+            f"the installed DistVAE has no {name}; the `main` arm needs DistVAE main "
+            f"(-DistVaeBranch main)"
+        )
+    vae.decoder = adapter(vae.decoder, vae_group=group).to(vae.device)
+    return f"{name} (named, not selected)"
+
+
+def _native_window(vae):
+    """The VAE's own pixel tile window, read without xDiT, since main's arm has no xDiT to read
+    it with"""
+    windows = {
+        value
+        for attr in ("tile_sample_min_size", "tile_sample_min_height", "tile_sample_min_width")
+        if isinstance(value := getattr(vae, attr, None), int) and value > 0
+    }
+    return windows.pop() if len(windows) == 1 else None
+
+
+def tile_as_main_does(vae):
+    """Turn tiling on the way main does, which is one call and no window to choose
+
+    main's _enable_options is `self.pipe.vae.enable_tiling()` and nothing else: diffusers' own
+    loop at the VAE's own window, decoding one tile at a time on every rank. There is no
+    --vae_tile_size on main, so the window is not a lever this arm has.
+    """
+    vae.enable_tiling()
+    return {
+        "enabled": True,
+        "requested_window": None,
+        "window_px": _native_window(vae),
+        "tile_latent_area": _latent_area(vae),
+        "as_main_does": True,
+    }
+
+
+def describe(vae, half, family, select=True):
     """What this half is assembled from, and which adapter xDiT picks for it
 
     Printed whether or not sharding then works, because a refusal or an assertion from inside a
     half-replaced decoder is only readable next to the blocks it was looking at.
+
+    `select` off is the main arm, which has no selection to report: main names an adapter per
+    runner model, so the only answer available there is this file's table of what it names.
     """
-    vae_parallel = _vae_parallel()
     part = getattr(vae, half)
     blocks = tuple(getattr(part, "up_blocks" if half == "decoder" else "down_blocks", None) or ())
-    chooser = (
-        vae_parallel.decoder_adapter_name if half == "decoder" else vae_parallel.encoder_adapter_name
-    )
+    chooser = None
+    if select:
+        vae_parallel = _vae_parallel()
+        chooser = (
+            vae_parallel.decoder_adapter_name if half == "decoder"
+            else vae_parallel.encoder_adapter_name
+        )
     norm = getattr(part, "conv_norm_out", None)
 
     # Qualified, because selection is by isinstance and diffusers has more than one class per
@@ -452,7 +534,7 @@ def describe(vae, half):
         "mid_block": named(getattr(part, "mid_block", None)),
         "conv_norm_out": named(norm),
         "norm_is_nn_groupnorm": isinstance(norm, torch.nn.GroupNorm),
-        "adapter": chooser(vae),
+        "adapter": chooser(vae) if chooser else MAIN_ADAPTERS.get(family),
     }
 
 
@@ -577,16 +659,23 @@ def phase_report(group=None, world_size=1):
     return report
 
 
+def _latent_area(vae):
+    """The latent area of the VAE's current tile, None where it has no square latent window"""
+    size = getattr(vae, "tile_latent_min_size", None)
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        return None
+    return size * size
+
+
 def setup_tiling(
-    vae, window, tile_batch, world_size, say, group=None, phase_timing=False,
-    tile_split="tiles",
+    vae, window, world_size, say, group=None, phase_timing=False, tile_split="tiles",
 ):
     """Turn tiling on the way the runner does, returning what it settled on
 
-    The runner's order is the thing under test and not an implementation detail: it reads the
-    VAE's own tile area *before* --vae_tile_size can narrow it, because the batch budget is
-    derived from both areas. Doing it the other way round would read the narrowed area twice and
-    budget a single tile per call at every window.
+    Unlike the runner this does NOT hold the window at or above
+    `vae_tiling.narrowest_useful_window`, because measuring below that floor is how the floor was
+    found; `below_useful_floor` in the returned facts says when a run is down there. Nothing else
+    here should differ from what the runner installs.
 
     A `group` is the tiles being dealt out across it, which is what the runner does instead of
     sharding when both flags are on. The decoder is then unsharded and the tile a rank is given
@@ -596,13 +685,14 @@ def setup_tiling(
     vae_tiling.require_vae_support(vae, "tiling", "--enable-tiling")
     vae.enable_tiling()
 
-    default_area = vae_tiling.tile_latent_area(vae)
     native = vae_tiling.tile_window(vae)
+    floor = vae_tiling.narrowest_useful_window(vae)
     facts = {
         "enabled": True,
         "requested_window": window,
         "window_px": native,
-        "default_tile_latent_area": default_area,
+        "default_tile_latent_area": _latent_area(vae),
+        "narrowest_useful_window_px": floor,
     }
 
     if window in ("half", "quarter"):
@@ -637,10 +727,15 @@ def setup_tiling(
         if pixels != window:
             say(f"tile window snapped {window} -> {pixels}px, the widest that lands whole")
 
-    tile_area = vae_tiling.tile_latent_area(vae)
-    facts["tile_latent_area"] = tile_area
-    facts["batched"] = False
+    facts["tile_latent_area"] = _latent_area(vae)
     facts["tile_parallel"] = group is not None
+    snapped = facts.get("snapped_window_px", native)
+    facts["below_useful_floor"] = bool(
+        floor is not None and snapped is not None and snapped < floor
+    )
+    if facts["below_useful_floor"]:
+        say(f"note: {snapped}px is below this VAE's {floor}px useful floor, which the runner "
+            f"would have clamped; measuring it anyway.")
 
     dealing = group is not None
     dispatch = assemble = None
@@ -657,21 +752,15 @@ def setup_tiling(
     if phase_timing:
         time_the_decoder(vae, vae.device)
 
-    budget = vae_tiling.tile_batch_budget(default_area, tile_area)
-    # Upstream's one tile per call is what isolates the dealing from the batching: the two are
-    # independent ways to spend the same independence between tiles. Without a group to deal to
-    # there is nothing left to install, and the arm measures diffusers' own loop.
-    if tile_batch == "upstream" or budget is None:
-        if not dealing and dispatch is None:
-            facts["budget_elems"] = None
-            return facts
-        budget = 0
-    facts["budget_elems"] = budget or None
+    # A tile to a call either way, so without a group to deal to there is nothing to install and
+    # the arm measures diffusers' own loop.
+    if not dealing and dispatch is None:
+        return facts
 
     if dealing:
-        batched = vae_tiling.tiled_decode_for(vae, budget, dispatch, assemble)
+        batched = vae_tiling.tiled_decode_for(vae, dispatch, assemble)
     else:
-        batched = vae_tiling.batched_tiled_decode(vae, budget, dispatch)
+        batched = vae_tiling.overlap_tiled_decode(vae, dispatch)
     if batched is None:
         # A family whose loop xDiT does not reimplement keeps its own, so there is nothing to
         # install and the arm still measures upstream tiling rather than silently measuring
@@ -681,8 +770,6 @@ def setup_tiling(
             vae.tiled_decode = timing_decode(vae.tiled_decode, vae.device)
         return facts
     vae.tiled_decode = timing_decode(batched, vae.device) if phase_timing else batched
-    facts["batched"] = budget > 0
-    facts["tiles_per_call"] = max(1, budget // tile_area) if tile_area else None
     return facts
 
 
@@ -707,6 +794,121 @@ def timed(run, iters, device):
         "max_s": samples[-1],
         "samples_s": samples,
     }
+
+
+def tile_shape_costs(args, spec, device, dtype, say):
+    """What each tile shape costs, against what its latent area says it should
+
+    A grid is a few full-window tiles and a fringe of smaller ones, because the latent bounds
+    clip the last row and the last column. The split weighs a tile by the area it covers, which
+    is the right weight only if a tile of half the area costs half as much. It need not: an odd
+    convolution shape can miss the kernels a square one is tuned for, and then the fringe is
+    dearer than it reads and any split that gathers the fringe onto one rank is slower than the
+    weighing promised.
+
+    Timed apart from any grid so that nothing else is in the way: one decode, one tile shape.
+    """
+    vae = build_vae(args.family, dtype, device)
+    window = _vae_tiling().tile_window(vae)
+    if window is None:
+        raise SystemExit(
+            f"--family {args.family} sizes its tile height and width apart, so there is no one "
+            f"window to clip against and no shape here that stands for a grid's fringe"
+        )
+    side = window // spec["spatial"]
+    depth = 1 + (args.frames - 1) // spec["temporal"] if spec["temporal"] else None
+    say(f"latent tile window {side}x{side}"
+        + (f", {depth} latent frames of {args.frames}" if depth else ""))
+
+    shapes = []
+    if args.tile_shape_sides:
+        # A narrowed window gives square tiles, and the small end of that is where batching is
+        # supposed to pay for itself, so it is worth reaching below anything this window clips to.
+        for text in args.tile_shape_sides.split(","):
+            shapes.append((int(text), int(text)))
+    else:
+        for down in (1, 2, 4):
+            for across in (1, 2, 4):
+                shape = (side // down, side // across)
+                if min(shape) >= 8 and shape not in shapes:
+                    shapes.append(shape)
+
+    # A rank does not decode its tiles one by one: same-shaped tiles are stacked and decoded in
+    # one call under the batch budget. How many stack together depends on the shape, so two ranks
+    # holding the same area can still be making very different calls, and a batch that does not
+    # scale with its count would cost the rank holding the smaller shapes.
+    counts, count = [], 1
+    while count <= args.tile_shape_batch:
+        counts.append(count)
+        count *= 2
+    measured, full, alone = [], None, {}
+    for rows, columns in shapes:
+        for count in counts:
+            size = (count, spec["latent_channels"], rows, columns)
+            if depth is not None:
+                size = (count, spec["latent_channels"], depth, rows, columns)
+            torch.manual_seed(1)
+            latent = torch.randn(*size, dtype=dtype, device=device)
+            torch.cuda.reset_peak_memory_stats(device)
+            try:
+                for _ in range(args.warmup):
+                    run_half(vae, "decoder", latent)
+                ms = timed(
+                    lambda: run_half(vae, "decoder", latent), args.iters, device
+                )["median_s"] * 1000
+            except torch.OutOfMemoryError:
+                # A batch that does not fit is a finding, not a failure: it is the budget asking
+                # for a call the device cannot make. Bigger batches of this shape need not be
+                # timed to know they will not fit either.
+                say(f"  {rows:>4} x {columns:<4} x{count}  out of memory")
+                del latent
+                torch.cuda.empty_cache()
+                measured.append({
+                    "rows": rows, "columns": columns, "tiles_in_the_call": count,
+                    "latent_area": rows * columns, "out_of_memory": True,
+                })
+                break
+            peak = torch.cuda.max_memory_allocated(device) / 1024 ** 2
+            each = ms / count
+            area = rows * columns
+            if count == 1:
+                alone[(rows, columns)] = each
+                if full is None:
+                    full = (each, area)
+            # What the split believes a tile of this shape costs, against the clock.
+            predicted = full[0] * area / full[1]
+            measured.append({
+                "rows": rows,
+                "columns": columns,
+                "tiles_in_the_call": count,
+                "latent_area": area,
+                "ms": ms,
+                "ms_per_tile": each,
+                "peak_mb": peak,
+                "ms_per_1k_latent_area": each / area * 1000,
+                "against_what_area_predicts": each / predicted,
+                "against_the_same_tile_alone": each / alone[(rows, columns)],
+            })
+            say(f"  {rows:>4} x {columns:<4} x{count}  area {area:>7}  {ms:8.1f} ms  "
+                f"{each:8.1f} ms per tile  peak {peak:7.0f} MB  "
+                f"{each / predicted:5.2f}x what area predicts  "
+                f"{each / alone[(rows, columns)]:5.2f}x the same tile alone")
+            del latent
+            torch.cuda.empty_cache()
+
+    fitted = [r for r in measured if not r.get("out_of_memory")]
+    batched = [r for r in fitted if r["tiles_in_the_call"] > 1]
+    if batched:
+        worst = max(batched, key=lambda r: r["against_the_same_tile_alone"])
+        say(f"\nstacking tiles into one call is worst at {worst['rows']}x{worst['columns']} "
+            f"{worst['tiles_in_the_call']} to a call, where each tile costs "
+            f"{worst['against_the_same_tile_alone']:.2f}x what it costs decoded alone")
+    dearest = max(fitted, key=lambda r: r["against_what_area_predicts"])
+    say(f"\nthe dearest tile against its area is {dearest['rows']}x{dearest['columns']} "
+        f"{dearest['tiles_in_the_call']} to a call, at "
+        f"{dearest['against_what_area_predicts']:.2f}x, so a split that weighs by area alone "
+        f"under-charges it by {(dearest['against_what_area_predicts'] - 1) * 100:.0f}%")
+    return {"family": args.family, "latent_window": side, "frames": args.frames, "shapes": measured}
 
 
 def main():
@@ -739,9 +941,6 @@ def main():
     parser.add_argument("--grid-shapes", default=None,
                         help="shapes to cross the arms with, comma separated, HxW or HxWxFRAMES, "
                              "e.g. '1024x1024,2048x2048,4096x4096'. Defaults to --height/--width")
-    parser.add_argument("--tile-batch", choices=["batched", "upstream"], default="batched",
-                        help="batched installs xDiT's batched tiled_decode under the budget rule; "
-                             "upstream leaves diffusers decoding one tile per call")
     parser.add_argument("--tile-split", choices=["tiles", "scattered", "rows"], default="tiles",
                         help="what the group divides when both tiling and parallel VAE are on. "
                              "tiles gives each rank a band of tile rows, which divides the "
@@ -750,6 +949,20 @@ def main():
                              "which is what composing the two flags did before either was an "
                              "option. All three are kept so they can be measured against "
                              "each other")
+    parser.add_argument("--tile-shape-costs", action="store_true",
+                        help="time a decode at each tile shape a grid contains, full window and "
+                             "clipped, and report what each costs against what its area predicts. "
+                             "Answers whether weighing a split by latent area is weighing the "
+                             "right thing. Runs on its own, ignoring the arms and shapes")
+    parser.add_argument("--tile-shape-batch", type=int, default=1,
+                        help="how many tiles to stack into one call in --tile-shape-costs, which "
+                             "is what the batch budget does on a rank holding several tiles of "
+                             "one shape. 1 times each shape alone, and anything above doubles up "
+                             "to it")
+    parser.add_argument("--tile-shape-sides", default="",
+                        help="latent tile edges to time in --tile-shape-costs, comma separated, "
+                             "in place of the ones this VAE's window clips to. Square, since that "
+                             "is what a narrowed window gives")
     parser.add_argument("--phase-timing", action="store_true",
                         help="split a tiled decode into the decoder calls and everything else, "
                              "which is where the blending lives. Diagnostic only: it synchronises "
@@ -808,14 +1021,37 @@ def main():
         f"shapes={args.grid_shapes or f'{args.height}x{args.width}'} "
         f"arms={args.grid_arms or 'single'}")
 
+    cells = grid_cells(args)
+
     # Before the VAE exists, because importing xfuser swaps torch.nn.GroupNorm for AITER's, and
     # both the adapters and xDiT's selection ask isinstance(norm, nn.GroupNorm). A VAE built
     # first holds the class from before the swap and matches nothing. Real runs import xfuser
     # long before they load a model, so this is the ordering being measured.
-    _vae_parallel()
+    if all(cell.get("as_main_does") for cell in cells):
+        # A grid of nothing but main's arms has to run on an xDiT with no selection to ask, which
+        # is the point of it. The environment is still the one being measured, so xfuser is
+        # imported as a run imports it and the swap is then undone exactly where main undoes it,
+        # in _validate_config, whenever parallel VAE is on.
+        try:
+            import xfuser  # noqa: F401
+        except ImportError:
+            pass
+        _restore_torch_groupnorm()
+    else:
+        _vae_parallel()
 
     spec = FAMILIES[args.family]
-    cells = grid_cells(args)
+
+    if args.tile_shape_costs:
+        costs = tile_shape_costs(args, spec, device, dtype, say)
+        if rank == 0 and args.out:
+            with open(args.out, "w") as handle:
+                json.dump(costs, handle, indent=2)
+            print(f"\nwrote {args.out}", flush=True)
+        dist.barrier()
+        dist.destroy_process_group()
+        return
+
     references = {}
     reports = []
 
@@ -832,7 +1068,11 @@ def main():
                 args, spec, cell, device, dtype, group, world_size, rank, say, references
             )
             failed = None
-        except Exception as error:  # noqa: BLE001 - the whole point is to keep the grid going
+        # SystemExit alongside Exception, because a refusal deep in the harness is raised that
+        # way and it does not derive from Exception: unhandled, one rank would unwind out of the
+        # loop while the others waited in the next cell's collectives, and the pod would hang
+        # until its timeout rather than lose the one row.
+        except (Exception, SystemExit) as error:  # noqa: BLE001 - keeping the grid going is the point
             report, failed = None, f"{type(error).__name__}: {error}"
             say(f"cell failed: {failed}")
         torch.cuda.empty_cache()
@@ -886,6 +1126,12 @@ def grid_cells(args) -> list:
         # Tiling with nothing to amortise, which separates the collective saving from the plain
         # effect of handing the GPU smaller convolutions.
         "tile-nopvae": {"parallel_vae": False, "tiling": "native"},
+        # What xDiT main and DistVAE main already do with these two flags on, which is the number
+        # every arm above has to beat to be worth shipping. Needs -DistVaeBranch main to mean it:
+        # run against the branch's library it measures main's WIRING over new adapters, which is
+        # a different claim.
+        "main": {"parallel_vae": True, "tiling": "native", "as_main_does": True},
+        "main-notile": {"parallel_vae": True, "tiling": None, "as_main_does": True},
     }
     shapes = []
     for text in args.grid_shapes.split(","):
@@ -924,11 +1170,13 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
     )
     say(f"{'latent' if args.half == 'decoder' else 'input'} {tuple(sample.shape)}")
 
-    built = describe(vae, args.half)
+    as_main_does = bool(cell.get("as_main_does"))
+    built = describe(vae, args.half, args.family, select=not as_main_does)
     say(f"{args.half}: {json.dumps(built)}")
     if built["adapter"] is None and cell["parallel_vae"]:
-        raise SystemExit(
-            f"xDiT has no adapter for this {type(vae).__name__} {args.half}. Nothing to measure."
+        raise ValueError(
+            f"{'xDiT main names' if as_main_does else 'xDiT has'} no adapter for this "
+            f"{type(vae).__name__} {args.half}. Nothing to measure."
         )
     if args.describe_only:
         return None
@@ -962,12 +1210,16 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
         and cell["tiling"]
         and args.half == "decoder"
         and args.tile_split in ("tiles", "scattered")
+        and not as_main_does
         and deals_tiles_out(vae)
     )
 
     adapter = None
     if not cell["parallel_vae"]:
         say("parallel VAE off: every rank decodes the whole half, as an unsharded run does")
+    elif as_main_does:
+        adapter = parallelize_as_main_does(vae, group, args.family, args.half)
+        say(f"adapter={adapter}")
     elif tile_parallel:
         say(f"parallel VAE by whole tiles ({args.tile_split}): the decoder is left unsharded and "
             f"each rank decodes the tiles it is given")
@@ -978,12 +1230,15 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
     # After sharding, which is the order the runner uses: _setup_parallel_vae runs during load and
     # _enable_options after it, so the batched decode is installed over an already-sharded decoder.
     tiling = {"enabled": False}
-    if cell["tiling"]:
+    if cell["tiling"] and as_main_does:
+        tiling = tile_as_main_does(vae)
+        say(f"tiling: {json.dumps(tiling)}")
+    elif cell["tiling"]:
         if args.half != "decoder":
-            raise SystemExit("tiling is a decode-side feature; --enable-tiling needs --half decoder")
+            raise ValueError("tiling is a decode-side feature; --enable-tiling needs --half decoder")
         window = None if cell["tiling"] == "native" else cell["tiling"]
         tiling = setup_tiling(
-            vae, window, args.tile_batch, world_size, say,
+            vae, window, world_size, say,
             group=group if tile_parallel else None,
             phase_timing=args.phase_timing,
             tile_split=args.tile_split,
