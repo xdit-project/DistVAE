@@ -40,7 +40,7 @@ import json
 import os
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import timedelta
 
 import torch
@@ -481,13 +481,104 @@ def _vae_tiling():
     return vae_tiling
 
 
-def setup_tiling(vae, window, tile_batch, world_size, say):
+def deals_tiles_out(vae) -> bool:
+    """Whether this VAE's tiles can go out to a group whole, which is xDiT's answer and not this
+    file's"""
+    vae_tiling = _vae_tiling()
+    if not hasattr(vae_tiling, "supports_tile_parallel"):
+        raise SystemExit(
+            "the installed xDiT does not deal tiles out across a group, so --tile-split tiles is "
+            "not something it can be measured doing. Point the runner at an xDiT that carries it "
+            "(-XditBranch), or ask for --tile-split rows."
+        )
+    return vae_tiling.supports_tile_parallel(vae)
+
+
+# Seconds spent inside each phase of a tiled decode, summed over however many decodes ran since
+# the last reset. Only filled when --phase-timing asks for it, since reading them means
+# synchronising the device around each tile and that is not what the timed arms should measure.
+PHASES = Counter()
+
+
+def timing_dispatch(base, device):
+    """A dispatcher that records what its calls cost, and what the rest of the dispatch cost
+
+    The question this answers is where a tiled decode's time actually goes: into the decoder, or
+    into the parts either side of it that dealing tiles out does nothing to divide. Everything a
+    tiled_decode does other than dispatch - slicing the latent, and blending every decoded tile
+    into the canvas - is what the caller gets by subtracting these from the whole.
+    """
+    def dispatch(calls):
+        def timing(call):
+            def timed_call():
+                torch.cuda.synchronize(device)
+                start = time.perf_counter()
+                out = call()
+                torch.cuda.synchronize(device)
+                PHASES["decode_s"] += time.perf_counter() - start
+                return out
+            return timed_call
+
+        torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        made = base([timing(call) for call in calls])
+        torch.cuda.synchronize(device)
+        PHASES["dispatch_s"] += time.perf_counter() - start
+        PHASES["calls"] += len(calls)
+        return made
+
+    return dispatch
+
+
+def timing_decode(tiled_decode, device):
+    """The whole tiled decode, timed, so that the phases can be read against it"""
+    def timed_decode(z, return_dict: bool = True):
+        torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        out = tiled_decode(z, return_dict=return_dict)
+        torch.cuda.synchronize(device)
+        PHASES["decode_total_s"] += time.perf_counter() - start
+        PHASES["decodes"] += 1
+        return out
+
+    return timed_decode
+
+
+def phase_report():
+    """What one tiled decode spent in each phase, in ms, empty unless --phase-timing asked
+
+    `rest_ms` is the whole decode less the dispatch: slicing the latent, and blending every
+    decoded tile into the canvas. Dealing tiles out divides the decoder calls between the ranks
+    and leaves that remainder on every one of them, so it is the number that says whether dealing
+    can pay at a given tile count.
+    """
+    decodes = PHASES.get("decodes", 0)
+    if not decodes:
+        return {}
+    total = PHASES["decode_total_s"] / decodes
+    dispatch = PHASES["dispatch_s"] / decodes
+    decode = PHASES["decode_s"] / decodes
+    return {
+        "total_ms": round(total * 1e3, 1),
+        "dispatch_ms": round(dispatch * 1e3, 1),
+        "decoder_ms": round(decode * 1e3, 1),
+        "gather_ms": round((dispatch - decode) * 1e3, 1),
+        "rest_ms": round((total - dispatch) * 1e3, 1),
+        "calls_per_decode": round(PHASES["calls"] / decodes, 1),
+    }
+
+
+def setup_tiling(vae, window, tile_batch, world_size, say, group=None, phase_timing=False):
     """Turn tiling on the way the runner does, returning what it settled on
 
     The runner's order is the thing under test and not an implementation detail: it reads the
     VAE's own tile area *before* --vae_tile_size can narrow it, because the batch budget is
     derived from both areas. Doing it the other way round would read the narrowed area twice and
     budget a single tile per call at every window.
+
+    A `group` is the tiles being dealt out across it, which is what the runner does instead of
+    sharding when both flags are on. The decoder is then unsharded and the tile a rank is given
+    is decoded whole.
     """
     vae_tiling = _vae_tiling()
     vae_tiling.require_vae_support(vae, "tiling", "--enable-tiling")
@@ -521,9 +612,10 @@ def setup_tiling(vae, window, tile_batch, world_size, say):
                 f"something fractional."
             )
         # A tile is sharded over its rows, so a tile thinner than the group leaves some rank
-        # holding nothing. The runner refuses rather than deadlocking inside the decoder.
+        # holding nothing. The runner refuses rather than deadlocking inside the decoder. Dealing
+        # whole tiles out divides nothing inside a tile, so the width of one stops mattering.
         rows = vae_tiling.latent_rows(vae, plan)
-        if world_size > 1 and rows is not None and rows < world_size:
+        if group is None and world_size > 1 and rows is not None and rows < world_size:
             raise SystemExit(
                 f"a {pixels}px tile holds {rows} latent rows, fewer than the {world_size} ranks "
                 f"sharding it. Ask for a wider window."
@@ -536,25 +628,50 @@ def setup_tiling(vae, window, tile_batch, world_size, say):
     tile_area = vae_tiling.tile_latent_area(vae)
     facts["tile_latent_area"] = tile_area
     facts["batched"] = False
+    facts["tile_parallel"] = group is not None
 
-    if tile_batch == "upstream":
-        facts["budget_elems"] = None
-        return facts
+    dealing = group is not None
+    dispatch = None
+    if dealing:
+        from xfuser.core.utils import vae_tile_parallel
+
+        dispatch = vae_tile_parallel.dispatch_over(group)
+    elif phase_timing and vae_tiling.tiles_by_overlap_factor(vae):
+        # With no group there is nothing to deal to, so the timing dispatcher makes every call
+        # itself in order, which is what this arm's decode did anyway. That keeps a rows arm the
+        # same arm it was and lets the two splits be read against one another phase by phase.
+        # Only the overlap-fraction family can be timed this way: handing the stride-walked family
+        # a dispatcher swaps diffusers' loop for xDiT's, which is a different arm.
+        dispatch = lambda calls: [call() for call in calls]  # noqa: E731
+    if phase_timing and dispatch is not None:
+        dispatch = timing_dispatch(dispatch, vae.device)
+    elif phase_timing:
+        say(f"--phase-timing has no loop to time on this {type(vae).__name__} without a group")
 
     budget = vae_tiling.tile_batch_budget(default_area, tile_area)
-    facts["budget_elems"] = budget
-    if budget is None:
-        return facts
-    batched = vae_tiling.batched_tiled_decode(vae, budget)
+    # Upstream's one tile per call is what isolates the dealing from the batching: the two are
+    # independent ways to spend the same independence between tiles. Without a group to deal to
+    # there is nothing left to install, and the arm measures diffusers' own loop.
+    if tile_batch == "upstream" or budget is None:
+        if not dealing and dispatch is None:
+            facts["budget_elems"] = None
+            return facts
+        budget = 0
+    facts["budget_elems"] = budget or None
+
+    if dealing:
+        batched = vae_tiling.tiled_decode_for(vae, budget, dispatch)
+    else:
+        batched = vae_tiling.batched_tiled_decode(vae, budget, dispatch)
     if batched is None:
-        # The stride-tiling families keep their own loop, so there is nothing to install and the
-        # arm still measures upstream tiling rather than silently measuring nothing.
-        say(f"no batched tiled_decode for {type(vae).__name__}: it tiles by a stride it stores "
-            f"outright, not by an overlap fraction. Measuring upstream tiling.")
+        # A family whose loop xDiT does not reimplement keeps its own, so there is nothing to
+        # install and the arm still measures upstream tiling rather than silently measuring
+        # nothing.
+        say(f"no reimplemented tiled_decode for {type(vae).__name__}. Measuring upstream tiling.")
         return facts
-    vae.tiled_decode = batched
-    facts["batched"] = True
-    facts["tiles_per_call"] = budget // tile_area if tile_area else None
+    vae.tiled_decode = timing_decode(batched, vae.device) if phase_timing else batched
+    facts["batched"] = budget > 0
+    facts["tiles_per_call"] = max(1, budget // tile_area) if tile_area else None
     return facts
 
 
@@ -614,6 +731,16 @@ def main():
     parser.add_argument("--tile-batch", choices=["batched", "upstream"], default="batched",
                         help="batched installs xDiT's batched tiled_decode under the budget rule; "
                              "upstream leaves diffusers decoding one tile per call")
+    parser.add_argument("--tile-split", choices=["tiles", "rows"], default="tiles",
+                        help="what the group divides when both tiling and parallel VAE are on: "
+                             "whole tiles, a rank to each, or the rows inside every tile. Rows is "
+                             "what composing the two flags did before whole tiles were an option, "
+                             "and is kept so that the two can be measured against each other")
+    parser.add_argument("--phase-timing", action="store_true",
+                        help="split a tiled decode into the decoder calls and everything else, "
+                             "which is where the blending lives. Diagnostic only: it synchronises "
+                             "the device around every tile, so the latency it reports is not the "
+                             "latency the arm has without it")
     parser.add_argument("--frames", type=int, default=17,
                         help="frames, for the VAEs that have a frame axis; ignored by the rest")
     parser.add_argument("--max-rel", type=float, default=None,
@@ -812,9 +939,23 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
             references[key] = run_half(vae, args.half, sample).float().cpu()
     reference = references.get(key)
 
+    # Two ways for a group to divide a tiled decode, and the runner picks the same one this does:
+    # whole tiles to a rank each, leaving the decoder unsharded, wherever the tiling loop is one
+    # xDiT owns. --tile-split rows is the other, which shards inside every tile.
+    tile_parallel = bool(
+        cell["parallel_vae"]
+        and cell["tiling"]
+        and args.half == "decoder"
+        and args.tile_split == "tiles"
+        and deals_tiles_out(vae)
+    )
+
     adapter = None
     if not cell["parallel_vae"]:
         say("parallel VAE off: every rank decodes the whole half, as an unsharded run does")
+    elif tile_parallel:
+        say("parallel VAE by whole tiles: the decoder is left unsharded and each rank decodes "
+            "the tiles it is dealt")
     else:
         adapter = parallelize(vae, group, args.half)
         say(f"adapter={adapter}")
@@ -826,7 +967,11 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
         if args.half != "decoder":
             raise SystemExit("tiling is a decode-side feature; --enable-tiling needs --half decoder")
         window = None if cell["tiling"] == "native" else cell["tiling"]
-        tiling = setup_tiling(vae, window, args.tile_batch, world_size, say)
+        tiling = setup_tiling(
+            vae, window, args.tile_batch, world_size, say,
+            group=group if tile_parallel else None,
+            phase_timing=args.phase_timing,
+        )
         say(f"tiling: {json.dumps(tiling)}")
 
     def once():
@@ -845,9 +990,13 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
     collectives = LOG.report()
     collectives.update(across_ranks(LOG.by_call, world_size))
 
+    PHASES.clear()
     torch.cuda.reset_peak_memory_stats(device)
     timing = timed(once, args.iters, device)
     peak_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+    phases = phase_report()
+    if phases:
+        say(f"phases: {json.dumps(phases)}")
 
     agreement = None
     if reference is not None:
@@ -905,6 +1054,7 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
         "latent_shape": list(sample.shape),
         "collectives": collectives,
         "timing": timing,
+        "phases": phases or None,
         "peak_vram_mb": peak_mb,
         "agreement": agreement,
         "versions": {
@@ -932,6 +1082,11 @@ def print_report(report: dict, half: str) -> None:
         print(f"  {entry['calls']:>6}  {site}", flush=True)
     print(f"\nmedian {timing['median_s'] * 1000:.1f} ms   peak {report['peak_vram_mb']:.0f} MB",
           flush=True)
+    phases = report.get("phases")
+    if phases:
+        print(f"phases: decoder {phases['decoder_ms']:.1f} ms   gather {phases['gather_ms']:.1f} ms"
+              f"   rest {phases['rest_ms']:.1f} ms   of {phases['total_ms']:.1f} ms"
+              f"   over {phases['calls_per_decode']:.0f} calls", flush=True)
     agreement = report.get("agreement")
     if agreement is not None:
         verdict = "matches" if agreement["ok"] else "DIFFERS FROM"
