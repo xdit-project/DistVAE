@@ -20,7 +20,12 @@ import torch.nn as nn
 from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from distvae.modules.patch_utils import DePatchify, Patchify
 
-from distributed_harness import assert_matches_reference, init_gloo, run_distributed
+from distributed_harness import (
+    assert_matches_reference,
+    assert_no_less_precise_than,
+    init_gloo,
+    run_distributed,
+)
 
 
 def worker(rank, world_size, shape, num_groups, patch_dim, seed, master_port):
@@ -65,6 +70,49 @@ def test_it_matches_group_norm_on_a_video_feature_map(world_size, master_port, s
 @pytest.mark.gloo
 def test_it_matches_group_norm_when_the_width_is_split(master_port, seed=42):
     run_distributed(worker, 2, ((1, 16, 16, 16), 8, -1, seed), master_port)
+
+
+def bfloat16_worker(rank, world_size, shape, num_groups, patch_dim, seed, master_port):
+    """PatchGroupNorm's bf16 rounding against nn.GroupNorm's own, both judged by the fp32 answer"""
+    init_gloo(rank, world_size, master_port)
+    try:
+        torch.manual_seed(seed)
+        channels = shape[1]
+        norm = nn.GroupNorm(
+            num_groups=num_groups, num_channels=channels, eps=1e-6, affine=True
+        ).eval()
+        x = torch.randn(*shape) * 3.0 + 2.0
+
+        with torch.no_grad():
+            # Before the cast: nn.Module.to is in place, and this needs the float32 answer.
+            gold = norm(x).to(torch.bfloat16) if rank == 0 else None
+            norm = norm.to(torch.bfloat16)
+            x = x.to(torch.bfloat16)
+            stock = norm(x) if rank == 0 else None
+
+            patchify = Patchify(patch_dim=patch_dim)
+            depatchify = DePatchify(patch_dim=patch_dim)
+            actual = depatchify(GroupNormAdapter(norm)(patchify(x)))
+
+        assert_no_less_precise_than(rank, actual, stock, gold, "PatchGroupNorm in bfloat16")
+    finally:
+        dist.destroy_process_group()
+
+
+# One rank is the interesting case rather than the lenient one: nothing is sharded, so any loss
+# here is the substitution of PatchGroupNorm for nn.GroupNorm and nothing else. It is also the
+# case the benchmark harness cannot excuse - it allows bf16 sharding a few percent on the grounds
+# that splitting reorders the arithmetic, which at one rank has not happened.
+@pytest.mark.gloo
+@pytest.mark.parametrize("world_size", [1, 2, 4])
+def test_it_rounds_no_worse_than_group_norm_in_bfloat16(world_size, master_port, seed=42):
+    run_distributed(bfloat16_worker, world_size, ((1, 32, 64, 64), 32, -2, seed), master_port)
+
+
+@pytest.mark.gloo
+@pytest.mark.parametrize("world_size", [1, 2])
+def test_it_rounds_no_worse_than_group_norm_in_bfloat16_on_video(world_size, master_port, seed=42):
+    run_distributed(bfloat16_worker, world_size, ((1, 16, 3, 8, 8), 4, -2, seed), master_port)
 
 
 if __name__ == "__main__":
