@@ -41,7 +41,7 @@ from distvae.modules.adapters.resnet_adapters import (
     WanResidualBlockAdapter,
 )
 from distvae.modules.adapters.unets.unet_2d_blocks_adapters import DownEncoderBlock2DAdapter
-from distvae.modules.patch_utils import Patchify, DePatchify, narrowing, widest_halo
+from distvae.modules.patch_utils import Patchify, DePatchify, widest_halo
 from distvae.utils import DistributedEnv, cache_cursor
 
 from diffusers.models.autoencoders.vae import Encoder
@@ -202,18 +202,16 @@ class _CausalEncoderAdapter(nn.Module):
             self.encoder.conv_norm_out = GroupNormAdapter(
                 encoder.conv_norm_out, patch_dim=patch_dim
             )
-        # Checked against the adapted stack rather than taken on trust, as the 2D adapter has
-        # always done by counting its down blocks. A caller reading a ratio off a config can be
-        # told a number the convolutions disagree with - a VAE stating its ratio under a name the
-        # caller does not know falls back to a default of 8 for an encoder that narrows by 16 -
-        # and the bands are then cut in eights for a stack that halves four times. That does not
-        # fail here; it fails several stages down as an odd band, on whichever ranks drew one.
-        counted = narrowing(self.encoder, patch_dim)
-        if counted != vae_scale_factor:
-            raise ValueError(
-                f"{adapter} was told this encoder narrows by {vae_scale_factor}, but its "
-                f"convolutions narrow the split axis by {counted}."
-            )
+        # The 2D adapter checks vae_scale_factor against its own blocks rather than taking it on
+        # trust, and there is no equivalent here. Counting what the convolutions stride by does
+        # not answer it: HunyuanVideo 1.5 and LTX-2 narrow by folding space into channels inside
+        # a downsampler's forward, so a walk over strides reports 1 for a stack that halves four
+        # or five times, and mistakes a correct caller for a wrong one. Counting downsampler
+        # stages instead assumes every stage halves this axis, which the temporal stages of these
+        # families do not. So the factor is checked where it is derived, in xFuser, which reads
+        # it from the VAE and refuses to guess - and a wrong one still fails here, several stages
+        # down, as an odd band on whichever ranks drew one.
+        #
         # Each band is a whole multiple of what the encoder narrows by, so it starts on the grid
         # the strided convolutions step along and the latent rows it produces are its own. Read
         # the halo after the whole stack is adapted, so it sees every convolution that exchanges.

@@ -17,25 +17,6 @@ def _patch_axis(conv) -> int:
     return patch_dim - 2
 
 
-def narrowing(module: nn.Module, patch_dim: int) -> int:
-    """How far the convolutions in here narrow the split axis between them
-
-    Every stage that halves does it with a strided convolution, so the product of the strides
-    along the axis being split is what a band has to be a whole multiple of. Counted off the
-    weights rather than taken from a config, because a config states the ratio for the whole VAE
-    and an encoder that patches, or that compresses time differently from space, does not narrow
-    its rows by that number - and a band cut to the wrong multiple is halved into a row its rank
-    does not own, which surfaces as one rank asserting alone inside a collective.
-    """
-    total = 1
-    for conv in module.modules():
-        if not isinstance(conv, PatchConvMixin) or conv.patch_dim != patch_dim:
-            continue
-        stride = conv.stride
-        total *= stride[_patch_axis(conv)] if isinstance(stride, tuple) else stride
-    return total
-
-
 def widest_halo(module: nn.Module) -> int:
     """The most rows any convolution in here will ask a neighbour for
 
