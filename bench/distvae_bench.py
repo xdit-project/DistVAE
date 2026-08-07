@@ -1170,7 +1170,12 @@ def tile_shape_costs(args, spec, device, dtype, say):
     return {"family": args.family, "latent_window": side, "frames": args.frames, "shapes": measured}
 
 
-def main():
+def build_parser():
+    """Every flag this bench takes
+
+    Apart from main so that what main does reads as the run it performs, rather than as ninety
+    lines of help text with a run at the bottom.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--family", default="flux2", choices=sorted(FAMILIES))
     parser.add_argument("--half", default="decoder", choices=["decoder", "encoder"])
@@ -1256,7 +1261,35 @@ def main():
     parser.add_argument("--timeout-min", type=int, default=30,
                         help="process group timeout; the first decode on a new shape pays MIOpen autotune")
     parser.add_argument("--out", default=None, help="write the report here as JSON")
-    args = parser.parse_args()
+    return parser
+
+
+def exit_code(reports: list) -> int:
+    """What the process leaves behind: 0 only where every cell produced a number it stands by
+
+    A cell that did not run is a failure however many cells were asked for. A grid is allowed to
+    contain arms that disagree with the reference - that is the measurement - but not arms that
+    never produced a number, and the two used to be answered the same way: the failure branch
+    appends a dict carrying an error rather than None, so a single run whose only cell failed
+    satisfied `reports[0] is None` being false and exited 0. A bench that measured nothing then
+    read, all the way out to the pod's phase, as a pass.
+    """
+    if any("error" in (report or {}) for report in reports):
+        return 1
+    # Beyond that a grid is a measurement, not a gate, so only a single run answers for whether
+    # its output matched the reference.
+    if len(reports) != 1:
+        return 0
+    if reports[0] is None:
+        return 1
+    agreement = reports[0].get("agreement")
+    # Only where the comparison is a gate. A tiled arm's disagreement is the measurement.
+    gated = agreement is not None and agreement.get("enforced", True)
+    return 1 if gated and not agreement["ok"] else 0
+
+
+def main():
+    args = build_parser().parse_args()
     if args.grid_arms and not args.grid_shapes:
         args.grid_shapes = f"{args.height}x{args.width}x{args.frames}"
 
@@ -1367,22 +1400,8 @@ def main():
 
     dist.barrier()
     dist.destroy_process_group()
-    # A cell that did not run is a failure however many cells were asked for. A grid is allowed to
-    # contain arms that disagree with the reference - that is the measurement - but it is not
-    # allowed to contain arms that never produced a number, and the two used to be answered the
-    # same way: the failure branch above appends a dict carrying an error rather than None, so a
-    # single run whose only cell failed satisfied `reports[0] is None` being false and exited 0.
-    # A bench that measured nothing then read, all the way out to the pod's phase, as a pass.
-    if any("error" in (report or {}) for report in reports):
+    if exit_code(reports):
         raise SystemExit(1)
-    # Beyond that a grid is a measurement, not a gate, so only a single run answers for whether
-    # its output matched the reference.
-    if len(reports) == 1:
-        agreement = (reports[0] or {}).get("agreement")
-        # Only where the comparison is a gate. A tiled arm's disagreement is the measurement.
-        gated = agreement is not None and agreement.get("enforced", True)
-        if reports[0] is None or (gated and not agreement["ok"]):
-            raise SystemExit(1)
 
 
 def grid_cells(args) -> list:
@@ -1629,9 +1648,6 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
                     "tiling changes the arithmetic; this is the size of that change, not a gate"
                 )
 
-    import diffusers
-    import distvae
-
     return {
         "arm": cell["name"],
         "family": args.family,
@@ -1653,11 +1669,10 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
         # it; the spread and its maximum alongside, which is what a capacity claim needs.
         **spread,
         "agreement": agreement,
-        "versions": {
-            "torch": torch.__version__,
-            "diffusers": diffusers.__version__,
-            "distvae": getattr(distvae, "__version__", "unknown"),
-        },
+        # No versions here. Every cell of a grid carried the same three, and the report they sit
+        # in already answers the question better: `ran.installed` names the branch and commit each
+        # package was installed from, which is what tells two machines holding the same version
+        # string apart, and it is what the collector reads.
     }
 
 
