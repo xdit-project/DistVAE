@@ -319,6 +319,26 @@ def across_ranks(by_call, world_size):
         "total_calls_by_rank": [total(counts) for counts in gathered],
     }
 
+
+def worst_rank(peak_mb: float, median_s: float, world_size: int) -> dict:
+    """Peak memory and latency as the worst-off rank saw them, alongside rank 0's own
+
+    The same argument the collective counts are already gathered under. Rank 0 borders one
+    neighbour and holds one halo where an interior rank holds two, and an uneven tile grid need
+    not deal it as many tiles as the last rank - so its peak is the low end of the spread, not
+    the cell's. What answers "does this configuration fit on the card" is the rank that needed
+    the most. Latency is the same question one step removed: the arms with no collective in
+    their decode never make rank 0 wait for anyone, so its clock is its own.
+    """
+    gathered = [None] * world_size
+    dist.all_gather_object(gathered, {"peak_vram_mb": peak_mb, "median_s": median_s})
+    return {
+        "peak_vram_mb_max": max(entry["peak_vram_mb"] for entry in gathered),
+        "peak_vram_mb_by_rank": [entry["peak_vram_mb"] for entry in gathered],
+        "median_s_max": max(entry["median_s"] for entry in gathered),
+        "median_s_by_rank": [entry["median_s"] for entry in gathered],
+    }
+
 # What sharding is allowed to move the output by, as a fraction of its largest value. Sharding
 # changes the order operations happen in, and in bf16 that alone is worth a few percent: the
 # measured 0.037 here is the same number whether or not the collectives have been optimised, so
@@ -1136,11 +1156,17 @@ def tile_shape_costs(args, spec, device, dtype, say):
         say(f"\nstacking tiles into one call is worst at {worst['rows']}x{worst['columns']} "
             f"{worst['tiles_in_the_call']} to a call, where each tile costs "
             f"{worst['against_the_same_tile_alone']:.2f}x what it costs decoded alone")
-    dearest = max(fitted, key=lambda r: r["against_what_area_predicts"])
-    say(f"\nthe dearest tile against its area is {dearest['rows']}x{dearest['columns']} "
-        f"{dearest['tiles_in_the_call']} to a call, at "
-        f"{dearest['against_what_area_predicts']:.2f}x, so a split that weighs by area alone "
-        f"under-charges it by {(dearest['against_what_area_predicts'] - 1) * 100:.0f}%")
+    # A sweep where nothing fitted is a finding about the card, not a reason to lose the rows
+    # already measured: max() over an empty list raises, and it used to raise here, past the
+    # try that keeps a grid going and before the report was written.
+    if fitted:
+        dearest = max(fitted, key=lambda r: r["against_what_area_predicts"])
+        say(f"\nthe dearest tile against its area is {dearest['rows']}x{dearest['columns']} "
+            f"{dearest['tiles_in_the_call']} to a call, at "
+            f"{dearest['against_what_area_predicts']:.2f}x, so a split that weighs by area alone "
+            f"under-charges it by {(dearest['against_what_area_predicts'] - 1) * 100:.0f}%")
+    else:
+        say("\nno tile shape fitted on this card, so there is no cost curve to read")
     return {"family": args.family, "latent_window": side, "frames": args.frames, "shapes": measured}
 
 
@@ -1331,7 +1357,7 @@ def main():
             reports.append({**cell, "error": failed or "another rank failed this cell"})
             continue
         reports.append(report)
-        if rank == 0:
+        if rank == 0 and report is not None:
             print_report(report, args.half)
 
     if rank == 0:
@@ -1341,11 +1367,21 @@ def main():
 
     dist.barrier()
     dist.destroy_process_group()
-    # A grid is a measurement, not a gate: it is expected to contain arms that disagree with the
-    # reference, so only a single run answers with its exit code.
+    # A cell that did not run is a failure however many cells were asked for. A grid is allowed to
+    # contain arms that disagree with the reference - that is the measurement - but it is not
+    # allowed to contain arms that never produced a number, and the two used to be answered the
+    # same way: the failure branch above appends a dict carrying an error rather than None, so a
+    # single run whose only cell failed satisfied `reports[0] is None` being false and exited 0.
+    # A bench that measured nothing then read, all the way out to the pod's phase, as a pass.
+    if any("error" in (report or {}) for report in reports):
+        raise SystemExit(1)
+    # Beyond that a grid is a measurement, not a gate, so only a single run answers for whether
+    # its output matched the reference.
     if len(reports) == 1:
         agreement = (reports[0] or {}).get("agreement")
-        if reports[0] is None or (agreement is not None and not agreement["ok"]):
+        # Only where the comparison is a gate. A tiled arm's disagreement is the measurement.
+        gated = agreement is not None and agreement.get("enforced", True)
+        if reports[0] is None or (gated and not agreement["ok"]):
             raise SystemExit(1)
 
 
@@ -1450,7 +1486,11 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
             f"{type(vae).__name__} {args.half}. Nothing to measure."
         )
     if args.describe_only:
-        return None
+        # The description is the whole answer this flag asks for, so it is what comes back.
+        # Returning None handed print_report a None to subscript, which killed rank 0 while every
+        # other rank sat in the barrier below until the process group timed out - half an hour,
+        # by default, to not answer a question that costs a second.
+        return {**cell, "describes": built, "half": args.half}
 
     # The reference has to be taken before sharding, which replaces the half in place. Every rank
     # computes it rather than rank 0 alone: the seeds match, so the weights match, and leaving it
@@ -1533,17 +1573,24 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
     collectives = LOG.report()
     collectives.update(across_ranks(LOG.by_call, world_size))
 
+    # Copied down and released before the peak is measured. Held on the device it would sit
+    # alongside the one each timed iteration makes, and the peak would come back a whole decoded
+    # output too high - which is a fixed number of megabytes added to every arm, and so a larger
+    # share of the arms with the smallest peaks. Those are the tiled ones, the arms this exists
+    # to weigh, and the effect is to understate exactly the saving being measured.
+    actual = output.float().cpu() if reference is not None else None
+    del output
     PHASES.clear()
     torch.cuda.reset_peak_memory_stats(device)
     timing = timed(once, args.iters, device)
     peak_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+    spread = worst_rank(peak_mb, timing["median_s"], world_size)
     phases = phase_report(group, world_size)
     if phases:
         say(f"phases: {json.dumps(phases)}")
 
     agreement = None
     if reference is not None:
-        actual = output.float().cpu()
         if actual.shape != reference.shape:
             agreement = {"ok": False, "why": f"shape {tuple(actual.shape)} != {tuple(reference.shape)}"}
         else:
@@ -1573,8 +1620,11 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
             # that. Tiling does not: it is a different computation, normalising each tile over
             # less context, and the whole reason to measure it here is to put a number on how
             # different. Failing the run for that would be failing it for working as designed.
+            # Recorded as not enforced rather than as passing. Overwriting the verdict made the
+            # log say the output matched the reference and then print how far it did not, and
+            # left anything filtering on `ok` unable to see a tiled arm that had genuinely broken.
             if tiling.get("enabled"):
-                agreement["ok"] = True
+                agreement["enforced"] = False
                 agreement["measured_not_enforced"] = (
                     "tiling changes the arithmetic; this is the size of that change, not a gate"
                 )
@@ -1599,6 +1649,9 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
         "timing": timing,
         "phases": phases or None,
         "peak_vram_mb": peak_mb,
+        # Rank 0's peak above, kept under the name it has always had so older readers still find
+        # it; the spread and its maximum alongside, which is what a capacity claim needs.
+        **spread,
         "agreement": agreement,
         "versions": {
             "torch": torch.__version__,
@@ -1610,6 +1663,10 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
 
 def print_report(report: dict, half: str) -> None:
     """One cell's numbers, in the shape the collector reads them back out of"""
+    if "collectives" not in report:
+        # --describe-only, which stops before there is anything to time. The description was
+        # already said as it was read; there are no numbers to lay out under it.
+        return
     collectives, timing = report["collectives"], report["timing"]
     print(f"\n--- collectives per {half} call (rank 0, and the most any rank made) ---", flush=True)
     for name, entry in collectives["by_call"].items():
@@ -1637,6 +1694,8 @@ def print_report(report: dict, half: str) -> None:
     agreement = report.get("agreement")
     if agreement is not None:
         verdict = "matches" if agreement["ok"] else "DIFFERS FROM"
+        if not agreement.get("enforced", True):
+            verdict += " (not enforced: tiling changes the arithmetic)"
         print(f"output {verdict} the single-rank reference: {agreement}", flush=True)
         print(f"error vs untiled unsharded: "
               f"max {agreement.get('max_rel_to_scale', 0) * 100:.2f}%  "

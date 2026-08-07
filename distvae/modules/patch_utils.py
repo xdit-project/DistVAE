@@ -5,9 +5,35 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from distvae.models.layers.conv2d import PatchConv2d
-from distvae.models.layers.conv3d import PatchConv3d
+from distvae.models.layers.conv_mixin import PatchConvMixin
 from distvae.utils import DistributedEnv
+
+
+def _patch_axis(conv) -> int:
+    """Which entry of a convolution's per-axis tuples describes the axis being split"""
+    patch_dim = conv.patch_dim
+    if patch_dim < 0:
+        patch_dim += conv._patch_ndim()
+    return patch_dim - 2
+
+
+def narrowing(module: nn.Module, patch_dim: int) -> int:
+    """How far the convolutions in here narrow the split axis between them
+
+    Every stage that halves does it with a strided convolution, so the product of the strides
+    along the axis being split is what a band has to be a whole multiple of. Counted off the
+    weights rather than taken from a config, because a config states the ratio for the whole VAE
+    and an encoder that patches, or that compresses time differently from space, does not narrow
+    its rows by that number - and a band cut to the wrong multiple is halved into a row its rank
+    does not own, which surfaces as one rank asserting alone inside a collective.
+    """
+    total = 1
+    for conv in module.modules():
+        if not isinstance(conv, PatchConvMixin) or conv.patch_dim != patch_dim:
+            continue
+        stride = conv.stride
+        total *= stride[_patch_axis(conv)] if isinstance(stride, tuple) else stride
+    return total
 
 
 def widest_halo(module: nn.Module) -> int:
@@ -21,15 +47,15 @@ def widest_halo(module: nn.Module) -> int:
     and reread never.
     """
     widest = 0
+    # Every patched convolution, by the mixin that gives them their halo rather than by the two
+    # plain subclasses: WanZeroPadConv2d exchanges a halo like the others and is neither of them,
+    # so naming the subclasses left its kernel out of the bound this guard is built from.
     for conv in module.modules():
-        if not isinstance(conv, (PatchConv2d, PatchConv3d)):
+        if not isinstance(conv, PatchConvMixin):
             continue
-        patch_dim = conv.patch_dim
-        if patch_dim < 0:
-            patch_dim += conv._patch_ndim()
         kernel = conv.kernel_size
         if isinstance(kernel, tuple):
-            kernel = kernel[patch_dim - 2]
+            kernel = kernel[_patch_axis(conv)]
         widest = max(widest, kernel // 2)
     return widest
 

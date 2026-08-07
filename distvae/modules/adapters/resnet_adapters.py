@@ -60,10 +60,13 @@ class ResnetBlock2DAdapter(nn.Module):
             down=resnet.down,
         )
         self.resnet.use_in_shortcut = resnet.use_in_shortcut
+        # The 2D chain splits H throughout - its convolutions take PatchConv2d's own -2 default
+        # and the encoder refuses any other axis - so the norms say so outright rather than
+        # reading an environment a causal adapter elsewhere in the process may have set to W.
         self.resnet.conv1 = Conv2dAdapter(resnet.conv1, block_size=conv_block_size)
-        self.resnet.norm1 = GroupNormAdapter(resnet.norm1)
+        self.resnet.norm1 = GroupNormAdapter(resnet.norm1, patch_dim=-2)
         self.resnet.conv2 = Conv2dAdapter(resnet.conv2, block_size=conv_block_size)
-        self.resnet.norm2 = GroupNormAdapter(resnet.norm2)
+        self.resnet.norm2 = GroupNormAdapter(resnet.norm2, patch_dim=-2)
         self.resnet.dropout = resnet.dropout
         self.resnet.nonlinearity = resnet.nonlinearity
         self.resnet.conv_shortcut = Conv2dAdapter(resnet.conv_shortcut, block_size=conv_block_size) if resnet.conv_shortcut is not None else None
@@ -171,7 +174,7 @@ class _PaddedCausalResnetBlockAdapter(nn.Module):
         for name in ("norm1", "norm2"):
             norm = getattr(resnet, name)
             if isinstance(norm, nn.GroupNorm):
-                setattr(resnet, name, GroupNormAdapter(norm))
+                setattr(resnet, name, GroupNormAdapter(norm, patch_dim=patch_dim))
         # Where the shortcut is a causal convolution it needs the same treatment; where it is a
         # bare 1x1x1 it reads one position per output and is already right on a patch.
         if isinstance(resnet.conv_shortcut, self._conv_adapter._supported):

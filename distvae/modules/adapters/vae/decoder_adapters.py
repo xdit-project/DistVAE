@@ -119,7 +119,9 @@ class DecoderAdapter(nn.Module):
         self.decoder.up_blocks = nn.ModuleList([
             UpDecoderBlock2DAdapter(up_block, conv_block_size=conv_block_size) for up_block in decoder.up_blocks
         ])
-        self.decoder.conv_norm_out = GroupNormAdapter(decoder.conv_norm_out)
+        # Spelled out rather than left to the environment: this adapter splits H throughout, and
+        # the environment carries whatever the last adapter built in this process asked for.
+        self.decoder.conv_norm_out = GroupNormAdapter(decoder.conv_norm_out, patch_dim=-2)
         self.decoder.conv_act = decoder.conv_act
         self.decoder.conv_out = Conv2dAdapter(decoder.conv_out, block_size=conv_block_size)
         self.use_profiler = use_profiler
@@ -199,7 +201,9 @@ class _CausalDecoderAdapter(nn.Module):
         # HunyuanVideo ends on a GroupNorm, whose statistics span the axis being split. The RMS
         # norms the other families end on do not, and are left as they are.
         if isinstance(getattr(decoder, "conv_norm_out", None), nn.GroupNorm):
-            self.decoder.conv_norm_out = GroupNormAdapter(decoder.conv_norm_out)
+            self.decoder.conv_norm_out = GroupNormAdapter(
+                decoder.conv_norm_out, patch_dim=patch_dim
+            )
         # Read after the whole stack is adapted, so it sees every convolution that will exchange.
         self.patchify = Patchify(patch_dim=patch_dim, halo=widest_halo(self.decoder))
         self.depatchify = DePatchify(patch_dim=patch_dim)
