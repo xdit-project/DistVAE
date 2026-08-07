@@ -672,8 +672,54 @@ def _latent_area(vae):
     return size * size
 
 
+def _set_tile_overlap(vae, overlap, facts, say):
+    """Widen the stride so tiles overlap by `overlap` of a tile rather than the VAE's own share
+
+    A window is one lever on a tile grid and the overlap is the other, and only the first is
+    exposed anywhere. They do different things: the window sets how big a tile is, which is what
+    peak memory follows, while the overlap sets how much of the image is decoded twice, which is
+    what the total work follows and what no window can change - scaling a window scales the stride
+    with it and leaves the ratio where it was.
+
+    Left in the harness rather than pushed into xDiT, because what it costs is seam fidelity and
+    that is measured here, against the untiled reference, before anything is recommended.
+    """
+    facts["requested_overlap"] = overlap
+
+    # The overlap-factor family states it as a fraction already and there is nothing to round.
+    if hasattr(vae, "tile_overlap_factor"):
+        vae.tile_overlap_factor = overlap
+        facts["overlap"] = overlap
+        say(f"tile overlap factor set to {overlap:.1%}")
+        return
+
+    ratio = _vae_tiling().spatial_ratio(vae)
+    if ratio is None or not hasattr(vae, "tile_sample_stride_height"):
+        raise SystemExit(
+            f"--tile-overlap has nothing to set on this {type(vae).__name__}: it reports neither "
+            f"a tile_overlap_factor nor a pixel stride over a known compression ratio."
+        )
+
+    edges, strides = [], []
+    for edge_attr, stride_attr in (
+        ("tile_sample_min_height", "tile_sample_stride_height"),
+        ("tile_sample_min_width", "tile_sample_stride_width"),
+    ):
+        edge = getattr(vae, edge_attr)
+        # A stride walks the latent, so it has to land on a whole latent pixel; asking for one
+        # that does not is rounded to the nearest that does and reported back as what it became.
+        latent = min(edge // ratio, max(1, round(edge * (1.0 - overlap) / ratio)))
+        setattr(vae, stride_attr, latent * ratio)
+        edges.append(edge)
+        strides.append(latent * ratio)
+
+    facts.update(overlap=1.0 - strides[0] / edges[0], stride_px=strides[0])
+    say(f"tile overlap set to {facts['overlap']:.1%}: a {edges[0]}px tile every {strides[0]}px")
+
+
 def setup_tiling(
     vae, window, world_size, say, group=None, phase_timing=False, tile_split="tiles",
+    overlap=None,
 ):
     """Turn tiling on the way the runner does, returning what it settled on
 
@@ -731,6 +777,9 @@ def setup_tiling(
         facts.update(snapped_window_px=pixels, tile_latent_rows=rows)
         if pixels != window:
             say(f"tile window snapped {window} -> {pixels}px, the widest that lands whole")
+
+    if overlap is not None:
+        _set_tile_overlap(vae, overlap, facts, say)
 
     facts["tile_latent_area"] = _latent_area(vae)
     facts["tile_parallel"] = group is not None
@@ -938,6 +987,15 @@ def main():
                              "implies --enable-tiling. Also takes 'half' or 'quarter', which is what "
                              "one matrix across families needs: each VAE has its own native window, "
                              "so a fixed number is a different fraction of it for every one of them")
+    parser.add_argument("--tile-overlap", default=None,
+                        help="overlap the tiles by this fraction of a tile instead of by the "
+                             "VAE's own share, comma separated for several, e.g. '0.25,0.125,0'. "
+                             "Crossed with the tiled arms, so each one is measured at each "
+                             "overlap. This is the lever the window is not: a window sets how big "
+                             "a tile is and so what memory peaks at, while the overlap sets how "
+                             "much of the image is decoded twice and so what the work totals - "
+                             "and scaling a window scales the stride with it, leaving that ratio "
+                             "exactly where it was")
     parser.add_argument("--grid-arms", default=None,
                         help="measure several arms in ONE process, comma separated, e.g. "
                              "'none,pvae,tile,tile-half'. Most of a pod's wall clock is startup, "
@@ -1123,6 +1181,8 @@ def grid_cells(args) -> list:
         "height": args.height,
         "width": args.width,
         "frames": args.frames,
+        # A single run has one cell to put an overlap in, so it takes the first of a list.
+        "overlap": float(args.tile_overlap.split(",")[0]) if args.tile_overlap else None,
     }
     if not args.grid_arms:
         return [single]
@@ -1157,13 +1217,33 @@ def grid_cells(args) -> list:
             }
         )
 
+    # None is the VAE's own overlap, which is the arm as it was before this was a knob, so it
+    # stays first and every other overlap is read against it.
+    overlaps = [None]
+    if args.tile_overlap:
+        overlaps += [float(text) for text in args.tile_overlap.split(",")]
+
     cells = []
     for shape in shapes:
         for name in args.grid_arms.split(","):
             name = name.strip()
             if name not in arms:
                 raise SystemExit(f"unknown arm {name!r}; pick from {sorted(arms)}")
-            cells.append({"name": name, **arms[name], **shape})
+            for overlap in overlaps:
+                # Only a tiled arm has tiles to overlap, and main's arms are what main does with
+                # no window and no overlap to choose, so both are measured once and left alone.
+                if overlap is not None and (
+                    not arms[name].get("tiling") or arms[name].get("as_main_does")
+                ):
+                    continue
+                cells.append(
+                    {
+                        "name": name if overlap is None else f"{name}-ov{overlap:g}",
+                        **arms[name],
+                        **shape,
+                        "overlap": overlap,
+                    }
+                )
     return cells
 
 
@@ -1253,6 +1333,7 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
             group=group if tile_parallel else None,
             phase_timing=args.phase_timing,
             tile_split=args.tile_split,
+            overlap=cell.get("overlap"),
         )
         say(f"tiling: {json.dumps(tiling)}")
 
