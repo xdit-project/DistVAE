@@ -2,7 +2,7 @@
 
 GroupNorm is the one normalisation in a VAE decoder whose statistics span the axis being split,
 so it is the one that has to be summed across ranks. The equivalent check exists in
-test_groupnorm.py, but only as a torchrun script needing NCCL and a GPU.
+manual_groupnorm.py, but only as a torchrun script needing NCCL and a GPU.
 
 Run from repo root:
   pytest test/test_patchgroupnorm.py -v

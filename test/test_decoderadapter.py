@@ -1,6 +1,6 @@
 """DecoderAdapter against the decoder it shards, over gloo on CPU.
 
-The equivalent check exists in test_vae_decoder.py, but only as a torchrun script needing NCCL
+The equivalent check exists in manual_vae_decoder.py, but only as a torchrun script needing NCCL
 and a GPU, so nothing exercised this adapter in a plain test run. It is the adapter every
 AutoencoderKL model decodes through, xDiT's SD3 and Z-Image included.
 

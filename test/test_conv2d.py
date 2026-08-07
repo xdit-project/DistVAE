@@ -1,144 +1,104 @@
-from distvae.models.layers.conv2d import PatchConv2d
-from distvae.modules.patch_utils import Patchify, DePatchify
-from distvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
-from distvae.utils import DistributedEnv
+"""PatchConv2d against nn.Conv2d, over gloo on CPU, at sizes that do not divide evenly.
 
-import torch
-import random
+This was a torchrun script whose only verdict was a print: it computed the difference, printed
+"FAILED" when it was too large, and exited 0 either way, with the one real assertion commented
+out at the bottom. Nothing ran it and nothing could have failed it, which is a shame, because
+the sizes it swept are the interesting ones - odd extents, and extents that do not divide by the
+rank count, at stride 1 and stride 2. Those are what exercise the halo widths and the
+global-position cropping, and they are what is kept here.
+
+Sizes are smaller than the original 1024x1024 at 64 channels, which was sized for a GPU. What
+makes a size interesting here is its remainder against the rank count and its parity, not its
+magnitude.
+
+Run from repo root:
+  pytest test/test_conv2d.py -v
+"""
+
 import argparse
+import os
+import sys
+
+import pytest
+import torch
 import torch.distributed as dist
-from torch import nn
-from torch.cuda import set_device, device_count
-from torch.cuda import manual_seed as device_manual_seed
-try:
-    import torch_musa
-    from torch_musa.core.device import set_device, device_count
-    from torch_musa.core.random import manual_seed as device_manual_seed
-except ModuleNotFoundError:
-    pass
+import torch.nn as nn
 
-class Conv2dModules(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
-        super().__init__()
-        self.convs = nn.ModuleList([
-            # nn.Conv2d(512, 256, kernel_size, stride, padding),
-            # nn.Conv2d(256, 128, kernel_size, stride, padding),
-            # nn.Conv2d(128, 64, kernel_size, stride, padding),
-            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
-        ])
+from distvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
+from distvae.modules.patch_utils import DePatchify, Patchify
 
-    def forward(self, x):
-        for conv in self.convs:
-            x = conv(x)
-        return x
+from distributed_harness import assert_matches_reference, init_gloo, run_distributed
 
 
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    torch.manual_seed(seed)
-    device_manual_seed(seed)
+def worker(rank, world_size, size, kernel, stride, padding, patch_dim, seed, master_port):
+    init_gloo(rank, world_size, master_port)
+    try:
+        torch.manual_seed(seed)
+        height, width = size
+        conv = nn.Conv2d(4, 3, kernel, stride=stride, padding=padding).eval()
+        x = torch.randn(1, 4, height, width)
 
-def main():
-    set_seed()
-    torch.backends.cudnn.deterministic = True
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--height",
-        type=int,
-        default=1024,
-        help="The height of image",
-    )
-    parser.add_argument(
-        "--width",
-        type=int,
-        default=1024,
-        help="The width of image",
-    )
-    args = parser.parse_args()
-    backend = DistributedEnv.get_torch_distributed_backend()
-    dist.init_process_group(backend=backend)
-    device = torch.distributed.get_rank() % device_count()
-    set_device(device)
-    DistributedEnv.initialize(None)
-    in_channels = 64
-    out_channels = 3
+        with torch.no_grad():
+            expected = conv(x) if rank == 0 else None
+            sharded = Conv2dAdapter(conv, patch_dim=patch_dim)
+            actual = DePatchify(patch_dim=patch_dim)(
+                sharded(Patchify(patch_dim=patch_dim)(x))
+            )
 
-    # Test both stride=1 and stride=2 cases
-    # stride=2 exercises the stride alignment and global-position cropping logic
-    test_configs = [
-        (3, 1, 1),  # kernel=3, stride=1, padding=1 (original test)
-        (3, 2, 1),  # kernel=3, stride=2, padding=1 (downsampling with stride alignment)
-    ]
-    if args.height != 1024 or args.width != 1024:
-        test_sizes = [
-            (args.height, args.width),
-        ]
-    else:
-        test_sizes = [
-            # 1k
-            (1024, 1024),
-            (1023, 1025),
-            (1025, 1023),
-            # 720p
-            (720, 1280),
-            (721, 1281), 
-            (719, 1279),
-            (1280, 720),
-            (1281, 721),
-            (1279, 719),
-        ]
-
-    for kernel_size, stride, padding in test_configs:
-        for height, width in test_sizes:
-            if dist.get_rank() == 0:
-                print(f"\nTesting kernel={kernel_size}, stride={stride}, padding={padding}, size={height}x{width}", flush=True)
-
-            convs = Conv2dModules(in_channels, out_channels, kernel_size, stride, padding).to(device)
-            patch_convs = nn.ModuleList()
-            for conv in convs.convs:
-                patch_convs.append(Conv2dAdapter(conv))
-            patch_convs = patch_convs.to(device)
-
-            hidden_state = torch.randn(1, 64, height, width, device=device)
-            result = convs(hidden_state)
-
-            
-            if dist.get_rank() == 0: 
-                print(kernel_size, stride, padding, "start", flush=True)
-            patch = Patchify()
-            depatch = DePatchify()
-
-            patch_hidden_state = patch(hidden_state)
-            for conv in patch_convs:
-                patch_hidden_state = conv(patch_hidden_state)
-            ppresult = depatch(patch_hidden_state)
+        assert_matches_reference(rank, actual, expected, "PatchConv2d", atol=1e-5)
+    finally:
+        dist.destroy_process_group()
 
 
+# Odd against even, and extents whose remainder against the rank count differs between the two
+# axes, so a run cannot pass by having every band the same size.
+SIZES = [(32, 32), (33, 31), (31, 33), (45, 28)]
 
-            if dist.get_rank() == 0:
-                print(f"result.shape={result.shape}, ppresult.shape={ppresult.shape}", flush=True)
-                diff = torch.abs(result - ppresult)
-                max_diff = diff.max().item()
-                mean_diff = diff.mean().item()
-                print(f"Max diff: {max_diff:.2e}, Mean diff: {mean_diff:.2e}", flush=True)
 
-                # Use slightly relaxed tolerance for stride>1 to account for numerical precision
-                # differences from distributed computation order
-                tolerance = 1e-5 if stride > 1 else 1e-6
-                if not torch.allclose(result, ppresult, atol=tolerance):
-                    print("in kernel size: ", kernel_size, "stride: ", stride, "padding: ", padding, flush=True)
-                    print(f"FAILED with tolerance {tolerance}\n", flush=True)
-                    # Find where the largest differences are
-                    max_diff_idx = torch.argmax(diff)
-                    max_diff_idx = torch.unravel_index(max_diff_idx, diff.shape)
-                    print(f"Largest diff at index {max_diff_idx}: ref={result[max_diff_idx].item():.6f}, patched={ppresult[max_diff_idx].item():.6f}", flush=True)
-                else:
-                    print(f"{kernel_size} {stride} {padding} end (max_diff={max_diff:.2e}, tol={tolerance:.0e})", flush=True)
+@pytest.mark.gloo
+@pytest.mark.parametrize("world_size", [1, 2, 4])
+@pytest.mark.parametrize("size", SIZES)
+def test_it_matches_conv2d_at_unit_stride(world_size, size, master_port, seed=42):
+    run_distributed(worker, world_size, (size, 3, 1, 1, -2, seed), master_port)
 
-    # assert torch.equal(result, ppresult), "two hidden states are not equal"
 
-    dist.barrier()
-    dist.destroy_process_group()
+@pytest.mark.gloo
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("size", SIZES)
+def test_it_matches_conv2d_when_it_halves(world_size, size, master_port, seed=42):
+    """Stride 2, which is where the crop has to know where its band starts
+
+    At unit stride every output row is an input row and the halo alone lines the bands up. A
+    strided convolution steps a grid the whole image shares, so a band starting at a row that is
+    not on that grid has to be cropped from where the grid next lands rather than from its own
+    first row - which is the arithmetic an even split never exercises.
+    """
+    run_distributed(worker, world_size, (size, 3, 2, 1, -2, seed), master_port)
+
+
+@pytest.mark.gloo
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("size", SIZES)
+def test_it_matches_conv2d_when_the_width_is_split(world_size, size, master_port, seed=42):
+    # The same convolution against the other axis, which the layer supports and nothing above it
+    # used to check at anything but a square.
+    run_distributed(worker, world_size, (size, 3, 1, 1, -1, seed), master_port)
+
+
+@pytest.mark.gloo
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("kernel,padding", [(1, 0), (5, 2), (7, 3)])
+def test_it_matches_conv2d_across_kernel_widths(world_size, kernel, padding, master_port, seed=42):
+    # The halo is kernel // 2 rows either side, so a wider kernel asks more of a neighbour than
+    # the thin bands an uneven split leaves have to spare.
+    run_distributed(worker, world_size, ((33, 31), kernel, 1, padding, -2, seed), master_port)
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="PatchConv2d GLOO multi-rank tests")
+    parser.add_argument("--world_size", type=int, default=None)
+    args, remainder = parser.parse_known_args()
+    pytest_args = [os.path.abspath(__file__), "-v"] + remainder
+    if args.world_size is not None:
+        pytest_args.extend(["-k", f"[{args.world_size}]"])
+    sys.exit(pytest.main(pytest_args))

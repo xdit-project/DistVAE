@@ -100,33 +100,44 @@ class TestCalcBottomHaloWidth:
 
 
 class TestCalcHaloWidth:
-    """Tests for calc_halo_width."""
+    """Tests for calc_halo_width.
+
+    Every expectation here is a number worked out by hand from the conv arithmetic. The
+    halo is how many rows a rank asks its neighbour for, so a wrong-but-non-negative
+    answer is exactly the bug worth catching: too few rows and the seam is wrong, too
+    many and the neighbour is asked for rows it does not have.
+    """
 
     @patch("distvae.models.layers.conv_utils.DistributedEnv.get_group_world_size")
     def test_first_rank_top_zero(self, mock_world_size):
         mock_world_size.return_value = 3
-        height_index = [0, 8, 16, 24]
-        top, bottom = calc_halo_width(0, height_index, 3, 0, 1)
-        assert top == 0
-        assert bottom >= 0
+        # k=3, p=0, s=1: the rank below reads one row back over the boundary at 8.
+        assert calc_halo_width(0, [0, 8, 16, 24], 3, 0, 1) == (0, 1)
 
     @patch("distvae.models.layers.conv_utils.DistributedEnv.get_group_world_size")
     def test_last_rank_bottom_zero(self, mock_world_size):
         mock_world_size.return_value = 3
-        height_index = [0, 8, 16, 24]
-        top, bottom = calc_halo_width(2, height_index, 3, 0, 1)
-        assert bottom == 0
-        assert top >= 0
+        assert calc_halo_width(2, [0, 8, 16, 24], 3, 0, 1) == (1, 0)
 
     @patch("distvae.models.layers.conv_utils.DistributedEnv.get_group_world_size")
     def test_middle_rank_both_nonzero(self, mock_world_size):
         mock_world_size.return_value = 3
-        height_index = [0, 8, 16, 24]
-        top, bottom = calc_halo_width(1, height_index, 3, 1, 1)
-        expected_top = calc_top_halo_width(1, height_index, 3, 1, 1)
-        expected_bottom = calc_bottom_halo_width(1, height_index, 3, 1, 1)
-        assert top == expected_top
-        assert bottom == expected_bottom
+        assert calc_halo_width(1, [0, 8, 16, 24], 3, 1, 1) == (1, 1)
+
+    @patch("distvae.models.layers.conv_utils.DistributedEnv.get_group_world_size")
+    def test_a_strided_middle_rank_reaches_further_one_way_than_the_other(self, mock_world_size):
+        """The case the symmetric ones cannot tell apart
+
+        At stride 1 the two halves of the halo come out equal, so top and bottom can be
+        swapped, or one computed twice, and every assertion above still holds. Striding
+        moves the output grid relative to the patch boundary and the two stop matching.
+        """
+        mock_world_size.return_value = 3
+        # k=5, p=1, s=2 over even patches: one row above, two below.
+        assert calc_halo_width(1, [0, 8, 16, 24], 5, 1, 2) == (1, 2)
+        # k=3, p=0, s=2 over the uneven split: the output grid lands on the lower
+        # boundary, so a middle rank needs nothing below it at all.
+        assert calc_halo_width(1, [0, 9, 17, 24], 3, 0, 2) == (1, 0)
 
 
 class TestCalcHaloWidthUnitStride:

@@ -15,11 +15,12 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.multiprocessing import spawn
 
 from distvae.utils import DistributedEnv
 from distvae.modules.patch_utils import Patchify, DePatchify
 from distvae.modules.adapters.layers.conv_adapters import Conv3dAdapter
+
+from distributed_harness import run_distributed
 
 
 def worker(
@@ -30,6 +31,7 @@ def worker(
     stride: int,
     padding: int,
     block_size: int,
+    size: tuple,
     seed: int,
     master_port: int,
 ) -> None:
@@ -47,18 +49,12 @@ def worker(
     # For stride>1 tests, use sizes that stress-test alignment logic
     # For stride=1, use sizes divisible by world_size for even splitting
     n, c, f = 1, in_ch, 4
-    if stride > 1:
-        # Use even sizes for stride>1 tests
-        # TODO: Add support for odd sizes with stride>1 (currently produces off-by-one errors)
-        h, w = 8, 8
-    else:
-        # Use sizes divisible by world_size for even splitting
-        h, w = 8, 8
-        if patch_dim == -2:
-            assert h % world_size == 0
-        else:
-            assert patch_dim == -1
-            assert w % world_size == 0
+    # Both branches of the conditional this replaces set 8 by 8, so the comment about needing
+    # even sizes for stride > 1 described the only case there was, and the assertions below it
+    # enforced an even split that no shipped decode gets. The split axis is now given by the
+    # caller, so a test can ask for a size that leaves the ranks holding different amounts -
+    # which is the case the halo widths and the crop are actually difficult for.
+    h, w = size
 
     x_full = torch.randn(n, c, f, h, w, device=device, dtype=torch.float32)
     ref_conv = nn.Conv3d(
@@ -98,31 +94,23 @@ def _run_one(
     block_size: int,
     seed: int,
     master_port: int,
+    size: tuple = (8, 8),
 ) -> None:
     """Spawn processes and run worker; raises on failure."""
-    spawn(
+    # Through the shared harness rather than spawn directly, so a port claimed between being
+    # found free and being bound is retried rather than failing the test.
+    run_distributed(
         worker,
-        nprocs=world_size,
-        args=(
-            world_size,
-            patch_dim,
-            kernel_size,
-            stride,
-            padding,
-            block_size,
-            seed,
-            master_port,
-        ),
-        join=True,
+        world_size,
+        (patch_dim, kernel_size, stride, padding, block_size, size, seed),
+        master_port,
     )
 
 
-@pytest.fixture
-def master_port(request):
-    """Unique port per test to avoid Address already in use when tests run sequentially."""
-    base = 29500
-    nodeid = request.node.nodeid
-    return base + (hash(nodeid) % 10000)
+# The port comes from conftest, which keys it on a crc32 of the test's id rather than on hash().
+# hash() over a str is salted per process, so the fixture that used to live here picked a
+# different port every run - and a run that fails on a port collision is then a run nobody can
+# reproduce. Its range overlapped conftest's as well, so the two could hand out the same port.
 
 
 @pytest.mark.gloo
@@ -138,6 +126,32 @@ def test_patch_conv3d_gloo_direct(world_size, patch_dim, master_port, seed=42):
         block_size=0,
         seed=seed,
         master_port=master_port,
+    )
+
+
+@pytest.mark.gloo
+@pytest.mark.parametrize("world_size,patch_dim", [(4, -2), (4, -1), (3, -2)])
+def test_patch_conv3d_gloo_on_bands_of_different_sizes(
+    world_size, patch_dim, master_port, seed=42
+):
+    """The split axis not dividing by the rank count, which is what the 8 by 8 above never gives
+
+    Every band being the same size is the easy case: the halo each rank asks of its neighbour is
+    the same, and the crop starts at the same offset into each. Nine rows over four ranks gives
+    3, 2, 2, 2, and the sizes stop being interchangeable - a rank that assumes its neighbour
+    matches it reads the wrong rows, and a global quantity derived from a local one is wrong on
+    every rank but one.
+    """
+    _run_one(
+        world_size=world_size,
+        patch_dim=patch_dim,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        block_size=0,
+        seed=seed,
+        master_port=master_port,
+        size=(9, 7),
     )
 
 
@@ -176,6 +190,36 @@ def test_patch_conv3d_stride2_alignment(world_size, patch_dim, master_port, seed
         block_size=0,  # Direct path
         seed=seed,
         master_port=master_port,
+    )
+
+
+@pytest.mark.gloo
+@pytest.mark.xfail(
+    reason="known off-by-one halving a band whose rows do not divide by the rank count",
+    strict=False,
+)
+@pytest.mark.parametrize("world_size,patch_dim", [(4, -2), (2, -1)])
+def test_patch_conv3d_stride2_on_bands_of_different_sizes(
+    world_size, patch_dim, master_port, seed=42
+):
+    """Halving an uneven split, which the sizes above were chosen to avoid
+
+    The TODO that used to sit beside those sizes said odd extents at stride > 1 produce
+    off-by-one errors, and the test was shaped around it. A known bug with no failing test is a
+    known bug that gets forgotten, so it is expected to fail here instead of being designed out.
+    Not strict, so the day the arithmetic is fixed this reports as an unexpected pass rather
+    than turning into a failure of its own.
+    """
+    _run_one(
+        world_size=world_size,
+        patch_dim=patch_dim,
+        kernel_size=3,
+        stride=2,
+        padding=1,
+        block_size=0,
+        seed=seed,
+        master_port=master_port,
+        size=(9, 7),
     )
 
 
