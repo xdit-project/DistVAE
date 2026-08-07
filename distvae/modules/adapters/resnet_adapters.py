@@ -22,6 +22,7 @@ from distvae.modules.adapters.layers.conv_adapters import (
     WanCausalConv3dAdapter,
 )
 from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
+from distvae.utils import cache_cursor
 from diffusers.models.resnet import ResnetBlock2D
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, WanResidualBlock
 
@@ -114,8 +115,10 @@ class _CausalResidualBlockAdapter(nn.Module):
                 patch_dim=patch_dim,
             )
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
-        return self.residual_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
+    def forward(self, x, feat_cache=None, feat_idx=None):
+        return self.residual_block(
+            x, feat_cache=feat_cache, feat_idx=cache_cursor(feat_idx)
+        )
 
 
 class WanResidualBlockAdapter(_CausalResidualBlockAdapter):

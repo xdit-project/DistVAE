@@ -13,6 +13,7 @@ from distvae.modules.adapters.diffusers_blocks import (
     resolved,
 )
 from distvae.modules.adapters.layers.attn_adapters import GatheredAttentionAdapter
+from distvae.utils import cache_cursor
 from distvae.modules.adapters.resnet_adapters import (
     HunyuanVideo15ResnetBlockAdapter,
     HunyuanVideoResnetBlockAdapter,
@@ -60,8 +61,8 @@ class _CausalMidBlockAdapter(nn.Module):
             for attn in mid_block.attentions
         ])
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
-        return self.mid_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
+    def forward(self, x, feat_cache=None, feat_idx=None):
+        return self.mid_block(x, feat_cache=feat_cache, feat_idx=cache_cursor(feat_idx))
 
 
 class WanMidBlockAdapter(_CausalMidBlockAdapter):

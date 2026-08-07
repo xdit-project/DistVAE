@@ -2,11 +2,25 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 import os
+from typing import List, Optional
 
 try:
     import torch_musa
 except ModuleNotFoundError:
     pass
+
+
+def cache_cursor(feat_idx: Optional[List[int]]) -> List[int]:
+    """The caller's position in the feature cache, or a fresh one at the start of it
+
+    The causal video decoders walk their feature cache with a one-element list, advancing it as
+    each layer takes its slot. That cursor cannot be a default argument: Python binds one list
+    per function at definition, so every call omitting it would share the same one, and a second
+    decode would carry on reading from wherever the first one stopped. What that gives is not an
+    error but a video conditioned on the tail of the previous decode.
+    """
+    return [0] if feat_idx is None else feat_idx
+
 
 class DistributedEnv:
     _vae_group = None

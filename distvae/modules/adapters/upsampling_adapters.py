@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from distvae.utils import DistributedEnv
+from distvae.utils import DistributedEnv, cache_cursor
 from distvae.models.upsampling import PatchUpsample2D
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
@@ -121,8 +121,8 @@ class _CausalResampleAdapter(nn.Module):
                 for layer in resample.resample
             ])
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
-        return self.resample(x, feat_cache=feat_cache, feat_idx=feat_idx)
+    def forward(self, x, feat_cache=None, feat_idx=None):
+        return self.resample(x, feat_cache=feat_cache, feat_idx=cache_cursor(feat_idx))
 
 
 class WanResampleAdapter(_CausalResampleAdapter):
@@ -182,8 +182,9 @@ class _CausalUpBlockAdapter(nn.Module):
                 up_block.upsampler = self._resample_adapter(up_block.upsampler, **options)
         setattr(self, self._attr, up_block)
 
-    def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
+    def forward(self, x, feat_cache=None, feat_idx=None, first_chunk=False):
         up_block = getattr(self, self._attr)
+        feat_idx = cache_cursor(feat_idx)
         if self._takes_first_chunk:
             return up_block(
                 x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk

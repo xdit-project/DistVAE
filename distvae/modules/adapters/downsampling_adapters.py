@@ -3,6 +3,7 @@ from typing import Tuple
 import torch.nn as nn
 
 from distvae.models.layers.wan.zeropadconv2d import WanZeroPadConv2d
+from distvae.utils import cache_cursor
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
     HUNYUAN_VIDEO_15,
@@ -180,8 +181,8 @@ class _CausalResampleDownAdapter(nn.Module):
                 patch_dim=patch_dim,
             )
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
-        return self.resample(x, feat_cache=feat_cache, feat_idx=feat_idx)
+    def forward(self, x, feat_cache=None, feat_idx=None):
+        return self.resample(x, feat_cache=feat_cache, feat_idx=cache_cursor(feat_idx))
 
 
 class WanResampleDownAdapter(_CausalResampleDownAdapter):
@@ -427,5 +428,7 @@ class WanResidualDownBlockAdapter(nn.Module):
                     patch_dim=patch_dim,
                 )
 
-    def forward(self, hidden_states, feat_cache=None, feat_idx=[0]):
-        return self.down_block(hidden_states, feat_cache=feat_cache, feat_idx=feat_idx)
+    def forward(self, hidden_states, feat_cache=None, feat_idx=None):
+        return self.down_block(
+            hidden_states, feat_cache=feat_cache, feat_idx=cache_cursor(feat_idx)
+        )
