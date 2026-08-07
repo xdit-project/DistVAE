@@ -182,6 +182,35 @@ def correct_start(start, stride):
     return ((start + stride - 1) // stride) * stride
 
 
+def chunk_bounds(extent, block, kernel_size, stride) -> List[Tuple[int, int]]:
+    """Where each chunk of one axis begins and ends, so that convolving them separately and
+    concatenating gives what convolving the whole axis would
+
+    The chunks divide the axis evenly and are then grown at each cut: every chunk but the last
+    runs on to the last input its final output position reads, and every chunk but the first
+    begins at the first input the next output step needs. Both are the same two corrections the
+    2D and the 3D path each used to write out per axis, which is two of them and five copies.
+
+    Args:
+        extent: Length of the axis, after any padding.
+        block: Requested chunk length; the count is the ceiling of extent over it.
+        kernel_size, stride: Conv parameters along this axis.
+
+    Returns:
+        List of (start, end) input-space bounds, one per chunk.
+    """
+    chunks = (extent + block - 1) // block
+    unit = extent // chunks
+    bounds = []
+    for idx in range(chunks):
+        start = idx * unit
+        bounds.append((
+            correct_start(start, stride) if idx else start,
+            extent if idx + 1 == chunks else correct_end(start + unit, kernel_size, stride),
+        ))
+    return bounds
+
+
 def build_crop_slice(
     patch_dim: int,
     patch_size: int,

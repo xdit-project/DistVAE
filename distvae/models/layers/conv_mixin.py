@@ -88,8 +88,7 @@ class PatchConvMixin:
         boundaries, so it reports global_start as None.
 
         Returns (input, patch_dim, patch_size, halo_width, kernel_size_patch_dim,
-        padding_patch_dim, stride_patch_dim, global_start, group_world_size, rank_in_group,
-        stride_shift).
+        padding_patch_dim, stride_patch_dim, global_start, group_world_size, rank_in_group).
         """
         group_world_size, global_rank, rank_in_group, local_rank = get_world_size_and_rank()
         patch_dim = self.patch_dim if self.patch_dim >= 0 else input.ndim + self.patch_dim
@@ -193,18 +192,11 @@ class PatchConvMixin:
         # only a strided conv paid to find it out, so at unit stride there is nothing to report.
         global_start = None if patch_index is None else patch_index[rank_in_group]
 
-        # Stride alignment: when stride > 1, we need to align input to global stride grid
-        # to ensure output indices match across ranks (prevents border artifacts)
-        stride_shift = 0
-        if halo_width[0] > 0 and stride_patch_dim > 1:
-            shift = (global_start - halo_width[0] + padding_patch_dim) % stride_patch_dim
-            if shift != 0:
-                stride_shift = shift
-                # Trim `shift` pixels from the top to align to stride grid
-                trim_slice = [slice(None)] * input.ndim
-                trim_slice[patch_dim] = slice(shift, None)
-                input = input[tuple(trim_slice)]
-                halo_width = (max(0, halo_width[0] - shift), halo_width[1])
+        # A block trimming the input back onto the global stride grid used to sit here. It never
+        # trimmed anything: the top halo is defined as the distance from the patch start back to
+        # the last output step before it, so start - halo + padding is that step's position, which
+        # is a whole number of strides by construction and leaves nothing to shift by. What it
+        # reported was therefore always zero, and both callers unpacked it and never read it.
         return (
             input,
             patch_dim,
@@ -216,5 +208,4 @@ class PatchConvMixin:
             global_start,
             group_world_size,
             rank_in_group,
-            stride_shift,
         )

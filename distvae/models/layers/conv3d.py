@@ -18,8 +18,7 @@ from torch.nn.common_types import _size_3_t
 
 from distvae.models.layers.conv_utils import (
     get_world_size_and_rank,
-    correct_end,
-    correct_start,
+    chunk_bounds,
     build_crop_slice,
 )
 from distvae.models.layers.conv_mixin import PatchConvMixin
@@ -97,7 +96,6 @@ class PatchConv3d(nn.Conv3d, PatchConvMixin):
                 global_start,
                 group_world_size,
                 rank_in_group,
-                stride_shift,
             ) = self._multi_rank_metadata_and_halo(input, self.halo_buffer)
             conv_res: Tensor
             padding = self._adjust_padding_for_patch(
@@ -153,72 +151,33 @@ class PatchConv3d(nn.Conv3d, PatchConvMixin):
                     input = F.pad(input, padding, mode="constant")
 
                 _, _, f, h, w = input.shape
-                if isinstance(self.block_size, int):
-                    num_chunks_in_f = (f + self.block_size - 1) // self.block_size
-                    num_chunks_in_h = (h + self.block_size - 1) // self.block_size
-                    num_chunks_in_w = (w + self.block_size - 1) // self.block_size
-                else:
-                    num_chunks_in_f = (f + self.block_size[0] - 1) // self.block_size[0]
-                    num_chunks_in_h = (h + self.block_size[1] - 1) // self.block_size[1]
-                    num_chunks_in_w = (w + self.block_size[2] - 1) // self.block_size[2]
-                unit_chunk_size_f = f // num_chunks_in_f
-                unit_chunk_size_h = h // num_chunks_in_h
-                unit_chunk_size_w = w // num_chunks_in_w
-                if isinstance(self.kernel_size, int):
-                    kernel_size_f, kernel_size_h, kernel_size_w = self.kernel_size, self.kernel_size, self.kernel_size
-                else:
-                    kernel_size_f, kernel_size_h, kernel_size_w = self.kernel_size
-                if isinstance(self.stride, int):
-                    stride_f, stride_h, stride_w = self.stride, self.stride, self.stride
-                else:
-                    stride_f, stride_h, stride_w = self.stride
+                # nn.Conv3d normalises all three of these to triples in its own __init__, so they
+                # are read as triples rather than tested for which they are.
+                block_f, block_h, block_w = _triple(self.block_size)
+                kernel_f, kernel_h, kernel_w = _triple(self.kernel_size)
+                stride_f, stride_h, stride_w = _triple(self.stride)
+                frames = chunk_bounds(f, block_f, kernel_f, stride_f)
+                rows = chunk_bounds(h, block_h, kernel_h, stride_h)
+                columns = chunk_bounds(w, block_w, kernel_w, stride_w)
 
-                # Chunk boundaries aligned via correct_end/correct_start so conv outputs line up when concatenated.
-                outputs = []
-                for idx_f in range(num_chunks_in_f):
-                    outer_output = []
-                    for idx_h in range(num_chunks_in_h):
-                        inner_output = []
-                        for idx_w in range(num_chunks_in_w):
-                            start_f = idx_f * unit_chunk_size_f
-                            start_w = idx_w * unit_chunk_size_w
-                            start_h = idx_h * unit_chunk_size_h
-                            end_f = (idx_f + 1) * unit_chunk_size_f
-                            end_w = (idx_w + 1) * unit_chunk_size_w
-                            end_h = (idx_h + 1) * unit_chunk_size_h
-                            if idx_f + 1 < num_chunks_in_f:
-                                end_f = correct_end(end_f, kernel_size_f, stride_f)
-                            else:
-                                end_f = f
-                            if idx_w + 1 < num_chunks_in_w:
-                                end_w = correct_end(end_w, kernel_size_w, stride_w)
-                            else:
-                                end_w = w
-                            if idx_h + 1 < num_chunks_in_h:
-                                end_h = correct_end(end_h, kernel_size_h, stride_h)
-                            else:
-                                end_h = h
-                            if idx_f > 0:
-                                start_f = correct_start(start_f, stride_f)
-                            if idx_w > 0:
-                                start_w = correct_start(start_w, stride_w)
-                            if idx_h > 0:
-                                start_h = correct_start(start_h, stride_h)
-
-                            inner_output.append(
-                                F.conv3d(
-                                    input[:, :, start_f:end_f, start_h:end_h, start_w:end_w],
-                                    weight,
-                                    bias,
-                                    self.stride,
-                                    0,
-                                    self.dilation,
-                                    self.groups,
-                                )
+                outputs = torch.cat([
+                    torch.cat([
+                        torch.cat([
+                            F.conv3d(
+                                input[:, :, first:last, top:bottom, left:right],
+                                weight,
+                                bias,
+                                self.stride,
+                                0,
+                                self.dilation,
+                                self.groups,
                             )
-                        outer_output.append(torch.cat(inner_output, dim=-1))
-                    outputs.append(torch.cat(outer_output, dim=-2))
-                outputs = torch.cat(outputs, dim=-3)
+                            for left, right in columns
+                        ], dim=-1)
+                        for top, bottom in rows
+                    ], dim=-2)
+                    for first, last in frames
+                ], dim=-3)
                 crop_slice = build_crop_slice(
                     patch_dim, patch_size, halo_width, outputs.shape[patch_dim], ndim=5,
                     global_start=global_start,
