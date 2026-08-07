@@ -41,7 +41,7 @@ from distvae.modules.adapters.resnet_adapters import (
     WanResidualBlockAdapter,
 )
 from distvae.modules.adapters.unets.unet_2d_blocks_adapters import DownEncoderBlock2DAdapter
-from distvae.modules.patch_utils import Patchify, DePatchify
+from distvae.modules.patch_utils import Patchify, DePatchify, widest_halo
 from distvae.utils import DistributedEnv
 
 from diffusers.models.autoencoders.vae import Encoder
@@ -113,7 +113,12 @@ class EncoderAdapter(nn.Module):
             )
             for down_block in encoder.down_blocks
         ])
-        self.patchify = Patchify(patch_dim=patch_dim, scale_factor=vae_scale_factor)
+        # Read after the whole stack is adapted, so it sees every convolution that will exchange.
+        self.patchify = Patchify(
+            patch_dim=patch_dim,
+            scale_factor=vae_scale_factor,
+            halo=widest_halo(self.encoder),
+        )
         self.depatchify = DePatchify(patch_dim=patch_dim)
         self.vae_group = vae_group
 
@@ -196,8 +201,13 @@ class _CausalEncoderAdapter(nn.Module):
         if isinstance(getattr(encoder, "conv_norm_out", None), nn.GroupNorm):
             self.encoder.conv_norm_out = GroupNormAdapter(encoder.conv_norm_out)
         # Each band is a whole multiple of what the encoder narrows by, so it starts on the grid
-        # the strided convolutions step along and the latent rows it produces are its own.
-        self.patchify = Patchify(patch_dim=patch_dim, scale_factor=vae_scale_factor)
+        # the strided convolutions step along and the latent rows it produces are its own. Read
+        # the halo after the whole stack is adapted, so it sees every convolution that exchanges.
+        self.patchify = Patchify(
+            patch_dim=patch_dim,
+            scale_factor=vae_scale_factor,
+            halo=widest_halo(self.encoder),
+        )
         self.depatchify = DePatchify(patch_dim=patch_dim)
         self.vae_group = vae_group
 

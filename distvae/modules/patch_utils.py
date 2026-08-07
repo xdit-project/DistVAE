@@ -5,7 +5,33 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from distvae.models.layers.conv2d import PatchConv2d
+from distvae.models.layers.conv3d import PatchConv3d
 from distvae.utils import DistributedEnv
+
+
+def widest_halo(module: nn.Module) -> int:
+    """The most rows any convolution in here will ask a neighbour for
+
+    Neither halo width ever exceeds half the kernel, whatever the stride and the padding: the
+    step count either side of a boundary is a ceiling of the same quantity the width is then
+    measured back from, and what survives that algebra is `kernel_size // 2` with the stride and
+    the padding cancelled out. So the widest kernel over the stack bounds every exchange the run
+    will make, and being a property of the weights rather than of the image, it can be read once
+    and reread never.
+    """
+    widest = 0
+    for conv in module.modules():
+        if not isinstance(conv, (PatchConv2d, PatchConv3d)):
+            continue
+        patch_dim = conv.patch_dim
+        if patch_dim < 0:
+            patch_dim += conv._patch_ndim()
+        kernel = conv.kernel_size
+        if isinstance(kernel, tuple):
+            kernel = kernel[patch_dim - 2]
+        widest = max(widest, kernel // 2)
+    return widest
 
 
 def gather_patches(patch: torch.Tensor, patch_dim: int) -> Tuple[List[torch.Tensor], List[int]]:
@@ -66,18 +92,25 @@ class Patchify(nn.Module):
     do, but it is not the same computation: after the first convolution the pad is no longer
     zeros but the network's answer to zeros, and it reaches the kept rows through every
     receptive field and every attention that follows, however much is cropped afterwards.
+
+    This is also where a band too thin to lend its neighbour a halo is caught, because it is the
+    one place every rank works the same sum from the same numbers. The convolutions cannot do it:
+    each holds only its own band, bands differ by a unit, and a rank that stopped on its own
+    would leave its neighbours waiting on rows from a rank that is no longer sending them.
     """
 
     def __init__(
         self,
         patch_dim: int = -2,
         scale_factor: int = 1,
+        halo: int = 0,
     ):
         super().__init__()
         self.group_world_size = DistributedEnv.get_group_world_size()
         self.rank_in_vae_group = DistributedEnv.get_rank_in_vae_group()
         self.patch_dim = patch_dim
         self.scale_factor = scale_factor
+        self.halo = halo
 
     def forward(self, hidden_state):
         patch_dim = self.patch_dim if self.patch_dim >= 0 else hidden_state.ndim + self.patch_dim
@@ -98,6 +131,20 @@ class Patchify(nn.Module):
             )
         # The ranks that come first each take one extra band where the count does not divide.
         band, remainder = divmod(units, self.group_world_size)
+        # A unit is the narrowest a band gets: an encoder is on its way down to one row per unit
+        # and a decoder is on its way up from one. So the thinnest band anyone will hold at any
+        # point in the run is `band` rows, and a halo wider than that is a rank reaching past its
+        # neighbour into a rank it does not border. Erring towards refusal for an encoder whose
+        # widest kernel sits early, where the rows have not been spent yet.
+        if self.halo > band:
+            fits = units // self.halo
+            raise ValueError(
+                f"Cannot split {size} rows across {self.group_world_size} ranks: that leaves "
+                f"{band} row{'' if band == 1 else 's'} per rank at the narrowest, and this VAE "
+                f"has a convolution reaching {self.halo} rows past a band into its neighbour's. "
+                f"Use at most {fits} rank{'' if fits == 1 else 's'} for this VAE, or tile it "
+                f"instead."
+            )
         rank = self.rank_in_vae_group
         start = (rank * band + min(rank, remainder)) * factor
         length = (band + (1 if rank < remainder else 0)) * factor

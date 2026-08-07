@@ -168,6 +168,11 @@ class PatchConvMixin:
                 )
                 next_top_halo_width = max(0, next_top_halo_width)
         if self._patch_ndim() == 4:
+            # Backstop, not the guard. Bands differ by a unit, so this can be true on one rank and
+            # false on its neighbour, and a rank that stops here stops on its way into the
+            # exchange below - leaving the others waiting on rows that will not come. Patchify
+            # refuses the same case up front, where every rank works it out from the same numbers
+            # and they all refuse together. Anything reaching here came in already split.
             assert halo_width[0] <= patch_size and halo_width[1] <= patch_size, (
                 "halo width is larger than the patch dimension of input tensor"
             )

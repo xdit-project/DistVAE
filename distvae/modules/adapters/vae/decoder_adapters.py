@@ -45,7 +45,7 @@ from distvae.modules.adapters.midblock_adapters import (
     QwenImageMidBlockAdapter,
     WanMidBlockAdapter,
 )
-from distvae.modules.patch_utils import Patchify, DePatchify
+from distvae.modules.patch_utils import Patchify, DePatchify, widest_halo
 from distvae.utils import DistributedEnv
 
 try:
@@ -200,7 +200,8 @@ class _CausalDecoderAdapter(nn.Module):
         # norms the other families end on do not, and are left as they are.
         if isinstance(getattr(decoder, "conv_norm_out", None), nn.GroupNorm):
             self.decoder.conv_norm_out = GroupNormAdapter(decoder.conv_norm_out)
-        self.patchify = Patchify(patch_dim=patch_dim)
+        # Read after the whole stack is adapted, so it sees every convolution that will exchange.
+        self.patchify = Patchify(patch_dim=patch_dim, halo=widest_halo(self.decoder))
         self.depatchify = DePatchify(patch_dim=patch_dim)
         self.use_profiler = use_profiler
         self.verbose = verbose
