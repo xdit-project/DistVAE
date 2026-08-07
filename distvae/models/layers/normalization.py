@@ -65,8 +65,14 @@ class PatchGroupNorm(nn.GroupNorm):
         affine: bool = True,
         device=None,
         dtype=None,
-        patch_dim: int = -2,
+        patch_dim: Optional[int] = None,
     ) -> None:
+        # None means "whichever axis this run splits on", read at forward time from the same
+        # place the process group is read from. A GroupNorm is built deep inside an adapter that
+        # was told the axis, through wrappers that do not all thread it down, so a default of -2
+        # here was silently overriding a run sharding on W: the statistics were summed as though
+        # the split were on H, and every normalised value came out wrong. Naming an axis outright
+        # still works, and is what the tests use to check one without a distributed environment.
         self.patch_dim = patch_dim
         super().__init__(
             num_groups=num_groups,
@@ -80,7 +86,8 @@ class PatchGroupNorm(nn.GroupNorm):
     def forward(self, x: Tensor) -> Tensor:
         ndim = x.ndim
         shape = x.shape
-        patch_dim = self.patch_dim if self.patch_dim >= 0 else ndim + self.patch_dim
+        axis = DistributedEnv.get_patch_dim() if self.patch_dim is None else self.patch_dim
+        patch_dim = axis if axis >= 0 else ndim + axis
 
         vae_group = DistributedEnv.get_vae_group()
         group_world_size = DistributedEnv.get_group_world_size()

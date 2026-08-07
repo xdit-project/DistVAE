@@ -19,6 +19,7 @@ import torch.nn as nn
 
 from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from distvae.modules.patch_utils import DePatchify, Patchify
+from distvae.utils import DistributedEnv
 
 from distributed_harness import (
     assert_matches_reference,
@@ -31,6 +32,10 @@ from distributed_harness import (
 def worker(rank, world_size, shape, num_groups, patch_dim, seed, master_port):
     init_gloo(rank, world_size, master_port)
     try:
+        # As the decoder and encoder adapters do when they are built. GroupNormAdapter is reached
+        # through wrappers that do not thread the axis down to it, so this is how the norm finds
+        # out which axis the run splits on.
+        DistributedEnv.set_patch_dim(patch_dim)
         torch.manual_seed(seed)
         channels = shape[1]
         norm = nn.GroupNorm(
@@ -70,6 +75,19 @@ def test_it_matches_group_norm_on_a_video_feature_map(world_size, master_port, s
 @pytest.mark.gloo
 def test_it_matches_group_norm_when_the_width_is_split(master_port, seed=42):
     run_distributed(worker, 2, ((1, 16, 16, 16), 8, -1, seed), master_port)
+
+
+@pytest.mark.gloo
+def test_it_matches_group_norm_when_an_odd_width_is_split(master_port, seed=42):
+    """The case that catches a norm summing across the wrong axis
+
+    A width of 15 over two ranks gives one rank 8 columns and the other 7. That unevenness is
+    what makes the axis matter: split evenly, counting rows where the split is on columns
+    happens to arrive at the same element count anyway - the row count is over-counted by
+    exactly the factor the column count is under-counted by, and the two cancel. The square
+    width-split case above therefore passed while the norm was reducing along height.
+    """
+    run_distributed(worker, 2, ((1, 16, 4, 15), 8, -1, seed), master_port)
 
 
 def bfloat16_worker(rank, world_size, shape, num_groups, patch_dim, seed, master_port):

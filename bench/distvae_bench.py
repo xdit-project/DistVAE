@@ -1079,10 +1079,13 @@ def tile_shape_costs(args, spec, device, dtype, say):
                 size = (count, spec["latent_channels"], depth, rows, columns)
             torch.manual_seed(1)
             latent = torch.randn(*size, dtype=dtype, device=device)
-            torch.cuda.reset_peak_memory_stats(device)
             try:
                 for _ in range(args.warmup):
                     run_half(vae, "decoder", latent)
+                # After the warmup, as the main path does, so the two report the same thing.
+                # Warmup is where the allocator grows and the autotuner takes its workspaces,
+                # and a peak measured across it is the setup's rather than the decode's.
+                torch.cuda.reset_peak_memory_stats(device)
                 ms = timed(
                     lambda: run_half(vae, "decoder", latent), args.iters, device
                 )["median_s"] * 1000

@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -42,7 +42,7 @@ from distvae.modules.adapters.resnet_adapters import (
 )
 from distvae.modules.adapters.unets.unet_2d_blocks_adapters import DownEncoderBlock2DAdapter
 from distvae.modules.patch_utils import Patchify, DePatchify, widest_halo
-from distvae.utils import DistributedEnv
+from distvae.utils import DistributedEnv, cache_cursor
 
 from diffusers.models.autoencoders.vae import Encoder
 from diffusers.models.unets.unet_2d_blocks import DownEncoderBlock2D
@@ -242,9 +242,12 @@ class _CausalEncoderAdapter(nn.Module):
         self,
         sample: torch.FloatTensor,
         feat_cache: Optional[torch.FloatTensor] = None,
-        feat_idx: Optional[int] = 0,
+        feat_idx: Optional[List[int]] = None,
         patchify: bool = True,
     ):
+        # A one-element list the causal blocks advance in place; see the decoder's forward for
+        # why it is neither a mutable default nor the bare 0 this used to take.
+        feat_idx = cache_cursor(feat_idx)
         return self._sharded_encode(
             sample, patchify, lambda x: self._run_encoder(x, feat_cache, feat_idx)
         )

@@ -1,5 +1,5 @@
 import time
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -46,7 +46,7 @@ from distvae.modules.adapters.midblock_adapters import (
     WanMidBlockAdapter,
 )
 from distvae.modules.patch_utils import Patchify, DePatchify, widest_halo
-from distvae.utils import DistributedEnv
+from distvae.utils import DistributedEnv, cache_cursor
 
 try:
     import torch_musa
@@ -242,10 +242,16 @@ class _CausalDecoderAdapter(nn.Module):
         self,
         sample: torch.FloatTensor,
         feat_cache: Optional[torch.FloatTensor] = None,
-        feat_idx: Optional[int] = 0,
+        feat_idx: Optional[List[int]] = None,
         first_chunk: bool = False,
         patchify: bool = True,
     ):
+        # The cursor is a one-element list the causal blocks advance in place, so it can be
+        # neither a mutable default nor the bare 0 this used to take: `0` is not subscriptable,
+        # and cache_cursor hands back whatever it is given, so an int passed here reaches the
+        # blocks as an int. Harmless while every caller passes the VAE's own list, which they do
+        # - but the whole point of the helper is that omitting it is safe.
+        feat_idx = cache_cursor(feat_idx)
         return _decode(
             lambda: self._sharded_decode(
                 sample,
