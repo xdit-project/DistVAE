@@ -173,13 +173,11 @@ def test_patch_conv3d_gloo_chunked_path(master_port, seed=42):
 @pytest.mark.gloo
 @pytest.mark.parametrize("world_size,patch_dim", [(4, -2), (2, -1)])
 def test_patch_conv3d_stride2_alignment(world_size, patch_dim, master_port, seed=42):
-    """
-    PatchConv3d with stride=2: tests stride alignment and global-position cropping logic.
+    """PatchConv3d at stride 2, where the crop has to be placed from the global position
 
-    This exercises the code path where:
-    1. Stride > 1 triggers stride alignment (shift calculation and input trimming)
-    2. build_crop_slice uses global_start and global_height for correct output cropping
-    3. Ranks would otherwise misalign without this logic
+    A strided convolution's output grid is set by where a rank's patch begins in the whole
+    image, not by where it begins in that rank, so build_crop_slice is given the global start
+    and the ranks would otherwise cut their outputs at offsets that do not join up.
     """
     _run_one(
         world_size=world_size,
@@ -194,7 +192,7 @@ def test_patch_conv3d_stride2_alignment(world_size, patch_dim, master_port, seed
 
 
 @pytest.mark.gloo
-@pytest.mark.parametrize("block_size", [0, 2])
+@pytest.mark.parametrize("block_size", [0, 4])
 @pytest.mark.parametrize("size", [(9, 7), (15, 11)])
 @pytest.mark.parametrize("world_size,patch_dim", [(4, -2), (3, -2), (2, -1)])
 def test_patch_conv3d_stride2_on_bands_of_different_sizes(
@@ -207,6 +205,10 @@ def test_patch_conv3d_stride2_on_bands_of_different_sizes(
     non-strict xfail so a known bug would not be quietly forgotten, it passed on both of its
     cases, so the claim is checked here instead of recorded: three splits, two shapes that
     divide by none of the rank counts, and both the direct and the chunked convolution.
+
+    The chunked block is 4 rather than anything smaller, as in the chunked test above: a block
+    below the kernel cuts a chunk the convolution cannot be run on at all, which is a limit of
+    that path and not of the split this is about.
 
     If the off-by-one is real it is not this. Should one of these ever fail, it is the arithmetic
     that is wrong and not the expectation - a strided convolution over an uneven split has to
