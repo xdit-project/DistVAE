@@ -37,18 +37,159 @@ real model.
 """
 
 import argparse
+import hashlib
 import json
 import os
+import platform
+import socket
+import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
 # Captured before anything can swap it out, which importing xfuser does.
 TORCH_GROUPNORM = torch.nn.GroupNorm
+
+
+# --------------------------------------------------------------------------------------------
+# What produced a measurement, so a result file can travel
+# --------------------------------------------------------------------------------------------
+
+# Bumped when the shape of a report changes in a way a reader has to know about.
+SCHEMA = 1
+
+
+def _git(cwd, *argv):
+    try:
+        done = subprocess.run(
+            ["git", *argv], cwd=cwd, capture_output=True, text=True, timeout=30
+        )
+        return done.stdout.strip() if done.returncode == 0 else None
+    except Exception:  # noqa: BLE001 - provenance never fails a run
+        return None
+
+
+def _checkout(module):
+    """The branch and commit a package was installed from, where it came from a git checkout
+
+    Branches are how this work moves between machines, so a version string cannot say what ran:
+    two boxes can both hold "0.0.0b5" and disagree about everything that matters.
+    """
+    location = getattr(module, "__file__", None)
+    if not location:
+        return None
+    start = Path(location).resolve().parent
+    for parent in [start, *start.parents]:
+        if not (parent / ".git").exists():
+            continue
+        return {
+            "branch": _git(parent, "rev-parse", "--abbrev-ref", "HEAD"),
+            "commit": _git(parent, "rev-parse", "--short", "HEAD"),
+            "dirty": bool(_git(parent, "status", "--porcelain")),
+        }
+    return None
+
+
+def _installed():
+    """What is loaded, asked of sys.modules rather than by importing
+
+    Importing xfuser to read its version would swap torch's GroupNorm for AITER's, and where in
+    the run that swap happens is part of what this bench measures. Anything not already imported
+    by now was not going to be used.
+    """
+    found = {}
+    for name in ("torch", "diffusers", "distvae", "xfuser"):
+        module = sys.modules.get(name)
+        if module is None:
+            continue
+        found[name] = {
+            "version": getattr(module, "__version__", None),
+            "checkout": _checkout(module),
+        }
+    return found
+
+
+def _this_script():
+    """This file's own identity, which its installed library's commit does not give
+
+    The bench script travels by other means than the package does - copied to a box, mounted into
+    a container, delivered by ConfigMap - so the commit of the DistVAE beside it is no evidence at
+    all of what was actually run. A digest is, and it costs one read of a file already on disk.
+    """
+    try:
+        source = Path(__file__).resolve()
+        return {
+            "path": str(source),
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest()[:12],
+            "checkout": _checkout(sys.modules[__name__]),
+        }
+    except Exception:  # noqa: BLE001 - provenance never fails a run
+        return None
+
+
+def _hardware(device_index):
+    if not torch.cuda.is_available():
+        return {"family": os.environ.get("HW_FAMILY", "cpu")}
+    card = torch.cuda.get_device_properties(device_index)
+    arch = getattr(card, "gcnArchName", "") or f"sm_{card.major}{card.minor}"
+    return {
+        # Deliberately not looked up in a table of known devices: whoever brings a machine up
+        # sets HW_FAMILY, and until they do the architecture string stands in, which is wrong in
+        # no way except being harder to read.
+        "family": os.environ.get("HW_FAMILY") or arch,
+        "product": card.name,
+        "arch": arch,
+        "vram_gib": round(card.total_memory / (1024 ** 3), 1),
+        "visible": torch.cuda.device_count(),
+        "runtime": (
+            f"rocm {torch.version.hip}" if getattr(torch.version, "hip", None)
+            else f"cuda {getattr(torch.version, 'cuda', None)}"
+        ),
+    }
+
+
+REPORT_BEGIN = "===== BEGIN DISTVAE REPORT ====="
+REPORT_END = "===== END DISTVAE REPORT ====="
+
+
+def write_report(path, world_size, device_index, body):
+    """Emit a result that answers for itself what produced it
+
+    A report arriving from another machine cannot be read back out of its numbers: which card,
+    which branch of DistVAE, which xDiT beside it, what was asked. Someone otherwise keeps that
+    in a message alongside the file, and eventually keeps it wrong.
+
+    Always to stdout as well as to the file, because the filesystem it was written to is often
+    the thing that does not survive the run: a pod deleted the moment it finishes, a container
+    someone brought up over ssh. The log is what comes back from those, so the report has to be
+    in it.
+    """
+    report = {
+        "schema": SCHEMA,
+        "ran": {
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "host": socket.gethostname(),
+            "python": platform.python_version(),
+            "world_size": world_size,
+            "hardware": _hardware(device_index),
+            "installed": _installed(),
+            "bench_script": _this_script(),
+            "argv": list(sys.argv),
+        },
+        **body,
+    }
+    if path:
+        with open(path, "w") as handle:
+            json.dump(report, handle, indent=2)
+        print(f"\nwrote {path}", flush=True)
+    print(f"\n{REPORT_BEGIN}")
+    print(json.dumps(report, indent=2))
+    print(REPORT_END, flush=True)
 
 
 # --------------------------------------------------------------------------------------------
@@ -1107,10 +1248,8 @@ def main():
 
     if args.tile_shape_costs:
         costs = tile_shape_costs(args, spec, device, dtype, say)
-        if rank == 0 and args.out:
-            with open(args.out, "w") as handle:
-                json.dump(costs, handle, indent=2)
-            print(f"\nwrote {args.out}", flush=True)
+        if rank == 0:
+            write_report(args.out, world_size, local_rank, {"tile_shape_costs": costs})
         dist.barrier()
         dist.destroy_process_group()
         return
@@ -1154,10 +1293,10 @@ def main():
         if rank == 0:
             print_report(report, args.half)
 
-    if rank == 0 and args.out:
-        with open(args.out, "w") as handle:
-            json.dump(reports if len(reports) > 1 else reports[0], handle, indent=2)
-        print(f"\nwrote {args.out}", flush=True)
+    if rank == 0:
+        # Always a list, even for one cell. A reader that has to find out whether it is holding a
+        # cell or a grid before it can start is a reader everyone writes slightly differently.
+        write_report(args.out, world_size, local_rank, {"cells": reports})
 
     dist.barrier()
     dist.destroy_process_group()
