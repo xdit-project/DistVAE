@@ -813,6 +813,28 @@ def _latent_area(vae):
     return size * size
 
 
+def overlap_token(text):
+    """A requested overlap: a fraction, or `half` for half of whatever this VAE's own is
+
+    Named rather than numeric because the VAE's own overlap differs by family - a quarter on
+    AutoencoderKL, elsewhere whatever its stride happens to work out to - so no single number
+    means "half the default" across a sweep, and a table of per-family numbers is one that goes
+    stale the first time a config changes upstream.
+    """
+    text = text.strip().lower()
+    if text == "half":
+        return "half"
+    try:
+        return float(text)
+    except ValueError:
+        raise SystemExit(f"--tile-overlap takes a fraction or `half`, not {text!r}") from None
+
+
+def overlap_label(overlap):
+    """What to call an arm measured at this overlap"""
+    return overlap if isinstance(overlap, str) else f"{overlap:g}"
+
+
 def _set_tile_overlap(vae, overlap, facts, say):
     """Widen the stride so tiles overlap by `overlap` of a tile rather than the VAE's own share
 
@@ -826,6 +848,19 @@ def _set_tile_overlap(vae, overlap, facts, say):
     that is measured here, against the untiled reference, before anything is recommended.
     """
     facts["requested_overlap"] = overlap
+
+    if overlap == "half":
+        own = _vae_tiling().tile_overlap(vae)
+        if own is None:
+            raise SystemExit(
+                f"--tile-overlap half has nothing to halve on this {type(vae).__name__}: it "
+                f"reports no overlap of its own to read."
+            )
+        # The down and across shares are the same on every VAE here, and where they are not the
+        # narrower one is the one that bounds the seam.
+        overlap = min(own) / 2
+        facts["own_overlap"] = min(own)
+        say(f"tile overlap half of the VAE's own {min(own):.1%}, so {overlap:.1%}")
 
     # The overlap-factor family states it as a fraction already and there is nothing to round.
     if hasattr(vae, "tile_overlap_factor"):
@@ -1131,6 +1166,9 @@ def main():
     parser.add_argument("--tile-overlap", default=None,
                         help="overlap the tiles by this fraction of a tile instead of by the "
                              "VAE's own share, comma separated for several, e.g. '0.25,0.125,0'. "
+                             "`half` means half of whatever this VAE's own overlap is, which is "
+                             "the only way to say that once across families that do not share a "
+                             "default. "
                              "Crossed with the tiled arms, so each one is measured at each "
                              "overlap. This is the lever the window is not: a window sets how big "
                              "a tile is and so what memory peaks at, while the overlap sets how "
@@ -1321,7 +1359,7 @@ def grid_cells(args) -> list:
         "width": args.width,
         "frames": args.frames,
         # A single run has one cell to put an overlap in, so it takes the first of a list.
-        "overlap": float(args.tile_overlap.split(",")[0]) if args.tile_overlap else None,
+        "overlap": overlap_token(args.tile_overlap.split(",")[0]) if args.tile_overlap else None,
     }
     if not args.grid_arms:
         return [single]
@@ -1360,7 +1398,7 @@ def grid_cells(args) -> list:
     # stays first and every other overlap is read against it.
     overlaps = [None]
     if args.tile_overlap:
-        overlaps += [float(text) for text in args.tile_overlap.split(",")]
+        overlaps += [overlap_token(text) for text in args.tile_overlap.split(",")]
 
     cells = []
     for shape in shapes:
@@ -1377,7 +1415,7 @@ def grid_cells(args) -> list:
                     continue
                 cells.append(
                     {
-                        "name": name if overlap is None else f"{name}-ov{overlap:g}",
+                        "name": name if overlap is None else f"{name}-ov{overlap_label(overlap)}",
                         **arms[name],
                         **shape,
                         "overlap": overlap,
