@@ -191,6 +191,13 @@ def chunk_bounds(extent, block, kernel_size, stride) -> List[Tuple[int, int]]:
     begins at the first input the next output step needs. Both are the same two corrections the
     2D and the 3D path each used to write out per axis, which is two of them and five copies.
 
+    Never more chunks than leave every one of them at least a kernel long. Asking for more cuts
+    an axis into pieces no convolution can be run on at all, which raises out of torch rather
+    than costing accuracy - and the count that does it is not obvious from the block size: a
+    frame axis of 4 padded to 6, chunked by 4 at stride 2, ends on a chunk of 2. Fewer chunks
+    only means a larger intermediate, which is the knob's own currency, and the output is the
+    same however the axis is divided.
+
     Args:
         extent: Length of the axis, after any padding.
         block: Requested chunk length; the count is the ceiling of extent over it.
@@ -200,6 +207,10 @@ def chunk_bounds(extent, block, kernel_size, stride) -> List[Tuple[int, int]]:
         List of (start, end) input-space bounds, one per chunk.
     """
     chunks = (extent + block - 1) // block
+    # A chunk spans its share of the axis less what the corrections at either end move it, which
+    # is a stride at most, so a share of kernel + stride - 1 is what keeps the shortest of them
+    # at a kernel. At stride 1 that is the kernel itself.
+    chunks = max(1, min(chunks, extent // (kernel_size + stride - 1)))
     unit = extent // chunks
     bounds = []
     for idx in range(chunks):

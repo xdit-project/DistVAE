@@ -192,7 +192,7 @@ def test_patch_conv3d_stride2_alignment(world_size, patch_dim, master_port, seed
 
 
 @pytest.mark.gloo
-@pytest.mark.parametrize("block_size", [0, 4])
+@pytest.mark.parametrize("block_size", [0, 2, 4])
 @pytest.mark.parametrize("size", [(9, 7), (15, 11)])
 @pytest.mark.parametrize("world_size,patch_dim", [(4, -2), (3, -2), (2, -1)])
 def test_patch_conv3d_stride2_on_bands_of_different_sizes(
@@ -206,9 +206,11 @@ def test_patch_conv3d_stride2_on_bands_of_different_sizes(
     cases, so the claim is checked here instead of recorded: three splits, two shapes that
     divide by none of the rank counts, and both the direct and the chunked convolution.
 
-    The chunked block is 4 rather than anything smaller, as in the chunked test above: a block
-    below the kernel cuts a chunk the convolution cannot be run on at all, which is a limit of
-    that path and not of the split this is about.
+    A block of 2 against a kernel of 3 was tried first and cut chunks no convolution can run on.
+    So did a block of 4, once the frame axis was chunked as well: 4 frames padded to 6, cut in
+    two at stride 2, ends on a chunk of 2. That is chunk_bounds' to answer rather than each
+    caller's to avoid, and it now takes no more chunks than leave every one of them a kernel
+    long, so both blocks work and the small one is kept here.
 
     If the off-by-one is real it is not this. Should one of these ever fail, it is the arithmetic
     that is wrong and not the expectation - a strided convolution over an uneven split has to

@@ -10,6 +10,7 @@ from distvae.models.layers.conv_utils import (
     calc_bottom_halo_width,
     calc_halo_width,
     calc_halo_width_unit_stride,
+    chunk_bounds,
     correct_end,
     correct_start,
     build_crop_slice,
@@ -215,6 +216,35 @@ class TestCorrectStart:
         assert correct_start(2, 1) == 2
         # (3+2-1)//2 * 2 = 4
         assert correct_start(3, 2) == 4
+
+
+class TestChunkBounds:
+    """The chunked convolution path cuts every axis with this"""
+
+    @pytest.mark.parametrize("stride", [1, 2])
+    @pytest.mark.parametrize("kernel_size", [1, 3, 5])
+    @pytest.mark.parametrize("block", [2, 4, 8, 64])
+    @pytest.mark.parametrize("extent", [4, 6, 7, 10, 17, 64])
+    def test_no_chunk_is_shorter_than_the_kernel(self, extent, block, kernel_size, stride):
+        """The one property the convolution cannot survive being without
+
+        A chunk shorter than the kernel raises out of torch, so this is not an accuracy question
+        that a later assertion would catch: it is whether the call can be made at all. Asked over
+        blocks below the kernel and axes that divide by none of them, which is where the path was
+        cutting a two-long tail off a six-long frame axis.
+        """
+        if extent < kernel_size:
+            pytest.skip("an axis shorter than the kernel has no chunking to get right")
+        for start, end in chunk_bounds(extent, block, kernel_size, stride):
+            assert end - start >= kernel_size, f"{extent}/{block} k{kernel_size} s{stride}"
+
+    def test_the_chunks_cover_the_axis_and_overlap_by_what_the_kernel_reads(self):
+        # Eight long, cut in two, kernel 3 at unit stride: the first chunk runs on to the last
+        # input its final output reads, so the two overlap by the kernel less one.
+        assert chunk_bounds(8, 4, 3, 1) == [(0, 6), (4, 8)]
+
+    def test_an_axis_that_wants_no_cutting_is_one_chunk(self):
+        assert chunk_bounds(8, 64, 3, 1) == [(0, 8)]
 
 
 class TestBuildCropSlice:
