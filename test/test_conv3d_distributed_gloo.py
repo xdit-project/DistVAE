@@ -194,21 +194,23 @@ def test_patch_conv3d_stride2_alignment(world_size, patch_dim, master_port, seed
 
 
 @pytest.mark.gloo
-@pytest.mark.xfail(
-    reason="known off-by-one halving a band whose rows do not divide by the rank count",
-    strict=False,
-)
-@pytest.mark.parametrize("world_size,patch_dim", [(4, -2), (2, -1)])
+@pytest.mark.parametrize("block_size", [0, 2])
+@pytest.mark.parametrize("size", [(9, 7), (15, 11)])
+@pytest.mark.parametrize("world_size,patch_dim", [(4, -2), (3, -2), (2, -1)])
 def test_patch_conv3d_stride2_on_bands_of_different_sizes(
-    world_size, patch_dim, master_port, seed=42
+    world_size, patch_dim, size, block_size, master_port, seed=42
 ):
-    """Halving an uneven split, which the sizes above were chosen to avoid
+    """Halving an uneven split, which the sizes elsewhere in this file were chosen to avoid
 
-    The TODO that used to sit beside those sizes said odd extents at stride > 1 produce
-    off-by-one errors, and the test was shaped around it. A known bug with no failing test is a
-    known bug that gets forgotten, so it is expected to fail here instead of being designed out.
-    Not strict, so the day the arithmetic is fixed this reports as an unexpected pass rather
-    than turning into a failure of its own.
+    A TODO used to sit beside those even sizes saying odd extents at stride > 1 produce
+    off-by-one errors, and the test was shaped around it rather than at it. Written first as a
+    non-strict xfail so a known bug would not be quietly forgotten, it passed on both of its
+    cases, so the claim is checked here instead of recorded: three splits, two shapes that
+    divide by none of the rank counts, and both the direct and the chunked convolution.
+
+    If the off-by-one is real it is not this. Should one of these ever fail, it is the arithmetic
+    that is wrong and not the expectation - a strided convolution over an uneven split has to
+    match nn.Conv3d, or a decode of any image whose rows do not divide by the rank count is wrong.
     """
     _run_one(
         world_size=world_size,
@@ -216,10 +218,10 @@ def test_patch_conv3d_stride2_on_bands_of_different_sizes(
         kernel_size=3,
         stride=2,
         padding=1,
-        block_size=0,
+        block_size=block_size,
         seed=seed,
         master_port=master_port,
-        size=(9, 7),
+        size=size,
     )
 
 
