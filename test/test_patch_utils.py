@@ -1,9 +1,8 @@
 """Splitting rows across ranks and gathering them back, over gloo on CPU.
 
-The pair has to round-trip exactly for row counts that do not divide by the rank count, because
-that is where it used to pad the tensor and crop afterwards, and padding is not free: it stops
-being zeros at the first convolution and reaches the kept rows from then on. Bands are now cut
-unevenly instead, so the gather has to cope with ranks holding different amounts.
+The pair has to round-trip exactly for row counts that do not divide by the rank count. Padding
+changes the computation once convolutions propagate values into retained rows. Uneven bands
+preserve the input, so the gather must accept different amounts from each rank.
 
 Run from repo root:
   pytest test/test_patch_utils.py -v

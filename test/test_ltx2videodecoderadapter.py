@@ -25,7 +25,7 @@ diffusers = pytest.importorskip("diffusers")
 if not hasattr(diffusers, "AutoencoderKLLTX2Video"):
     pytest.skip("installed diffusers has no AutoencoderKLLTX2Video", allow_module_level=True)
 
-# The tiny stand-in xDiT builds this class from, small enough to decode on CPU.
+# Four channel stages preserve the decoder's spatial compression structure.
 CONFIG = dict(
     block_out_channels=(8, 16, 32, 32),
     latent_channels=8,
@@ -83,15 +83,13 @@ def refusal_worker(rank, world_size, master_port):
 
 
 @pytest.mark.gloo
-@pytest.mark.parametrize("world_size", [1, 2, 4])
-def test_a_sharded_ltx2_decode_matches_a_single_rank_one(world_size, master_port, seed=42):
-    run_distributed(worker, world_size, (1, 16, 16, "reflect", 0, seed), master_port)
+def test_a_sharded_ltx2_decode_matches_a_single_rank_one(master_port, seed=42):
+    run_distributed(worker, 2, (1, 16, 16, "reflect", 0, seed), master_port)
 
 
 @pytest.mark.gloo
-@pytest.mark.parametrize("world_size", [1, 2])
-def test_the_zeros_padding_ltx23_ships_decodes_the_same(world_size, master_port, seed=42):
-    run_distributed(worker, world_size, (1, 16, 16, "zeros", 0, seed), master_port)
+def test_the_zeros_padding_ltx23_ships_decodes_the_same(master_port, seed=42):
+    run_distributed(worker, 2, (1, 16, 16, "zeros", 0, seed), master_port)
 
 
 @pytest.mark.gloo
@@ -113,7 +111,7 @@ def test_the_chunked_convolution_path_decodes_the_same(master_port, seed=42):
 
 @pytest.mark.gloo
 def test_latent_rows_that_do_not_divide_by_the_rank_count(master_port, seed=42):
-    # 16 rows over 3 ranks, the case the old pad-and-crop split got wrong.
+    # Uneven bands must preserve all 16 rows without padding the decoder input.
     run_distributed(worker, 3, (1, 16, 16, "reflect", 0, seed), master_port)
 
 

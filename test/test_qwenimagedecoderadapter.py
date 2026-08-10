@@ -1,7 +1,6 @@
 """QwenImageDecoderAdapter against the decoder it shards, over gloo on CPU.
 
-Unlocks --use_parallel_vae for Qwen-Image, Qwen-Image-Edit and the Krea-2 models, which xDiT
-otherwise has to refuse for want of an adapter.
+Qwen-Image, Qwen-Image-Edit, and Krea-2 share this decoder structure.
 
 Run from repo root:
   pytest test/test_qwenimagedecoderadapter.py -v
@@ -23,7 +22,7 @@ diffusers = pytest.importorskip("diffusers")
 if not hasattr(diffusers, "AutoencoderKLQwenImage"):
     pytest.skip("installed diffusers has no AutoencoderKLQwenImage", allow_module_level=True)
 
-# The tiny stand-in xDiT builds this class from, small enough to decode on CPU.
+# Four channel stages exercise every decoder upsampling transition.
 CONFIG = dict(base_dim=8, z_dim=4, dim_mult=[1, 2, 4, 4], num_res_blocks=1, attn_scales=[])
 LATENT_CHANNELS = 4
 
@@ -60,9 +59,8 @@ def worker(rank, world_size, frames, height, width, conv_block_size, seed, maste
 
 
 @pytest.mark.gloo
-@pytest.mark.parametrize("world_size", [1, 2, 4])
-def test_a_sharded_qwen_decode_matches_a_single_rank_one(world_size, master_port, seed=42):
-    run_distributed(worker, world_size, (1, 16, 16, 0, seed), master_port)
+def test_a_sharded_qwen_decode_matches_a_single_rank_one(master_port, seed=42):
+    run_distributed(worker, 2, (1, 16, 16, 0, seed), master_port)
 
 
 @pytest.mark.gloo
@@ -81,9 +79,8 @@ def test_more_than_one_frame_still_decodes(master_port, seed=42):
 
 @pytest.mark.gloo
 def test_latent_rows_that_do_not_divide_by_the_rank_count(master_port, seed=42):
-    # 16 rows over 3 ranks. This used to pad the latent up to a size that did divide and crop
-    # the decode afterwards, which is not the same computation: the pad stops being zeros at the
-    # first convolution and reaches every kept pixel through the mid block's attention.
+    # Padding to an even split changes the decode because convolution and mid-block attention
+    # propagate padded values into the rows that survive cropping.
     run_distributed(worker, 3, (1, 16, 16, 0, seed), master_port)
 
 

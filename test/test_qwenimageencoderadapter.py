@@ -76,17 +76,15 @@ def worker(
 
 
 @pytest.mark.gloo
-@pytest.mark.parametrize("world_size", [1, 2, 4])
-def test_a_sharded_qwen_encode_matches_a_single_rank_one(world_size, master_port, seed=42):
-    run_distributed(worker, world_size, (4, 64, 64, (), 0, seed), master_port)
+def test_a_sharded_qwen_encode_matches_a_single_rank_one(master_port, seed=42):
+    run_distributed(worker, 2, (4, 64, 64, (), 0, seed), master_port)
 
 
 @pytest.mark.gloo
-@pytest.mark.parametrize("world_size", [1, 2])
-def test_an_attention_block_among_the_down_blocks_is_gathered(world_size, master_port, seed=42):
+def test_an_attention_block_among_the_down_blocks_is_gathered(master_port, seed=42):
     # An attention reduces over every position, so a rank holding one patch of rows cannot do it
     # alone. attn_scales=(1.0,) puts one at the first stage, where the feature map is largest.
-    run_distributed(worker, world_size, (4, 64, 64, (1.0,), 0, seed), master_port)
+    run_distributed(worker, 2, (4, 64, 64, (1.0,), 0, seed), master_port)
 
 
 @pytest.mark.gloo

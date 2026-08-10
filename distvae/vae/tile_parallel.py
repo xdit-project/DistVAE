@@ -49,15 +49,14 @@ class Blend(NamedTuple):
     crop: Callable[
         [torch.Tensor], torch.Tensor
     ]  # the corner of a blended tile that is kept
-    # How big a whole tile is, which decides whether a run can be blended alone at all. Taken
-    # from the window rather than from a decoded tile, because every rank has to reach the same
-    # answer: one rank falling back while the others gather would hang the decode, not fail it.
+    # The configured window gives every rank the same whole-tile dimensions. A rank-local decoded
+    # tile may be clipped; using it could make one rank fall back while the others enter a gather.
     tile_down: int
     tile_across: int
 
 
 def mark(vae, context: ParallelContext) -> None:
-    """Record the immutable context used to distribute this VAE's tiles."""
+    """Record this VAE's immutable tile-distribution context."""
     if not isinstance(context, ParallelContext):
         raise TypeError("tile-parallel metadata requires a ParallelContext")
     setattr(vae, GROUP_ATTR, context)
@@ -445,10 +444,10 @@ def _share(
     world_size: int,
     like: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
-    """Fill in the calls this rank did not make from the ranks that did
+    """Fill in the calls this rank did not make from the ranks that did.
 
-    `like` says what to send from where this rank has nothing of its own to send, which happens
-    only where what is being shared is edges: the last run has no run after it to read its own.
+    `like` supplies edge metadata when this rank has no local tensor of the required shape. The
+    last run needs it because no following run provides an edge shape.
     """
     mine = [(n, tensor) for n, tensor in enumerate(made) if tensor is not None]
 

@@ -793,6 +793,44 @@ def test_tile_window_and_stride_are_applied_through_distvae_plans(monkeypatch):
     assert facts["overlap"] == (0.25, 0.25)
 
 
+def test_native_tile_window_enables_tiling_without_replanning(monkeypatch):
+    class Vae:
+        def __init__(self):
+            self.enabled = False
+
+        def enable_tiling(self):
+            self.enabled = True
+
+    vae = Vae()
+    monkeypatch.setattr(measure.vae_api, "require_vae_support", lambda *args: None)
+    monkeypatch.setattr(measure.vae_api, "tile_window", lambda value: 512)
+    monkeypatch.setattr(measure.vae_api, "narrowest_useful_window", lambda value: 256)
+    monkeypatch.setattr(measure.vae_api, "tile_overlap", lambda value: (0.25, 0.25))
+    monkeypatch.setattr(measure.vae_api, "latent_rows", lambda value: 64)
+    monkeypatch.setattr(
+        measure.vae_api,
+        "tile_plan",
+        lambda *args: pytest.fail("native tiling must not create a replacement plan"),
+    )
+
+    facts = measure.configure_tiling(
+        vae,
+        {
+            "sharding": "unsharded",
+            "tiling": "native",
+            "overlap": None,
+            "tile_distribution": None,
+        },
+        SimpleNamespace(world_size=1, group=object()),
+        "decoder",
+        lambda *parts: None,
+    )
+
+    assert vae.enabled is True
+    assert facts["requested_window"] == "native"
+    assert facts["window_px"] == 512
+
+
 def test_report_schema_contains_provenance_and_effective_composition():
     record = report.make_record(
         family="kl",

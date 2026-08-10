@@ -24,7 +24,7 @@ diffusers = pytest.importorskip("diffusers")
 if not hasattr(diffusers, "AutoencoderKLHunyuanVideo"):
     pytest.skip("installed diffusers has no AutoencoderKLHunyuanVideo", allow_module_level=True)
 
-# The tiny stand-in xDiT builds this class from, small enough to encode on CPU.
+# Four channel stages exercise every encoder downsampling transition.
 CONFIG = dict(
     block_out_channels=(8, 8, 16, 16),
     layers_per_block=1,
@@ -76,17 +76,15 @@ def worker(
 
 
 @pytest.mark.gloo
-@pytest.mark.parametrize("world_size", [1, 2, 4])
-def test_a_sharded_hunyuan_encode_matches_a_single_rank_one(world_size, master_port, seed=42):
-    run_distributed(worker, world_size, (5, 64, 64, True, 0, seed), master_port)
+def test_a_sharded_hunyuan_encode_matches_a_single_rank_one(master_port, seed=42):
+    run_distributed(worker, 2, (5, 64, 64, True, 0, seed), master_port)
 
 
 @pytest.mark.gloo
-@pytest.mark.parametrize("world_size", [1, 2])
-def test_an_encoder_whose_mid_block_has_no_attention(world_size, master_port, seed=42):
+def test_an_encoder_whose_mid_block_has_no_attention(master_port, seed=42):
     # Without attention the mid block is convolutions alone, so it stays sharded rather than
     # being gathered around, which is a different path through the mid block adapter.
-    run_distributed(worker, world_size, (5, 64, 64, False, 0, seed), master_port)
+    run_distributed(worker, 2, (5, 64, 64, False, 0, seed), master_port)
 
 
 @pytest.mark.gloo

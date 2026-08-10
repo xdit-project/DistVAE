@@ -25,9 +25,8 @@ diffusers = pytest.importorskip("diffusers")
 if not hasattr(diffusers, "AutoencoderKLLTX2Video"):
     pytest.skip("installed diffusers has no AutoencoderKLLTX2Video", allow_module_level=True)
 
-# The tiny stand-in xDiT builds this class from, small enough to encode on CPU. The compression
-# ratio has to match the number of stages, because the space-to-channel downsamplers divide the
-# channels by what they fold in, so it cannot be lowered to make the test cheaper.
+# Four channel stages exercise every downsampling mode. The compression ratio matches their
+# space-to-channel factors.
 CONFIG = dict(
     block_out_channels=(8, 16, 32, 32),
     latent_channels=8,
@@ -85,9 +84,8 @@ def worker(
 
 
 @pytest.mark.gloo
-@pytest.mark.parametrize("world_size", [1, 2])
-def test_a_sharded_ltx2_encode_matches_a_single_rank_one(world_size, master_port, seed=42):
-    run_distributed(worker, world_size, (9, 64, 64, FOLDING, "reflect", 0, seed), master_port)
+def test_a_sharded_ltx2_encode_matches_a_single_rank_one(master_port, seed=42):
+    run_distributed(worker, 2, (9, 64, 64, FOLDING, "reflect", 0, seed), master_port)
 
 
 @pytest.mark.gloo

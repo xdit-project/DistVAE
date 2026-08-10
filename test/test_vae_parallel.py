@@ -133,7 +133,7 @@ class TestEncoderAdapterChoice(unittest.TestCase):
 
 
 class TestEncoderScaleFactor(unittest.TestCase):
-    """The number the encoder adapter shards by, which used to be derived per model"""
+    """The spatial factor passed from a VAE's encoder structure into its adapter."""
 
     def test_a_vae_that_does_not_patch_uses_its_spatial_ratio(self):
         vae = _vae_class("AutoencoderKLWan")(**CONFIGS["AutoencoderKLWan"])
@@ -244,9 +244,8 @@ class TestBothHalvesShardTogether(unittest.TestCase):
     """Every VAE class an integration loads has both halves replaced, in the caller's order
 
     Naming an adapter and installing it are different things: the adapters rebuild a half in
-    place, so the half done first no longer answers to the blocks it was recognised by. Choosing
-    both names off intact blocks and then wrapping is what these check, over a one-rank gloo
-    group, since a name that resolves is no use if the wrapping it is chosen for cannot run.
+    place, so the half done first no longer answers to the blocks it was recognised by. These
+    tests choose both names from intact blocks before constructing either adapter.
     """
 
     @classmethod

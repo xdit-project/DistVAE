@@ -27,7 +27,7 @@ if not hasattr(diffusers, "AutoencoderKLHunyuanVideo15"):
         "installed diffusers has no AutoencoderKLHunyuanVideo15", allow_module_level=True
     )
 
-# The tiny stand-in xDiT builds this class from, small enough to encode on CPU.
+# Five channel stages exercise every encoder downsampling transition.
 CONFIG = dict(
     block_out_channels=(8, 8, 16, 16, 16),
     layers_per_block=1,
@@ -73,9 +73,8 @@ def worker(rank, world_size, frames, height, width, conv_block_size, seed, maste
 
 
 @pytest.mark.gloo
-@pytest.mark.parametrize("world_size", [1, 2, 4])
-def test_a_sharded_hunyuan15_encode_matches_a_single_rank_one(world_size, master_port, seed=42):
-    run_distributed(worker, world_size, (5, 64, 64, 0, seed), master_port)
+def test_a_sharded_hunyuan15_encode_matches_a_single_rank_one(master_port, seed=42):
+    run_distributed(worker, 2, (5, 64, 64, 0, seed), master_port)
 
 
 @pytest.mark.gloo

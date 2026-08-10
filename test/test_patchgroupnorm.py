@@ -1,11 +1,7 @@
-"""PatchGroupNorm against nn.GroupNorm, over gloo on CPU.
+"""PatchGroupNorm against nn.GroupNorm over multiple ranks.
 
-GroupNorm is the one normalisation in a VAE decoder whose statistics span the axis being split,
-so it is the one that has to be summed across ranks. The equivalent check exists in
-test_groupnorm.py, but only as a torchrun script needing NCCL and a GPU.
-
-Run from repo root:
-  pytest test/test_patchgroupnorm.py -v
+GroupNorm statistics include the split spatial axis, so group sums and variances must be
+aggregated across ranks.
 """
 
 import argparse
@@ -63,8 +59,7 @@ def test_it_matches_group_norm_on_a_feature_map(world_size, master_port, seed=42
 @pytest.mark.gloo
 @pytest.mark.parametrize("world_size", [1, 2])
 def test_it_matches_group_norm_on_a_video_feature_map(world_size, master_port, seed=42):
-    # The video VAEs normalise over (F, H, W), so the reduction has to cover the axes either
-    # side of the one being split, not just the split one.
+    # Video GroupNorm reduces over all of (F, H, W), including the axes around the split axis.
     run_distributed(worker, world_size, ((1, 16, 3, 8, 8), 4, -2, seed, True), master_port)
 
 
@@ -74,10 +69,25 @@ def test_it_matches_group_norm_when_the_width_is_split(master_port, seed=42):
 
 
 @pytest.mark.gloo
-def test_it_matches_group_norm_when_uneven_width_is_split_without_affine(master_port, seed=42):
+@pytest.mark.parametrize(
+    "shape,patch_dim",
+    [
+        pytest.param((1, 16, 10, 8), -2, id="uneven-height"),
+        pytest.param((1, 16, 8, 10), -1, id="uneven-width"),
+    ],
+)
+def test_it_matches_group_norm_on_uneven_spatial_bands_without_affine(
+    shape, patch_dim, master_port, seed=42
+):
     run_distributed(
-        worker, 3, ((1, 16, 8, 10), 8, -1, seed, False), master_port
+        worker, 3, (shape, 8, patch_dim, seed, False), master_port
     )
+
+
+def test_video_frame_axis_is_rejected_in_its_positive_spelling():
+    norm = GroupNormAdapter(nn.GroupNorm(1, 2), patch_dim=2)
+    with pytest.raises(ValueError, match="frame axis"):
+        norm(torch.randn(1, 2, 3, 4, 4))
 
 
 def test_constructing_a_second_norm_adapter_does_not_reconfigure_the_first(monkeypatch):
@@ -125,10 +135,6 @@ def bfloat16_worker(rank, world_size, shape, num_groups, patch_dim, seed, master
         dist.destroy_process_group()
 
 
-# One rank is the interesting case rather than the lenient one: nothing is sharded, so any loss
-# here is the substitution of PatchGroupNorm for nn.GroupNorm and nothing else. It is also the
-# case the benchmark harness cannot excuse - it allows bf16 sharding a few percent on the grounds
-# that splitting reorders the arithmetic, which at one rank has not happened.
 @pytest.mark.gloo
 @pytest.mark.parametrize("world_size", [1, 2, 4])
 def test_it_rounds_no_worse_than_group_norm_in_bfloat16(world_size, master_port, seed=42):

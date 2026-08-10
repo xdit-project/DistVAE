@@ -45,9 +45,8 @@ def _zero_pad_strided_conv(conv, conv_block_size, patch_dim, parallel_context=No
     """A sharded stand-in for a (0, 1, 0, 1) zero pad followed by a stride-2 convolution
 
     The pair cannot be split as written, because a rank's bottom row is padding only if it is the
-    bottom row of the whole image. One module that pads the outside edges and exchanges halos on
-    the inside ones settles it. Named for Wan, whose resample was the first to need it, but the
-    shape is just as much the one diffusers' own Downsample2D takes when told to pad by hand.
+    bottom row of the whole image. One module pads outside edges and exchanges halos across rank
+    boundaries. Wan resampling and diffusers Downsample2D both use this operation.
     """
     padding = conv.padding
     if (isinstance(padding, int) and padding != 0) or (
@@ -133,7 +132,7 @@ class Downsample2DAdapter(nn.Module):
 
 
 class _CausalResampleDownAdapter(nn.Module):
-    """Shards a resample used to downsample: a temporal convolution and a strided spatial one
+    """Shards a downsampling resample containing temporal and strided spatial convolutions.
 
     The spatial half is a zero pad of (0, 1, 0, 1) followed by a stride-2 convolution with no
     padding of its own. Splitting that needs the pad and the convolution taken together, since a

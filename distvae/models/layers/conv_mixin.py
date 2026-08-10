@@ -80,7 +80,7 @@ class PatchConvMixin:
         input: Tensor,
         halo_buffer: dict = None
     ):
-        """Work out the halo this rank needs, exchange it, and return the extended input.
+        """Exchange this rank's halo and return the input extended with neighboring rows.
 
         A strided conv all-gathers each rank's patch size to build the cumulative boundaries
         its halo widths and its output cropping both turn on. A unit-stride conv derives the

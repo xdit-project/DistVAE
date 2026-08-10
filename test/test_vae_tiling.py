@@ -266,10 +266,8 @@ class TestLatentRows(unittest.TestCase):
         self.assertIsNone(vae_tiling.latent_rows(vae, vae_tiling.tile_plan(vae, 128)))
 
     def test_with_no_plan_the_vae_s_own_window_is_the_plan(self):
-        # How the caller asks about a window no flag set: a VAE tiling at its own default, or one
-        # a model turned tiling on for at load. That composition is the dangerous one - DistVAE
-        # splits the rows of every tile it is handed - and it used to go unchecked because there
-        # was no plan to check.
+        # DistVAE must validate the VAE's default window when tiling was enabled before the
+        # integration applied an explicit plan; every tile is subsequently split across ranks.
         self.assertEqual(vae_tiling.latent_rows(legacy_pair_vae()), 32)
         self.assertEqual(vae_tiling.latent_rows(stride_vae()), 32)
         self.assertIsNone(vae_tiling.latent_rows(StubVAE(tile_overlap_factor=0.25)))
@@ -330,8 +328,8 @@ class TestSnapping(unittest.TestCase):
 class TestEverySupportedVAE(unittest.TestCase):
     """Every supported VAE accepts a resized tile window without changing output size"""
 
-    # A tiny stand-in per class, small enough to decode on CPU. LTX2 pins its compression ratio
-    # because the config default describes more encoder stages than its decoder upsamples.
+    # Minimal configs preserve each class's decoder topology. LTX2 pins its compression ratio
+    # because the default describes more encoder stages than its decoder upsamples.
     VAES = {
         "AutoencoderKL": (
             dict(
@@ -643,11 +641,9 @@ class TestTiledDecode(unittest.TestCase):
     def test_it_decodes_a_tile_at_a_time_exactly_as_upstream_does(self):
         import torch
 
-        # This loop exists to hand the calls round, not to compute differently, so with nobody to
-        # hand them to it has to be indistinguishable from the loop it replaces - to the bit, not
-        # to a tolerance. Tiles used to be stacked onto the batch dimension here, which cost a
-        # ~1e-5 residue because a convolution blocks off the rows it is handed; a tile to a call
-        # spends nothing to be exact.
+        # With no dispatcher, this loop must preserve the VAE's call boundaries and produce a
+        # bit-identical sample. Each tile remains a separate decoder call because convolution
+        # arithmetic depends on the rows grouped into that call.
         for name in self.FAMILY:
             with self.subTest(vae=name):
                 vae, latents = self._tiled_vae(name)

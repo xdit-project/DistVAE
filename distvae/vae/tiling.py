@@ -384,9 +384,8 @@ def tile_overlap_plan(vae, overlap: float) -> Optional[dict]:
 def widest_tile_overlap(vae) -> Optional[float]:
     """The most overlap this VAE can step by, so a refusal can name one that would be accepted
 
-    Reachability is one-sided: less overlap is a wider step, and a wider step is never the one
-    that fails, so walking down from a refused overlap finds where it turns. To a hundredth,
-    which is finer than this is set by hand.
+    Less overlap creates a wider step, so candidates are checked in descending hundredths until
+    one is accepted. Hundredths are finer than the manual setting precision.
     """
     for hundredths in range(99, -1, -1):
         overlap = hundredths / 100

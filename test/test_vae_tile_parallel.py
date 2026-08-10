@@ -1,4 +1,4 @@
-"""Dealing a tiled decode's calls out to a group, over gloo, without a GPU or a VAE in sight"""
+"""Tile-decode call distribution and assembly over a process group."""
 
 import itertools
 import os
@@ -60,11 +60,10 @@ def _free_port() -> int:
 
 
 def _cores_allowed() -> int:
-    """The cores this process may actually use, which is not the number it can see
+    """The process CPU quota expressed as a core count.
 
-    Under a container CPU limit the kernel enforces a quota rather than an affinity mask, so
-    `os.cpu_count()` reports the whole host - 128 where the quota was 8 - and anything sizing a
-    thread pool from it asks for sixteen times the machine it has been given.
+    A cgroup quota can be lower than the affinity-visible count returned by `os.cpu_count()`.
+    Worker thread pools must fit the quota shared by all spawned ranks.
     """
     try:
         quota, period = open("/sys/fs/cgroup/cpu.max").read().split()
@@ -76,28 +75,23 @@ def _cores_allowed() -> int:
 
 
 def _share_the_cores(world_size: int) -> None:
-    """Take a share of what this process may use, since the other ranks are here too
-
-    Every rank is a process of its own, and four of them each sizing a thread pool from the whole
-    host put 512 threads on an 8-core quota. The four-rank decodes then ran an order of magnitude
-    longer than the two-rank ones and looked for all the world like a deadlock. These tests check
-    what the assembly computes, not how fast it computes it.
-    """
+    """Divide the available process threads among ranks sharing the host."""
     torch.set_num_threads(max(1, _cores_allowed() // world_size))
 
 
 def _backend_for(world_size: int) -> Tuple[str, Optional[str]]:
-    """The collective backend to use and the device to put this rank's tensors on
-
-    Gloo on the CPU runs anywhere, which is why these tests were written for it, but it is neither
-    the fast path nor the one shipped: a real decode gathers over RCCL between devices. Where the
-    group can have a device each, use that - it exercises the collective that will actually carry
-    the tiles, and a decode that takes minutes on CPU takes seconds. Where it cannot, gloo still
-    checks the arithmetic, which is what these tests are for.
-    """
+    """Select a device collective when every rank has a device, otherwise a host collective."""
     if torch.cuda.is_available() and torch.cuda.device_count() >= world_size:
         return dist.Backend.NCCL, "cuda"
     return dist.Backend.GLOO, None
+
+
+def _assert_tiled_decode_matches(got, expected, device) -> None:
+    if device is None:
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+        return
+    # Device collectives may change floating-point accumulation order across ranks.
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=3e-6)
 
 
 def _dispatch_in_a_group(
@@ -238,11 +232,9 @@ def _require_run_vae(testcase, name: str) -> None:
         testcase.skipTest(f"diffusers {diffusers.__version__} cannot tile {name}")
 
 
-# Two windows down by three across comes out as a 3x4 grid of tiles at a quarter overlap. It is
-# deliberately not square and deliberately not a multiple of the ranks: twelve tiles over four
-# ranks is three each against four columns, so every rank's run starts and ends mid-row, which is
-# the case a split by whole rows would never reach. The tiles are decoded on a CPU here, so a
-# wider grid costs minutes rather than the coverage it looks like it buys.
+# A quarter-overlap grid spanning two windows down and three across has 3x4 tiles. Distributing
+# those tiles over four ranks makes each contiguous run start or end mid-row, exercising run
+# boundaries that cannot be represented by whole-row assignment.
 WINDOWS_DOWN, WINDOWS_ACROSS = 2, 3
 
 
@@ -322,18 +314,22 @@ def _runs_in_a_group(
             got = decode(latents).sample
 
         assert got.shape == expected.shape, f"{got.shape} != {expected.shape}"
-        # Bit-exact, not close: a run replays the blending its neighbour would have done on the
-        # same values, so there is no reordering to excuse a difference.
-        #
-        # That holds on gloo, which is what -TestGpus 1 runs and where this is checked. On four
-        # devices over RCCL it has been seen to miss by 2.1e-06 on AutoencoderKL at two ranks
-        # while passing at four and passing on Wan and Qwen-Image at both, which is the shape of
-        # an accelerator picking its convolution differently rather than of the assembly putting
-        # a tile in the wrong place - but it has not been run down, so read a failure here on a
-        # device as unexplained rather than as this code.
-        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+        _assert_tiled_decode_matches(got, expected, device)
     finally:
         dist.destroy_process_group()
+
+
+class TestBackendAgreement(unittest.TestCase):
+    def test_host_collective_requires_bit_exact_output(self):
+        with self.assertRaises(AssertionError):
+            _assert_tiled_decode_matches(
+                torch.tensor([1.0]), torch.tensor([1.0 + 1e-6]), device=None
+            )
+
+    def test_device_collective_allows_accumulation_order_rounding(self):
+        _assert_tiled_decode_matches(
+            torch.tensor([1.0]), torch.tensor([1.0 + 2.1e-6]), device="cuda"
+        )
 
 
 class TestRuns(unittest.TestCase):

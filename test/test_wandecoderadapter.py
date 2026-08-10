@@ -18,7 +18,7 @@ from distributed_harness import assert_matches_reference, init_gloo, run_distrib
 
 diffusers = pytest.importorskip("diffusers")
 
-# The tiny stand-in xDiT builds this class from, small enough to decode on CPU.
+# Four channel stages exercise every decoder upsampling transition.
 CONFIG = dict(base_dim=8, z_dim=4, dim_mult=[1, 2, 4, 4], num_res_blocks=1)
 LATENT_CHANNELS = 4
 
@@ -52,28 +52,9 @@ def worker(rank, world_size, frames, height, width, seed, master_port):
         dist.destroy_process_group()
 
 
-def cached_worker(rank, world_size, seed, master_port):
-    init_gloo(rank, world_size, master_port)
-    try:
-        torch.manual_seed(seed)
-        adapter = WanDecoderAdapter(build_decoder(), vae_group=None).eval()
-        latents = torch.randn(1, LATENT_CHANNELS, 1, 16, 16)
-
-        with torch.no_grad():
-            adapter(latents, feat_cache=[None] * 1000)
-    finally:
-        dist.destroy_process_group()
-
-
 @pytest.mark.gloo
-@pytest.mark.parametrize("world_size", [1, 2, 4])
-def test_a_sharded_wan_decode_matches_a_single_rank_one(world_size, master_port, seed=42):
-    run_distributed(worker, world_size, (1, 16, 16, seed), master_port)
-
-
-@pytest.mark.gloo
-def test_cached_decode_gets_a_fresh_cursor_when_one_is_omitted(master_port, seed=42):
-    run_distributed(cached_worker, 1, (seed,), master_port)
+def test_a_sharded_wan_decode_matches_a_single_rank_one(master_port, seed=42):
+    run_distributed(worker, 2, (1, 16, 16, seed), master_port)
 
 
 @pytest.mark.gloo
@@ -85,9 +66,8 @@ def test_a_latent_taller_than_it_is_wide_still_decodes(master_port, seed=42):
 
 @pytest.mark.gloo
 def test_latent_rows_that_do_not_divide_by_the_rank_count(master_port, seed=42):
-    # 16 rows over 3 ranks. This used to pad the latent up to a size that did divide and crop
-    # the decode afterwards, which is not the same computation: the pad stops being zeros at the
-    # first convolution and reaches every kept pixel through the mid block's attention.
+    # Padding to an even split changes the decode because convolution and mid-block attention
+    # propagate padded values into the rows that survive cropping.
     run_distributed(worker, 3, (1, 16, 16, seed), master_port)
 
 

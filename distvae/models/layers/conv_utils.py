@@ -405,10 +405,8 @@ def exchange_halo(
             )
         ops.append(dist.P2POp(dist.irecv, bottom_halo_recv, global_rank_of_next, group=vae_group))
 
-    # One batch rather than four separate calls. The two directions are independent, so blocking
-    # in the receive from the previous rank before even offering the send to the previous rank
-    # exposed a round trip that did not have to be exposed; and NCCL builds a fresh two-rank
-    # communicator for every unbatched point-to-point op issued on a wider group.
+    # Batching exposes both independent directions at once and lets NCCL reuse the wider group's
+    # communicator instead of constructing one for each point-to-point operation.
     if ops:
         for work in dist.batch_isend_irecv(ops):
             work.wait()

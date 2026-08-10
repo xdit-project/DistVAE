@@ -27,8 +27,8 @@ class TestCacheCursor(unittest.TestCase):
         first, second = cache_cursor(None), cache_cursor(None)
         self.assertEqual(first, [0])
         self.assertEqual(second, [0])
-        # Not merely equal: the blocks advance the cursor in place as they walk the cache, so two
-        # decodes sharing one list is a second decode reading from where the first stopped.
+        # Identity matters because blocks advance the cursor in place while walking the cache.
+        # Sharing one list would make the second decode start where the first stopped.
         self.assertIsNot(first, second)
 
     def test_a_cursor_handed_in_is_the_one_used(self):

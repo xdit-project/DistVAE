@@ -77,10 +77,8 @@ class Patchify(nn.Module):
     along and the rows a rank produces are its own. Bands therefore differ in size when they do
     not divide evenly, which is why the gathers pad for transport.
 
-    Padding the tensor up to a size that did divide would be simpler and is what this used to
-    do, but it is not the same computation: after the first convolution the pad is no longer
-    zeros but the network's answer to zeros, and it reaches the kept rows through every
-    receptive field and every attention that follows, however much is cropped afterwards.
+    Padding to an even split changes the computation: convolution and attention propagate the
+    network's response to padded values into retained rows before any final crop.
     """
 
     def __init__(

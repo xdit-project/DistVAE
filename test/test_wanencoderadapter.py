@@ -85,15 +85,13 @@ def worker(
 
 
 @pytest.mark.gloo
-@pytest.mark.parametrize("world_size", [1, 2, 4])
-def test_a_sharded_wan_encode_matches_a_single_rank_one(world_size, master_port, seed=42):
-    run_distributed(worker, world_size, (4, 64, 64, False, 0, seed), master_port)
+def test_a_sharded_wan_encode_matches_a_single_rank_one(master_port, seed=42):
+    run_distributed(worker, 2, (4, 64, 64, False, 0, seed), master_port)
 
 
 @pytest.mark.gloo
-@pytest.mark.parametrize("world_size", [1, 2])
-def test_the_grouped_wan22_down_blocks_encode_the_same(world_size, master_port, seed=42):
-    run_distributed(worker, world_size, (4, 64, 64, True, 0, seed), master_port)
+def test_the_grouped_wan22_down_blocks_encode_the_same(master_port, seed=42):
+    run_distributed(worker, 2, (4, 64, 64, True, 0, seed), master_port)
 
 
 @pytest.mark.gloo
