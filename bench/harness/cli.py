@@ -132,6 +132,25 @@ def _shape(spec, cell):
     }
 
 
+def _local_error(caught, rank):
+    return {
+        "type": type(caught).__name__,
+        "message": str(caught),
+        "rank": int(rank),
+    }
+
+
+def _aggregate_errors(failures):
+    details = [failure for failure in failures if failure is not None]
+    if not details:
+        return None
+    return {
+        **details[0],
+        "failed_ranks": [failure["rank"] for failure in details],
+        "failures": details,
+    }
+
+
 def _describe(args, cells):
     spec = catalog.FAMILIES[args.family]
     records = []
@@ -171,11 +190,11 @@ def _measure(args, cells, runtime):
             )
             measurement = {"tile_shape_costs": costs}
         except (Exception, SystemExit) as caught:
-            error = {"type": type(caught).__name__, "message": str(caught)}
+            error = _local_error(caught, runtime.rank)
             measurement = {}
         failures = [None] * runtime.world_size
         dist.all_gather_object(failures, error, group=runtime.group)
-        first_error = next((failure for failure in failures if failure), None)
+        aggregate_error = _aggregate_errors(failures)
         composition = {
             "name": "tile-shape-costs",
             "execution": "tile-shape-costs",
@@ -190,7 +209,7 @@ def _measure(args, cells, runtime):
             {"height": None, "width": None, "frames": costs.get("frames")},
             composition,
             measurement,
-            first_error,
+            aggregate_error,
             dtype=args.dtype,
             world_size=runtime.world_size,
         )
@@ -212,7 +231,7 @@ def _measure(args, cells, runtime):
                 args, spec, cell, runtime, references, say
             )
         except (Exception, SystemExit) as caught:
-            error = {"type": type(caught).__name__, "message": str(caught)}
+            error = _local_error(caught, runtime.rank)
             print(
                 f"[rank {runtime.rank}] cell {cell['name']} failed: "
                 f"{error['type']}: {error['message']}",
@@ -223,14 +242,14 @@ def _measure(args, cells, runtime):
 
         failures = [None] * runtime.world_size
         dist.all_gather_object(failures, error, group=runtime.group)
-        first_error = next((failure for failure in failures if failure), None)
+        aggregate_error = _aggregate_errors(failures)
         record = report.make_record(
             args.family,
             args.half,
             _shape(spec, cell),
             composition,
             measurement,
-            first_error,
+            aggregate_error,
             dtype=args.dtype,
             world_size=runtime.world_size,
         )

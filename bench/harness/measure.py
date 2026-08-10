@@ -530,6 +530,7 @@ def agreement_with(actual, reference, dtype, max_rel, tiled):
     if tuple(actual.shape) != tuple(reference.shape):
         agreement = {
             "ok": False,
+            "disagreement_type": "shape",
             "why": f"shape {tuple(actual.shape)} != {tuple(reference.shape)}",
         }
     else:
@@ -539,6 +540,7 @@ def agreement_with(actual, reference, dtype, max_rel, tiled):
         relative = diff.max().item() / scale if scale else 0.0
         agreement = {
             "ok": bool(relative <= tolerance),
+            "disagreement_type": "numerical",
             "max_abs": diff.max().item(),
             "mean_abs": diff.mean().item(),
             "reference_max_abs": scale,

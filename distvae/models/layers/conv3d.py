@@ -1,10 +1,10 @@
-"""PatchConv3d: 5D convolution with patch-dim parallelism for distributed VAE.
+"""PatchConv3d: 5D convolution with H/W patch parallelism for distributed VAE.
 
 When world size is 1, behaves as nn.Conv3d. When world size > 1, gathers patch
-sizes, exchanges halos along the patch dimension (F, H, or W), then either runs a
+sizes, exchanges halos along the patch dimension (H or W), then either runs a
 single conv and crops (direct path) or splits the padded input into overlapping
 chunks, convs each chunk, concatenates, and crops (chunked path). Supports
-patch_dim in {-3, -2, -1, 2, 3, 4} for F, H, W. Dilation is not supported.
+patch_dim in {-2, -1, 3, 4} for H and W. Dilation is not supported.
 """
 
 from typing import Optional, Tuple, Union
@@ -27,12 +27,13 @@ from distvae.utils import ParallelContext, normalize_patch_dim
 
 
 class PatchConv3d(nn.Conv3d, PatchConvMixin):
-    """3D convolution with patch-dim parallelism; subclasses nn.Conv3d and PatchConvMixin.
+    """3D convolution with H/W patch parallelism.
 
-    patch_dim selects which spatial dimension is split across ranks (F=frame, H=height,
-    W=width). block_size controls when the chunked path is used: 0 or all spatial
-    sizes <= block_size => direct path (one conv + crop); otherwise chunked path.
-    Dilation must be 1.
+    ``patch_dim`` selects height or width for splitting across ranks. ``block_size``
+    controls local convolution chunking across all three convolution dimensions:
+    an integer applies one limit to F, H, and W, while a tuple is ordered (F, H, W).
+    Zero, or all dimensions fitting their limits, selects the direct path. Dilation
+    must be 1.
     """
 
     def __init__(
@@ -52,7 +53,11 @@ class PatchConv3d(nn.Conv3d, PatchConvMixin):
         patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ) -> None:
-        """patch_dim: which spatial dim is split (F=-3/3, H=-2/2, W=-1/4). block_size: 0 => prefer direct path; int or (F,H,W) => chunked when any spatial > block_size."""
+        """Initialize H/W sharding and optional local (F, H, W) chunk limits.
+
+        ``patch_dim`` accepts H (-2 or 3) or W (-1 or 4). ``block_size`` is zero
+        for the direct path, an integer shared by F/H/W, or an (F, H, W) tuple.
+        """
         if isinstance(dilation, int):
             assert dilation == 1, "dilation is not supported in PatchConv3d"
         else:

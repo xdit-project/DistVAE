@@ -711,14 +711,88 @@ def test_measurement_records_effective_dtype_and_world_size(monkeypatch, shape_c
         assert record["measurement"]["tile_shape_costs"]["frames"] is None
 
 
-def test_tiled_agreement_keeps_raw_verdict_without_enforcement():
-    agreement = {"ok": False, "max_rel_to_scale": 0.2}
+@pytest.mark.parametrize("shape_costs", [False, True])
+def test_distributed_cell_errors_preserve_per_rank_details(
+    monkeypatch, capsys, shape_costs
+):
+    args = SimpleNamespace(
+        family="kl",
+        half="decoder",
+        dtype="float32",
+        frames=1,
+        tile_shape_costs=shape_costs,
+    )
+    runtime = SimpleNamespace(
+        rank=0,
+        world_size=2,
+        group=object(),
+        device_api=SimpleNamespace(empty_cache=lambda: None),
+    )
+    cell = {
+        "name": "failing-cell",
+        "height": 512,
+        "width": 512,
+        "frames": 1,
+    }
+    peer_error = {"type": "ValueError", "message": "peer failure", "rank": 1}
 
-    report.set_agreement_policy(agreement, tiling_enabled=True)
+    def gather(values, value, **kwargs):
+        values[:] = [value, peer_error]
 
+    monkeypatch.setattr(cli.dist, "all_gather_object", gather)
+    if shape_costs:
+        monkeypatch.setattr(
+            measure,
+            "tile_shape_costs",
+            lambda *args: (_ for _ in ()).throw(RuntimeError("local failure")),
+        )
+    else:
+        monkeypatch.setattr(
+            measure,
+            "measure_cell",
+            lambda *args: (_ for _ in ()).throw(RuntimeError("local failure")),
+        )
+
+    [record] = cli._measure(args, [cell], runtime)
+
+    assert record["error"]["rank"] == 0
+    assert record["error"]["failed_ranks"] == [0, 1]
+    assert record["error"]["failures"] == [
+        {"type": "RuntimeError", "message": "local failure", "rank": 0},
+        peer_error,
+    ]
+    assert report.report_status([record]) == 1
+    assert "RuntimeError: local failure" in capsys.readouterr().out
+
+
+def test_tiled_numerical_disagreement_keeps_raw_verdict_without_enforcement():
+    agreement = measure.agreement_with(
+        measure.torch.tensor([2.0]),
+        measure.torch.tensor([1.0]),
+        "float32",
+        max_rel=0.1,
+        tiled=True,
+    )
+
+    assert agreement["disagreement_type"] == "numerical"
     assert agreement["ok"] is False
     assert agreement["enforced"] is False
     assert report.report_status([{"measurement": {"agreement": agreement}}]) == 0
+
+
+def test_tiled_shape_mismatch_is_enforced():
+    agreement = measure.agreement_with(
+        measure.torch.zeros(1, 2),
+        measure.torch.zeros(1, 3),
+        "float32",
+        max_rel=None,
+        tiled=True,
+    )
+
+    assert agreement["disagreement_type"] == "shape"
+    assert agreement["ok"] is False
+    assert agreement["enforced"] is True
+    assert report.report_status([{"measurement": {"agreement": agreement}}]) == 1
 
 
 def test_enforced_agreement_and_execution_errors_fail():

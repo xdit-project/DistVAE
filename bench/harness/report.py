@@ -83,8 +83,9 @@ def make_record(
 
 def set_agreement_policy(agreement, tiling_enabled):
     """Record whether the raw agreement verdict controls process success."""
-    agreement["enforced"] = not tiling_enabled
-    if tiling_enabled:
+    numerical_difference = agreement.get("disagreement_type") == "numerical"
+    agreement["enforced"] = not (tiling_enabled and numerical_difference)
+    if tiling_enabled and numerical_difference:
         agreement["measured_not_enforced"] = (
             "tiling changes arithmetic; the measured difference remains reported"
         )
