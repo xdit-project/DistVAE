@@ -246,6 +246,106 @@ class TestTilePlan(unittest.TestCase):
         self.assertEqual(plan["tile_sample_stride_height"], 384)
 
 
+class TestTileShapePlan(unittest.TestCase):
+
+    def test_a_legacy_square_window_can_be_planned_rectangularly(self):
+        vae = legacy_pair_vae()
+
+        plan = vae_tiling.tile_shape_plan(vae, 128, 192)
+
+        self.assertEqual(
+            plan,
+            {
+                "tile_sample_min_size": 128,
+                "tile_sample_min_height": 128,
+                "tile_sample_min_width": 192,
+                "tile_latent_min_size": 16,
+                "tile_latent_min_height": 16,
+                "tile_latent_min_width": 24,
+            },
+        )
+        vae_tiling.apply_tile_plan(vae, plan)
+        self.assertEqual(
+            vae_tiling.overlap_windows(vae), ((16, 24), (128, 192))
+        )
+
+    def test_a_stored_stride_is_rescaled_independently_on_each_axis(self):
+        self.assertEqual(
+            vae_tiling.tile_shape_plan(stride_vae(), 128, 192),
+            {
+                "tile_sample_min_height": 128,
+                "tile_sample_min_width": 192,
+                "tile_sample_stride_height": 96,
+                "tile_sample_stride_width": 144,
+            },
+        )
+
+    def test_either_non_integral_axis_rejects_the_rectangle(self):
+        self.assertIsNone(
+            vae_tiling.tile_shape_plan(legacy_pair_vae(), 128, 100)
+        )
+        # The scaled width stride is 99 pixels, which cannot step an 8-pixel
+        # latent grid without truncating.
+        self.assertIsNone(vae_tiling.tile_shape_plan(stride_vae(), 128, 132))
+
+    def test_the_shape_reader_never_squares_a_native_rectangle(self):
+        self.assertEqual(vae_tiling.tile_shape(legacy_pair_vae()), (256, 256))
+        self.assertEqual(vae_tiling.tile_shape(asymmetric_vae()), (240, 360))
+
+    def test_scalar_planning_is_unchanged(self):
+        self.assertEqual(
+            vae_tiling.tile_plan(legacy_pair_vae(), 128),
+            {
+                "tile_sample_min_size": 128,
+                "tile_latent_min_size": 16,
+            },
+        )
+        self.assertIsNone(vae_tiling.tile_plan(asymmetric_vae(), 128))
+
+    def test_rectangular_legacy_windows_install_a_local_replacement(self):
+        import torch
+        import torch.nn.functional as functional
+
+        vae = overlap_factor_vae()
+        vae.decoder = lambda tile: functional.interpolate(
+            tile, scale_factor=8, mode="nearest"
+        )
+        plan = vae_tiling.tile_shape_plan(vae, 128, 192)
+        vae_tiling.apply_tile_plan(vae, plan)
+
+        decode = vae_tiling.local_tiled_decode_for(vae)
+
+        self.assertIsNotNone(decode)
+        sample = decode(torch.randn(1, 4, 24, 32)).sample
+        self.assertEqual(sample.shape, (1, 4, 192, 256))
+
+    def test_legacy_threshold_enters_tiling_when_the_smaller_axis_is_exceeded(self):
+        import torch
+        from diffusers.models.autoencoders.vae import DecoderOutput
+
+        kwargs, _, _ = TestEverySupportedVAE.VAES["AutoencoderKL"]
+        vae = _diffusers_vae(self, "AutoencoderKL", kwargs, require_tiling=True)
+        vae.enable_tiling()
+        plan = vae_tiling.tile_shape_plan(vae, 128, 384)
+        vae_tiling.apply_tile_plan(vae, plan)
+        vae.tiled_decode = mock.Mock(
+            return_value=DecoderOutput(sample=torch.empty(1, 4, 136, 192))
+        )
+
+        vae._decode(torch.randn(1, 4, 17, 24))
+
+        self.assertEqual(vae.tile_latent_min_size, 16)
+        vae.tiled_decode.assert_called_once()
+
+    def test_native_keyed_rectangles_keep_the_upstream_local_loop(self):
+        vae = overlap_keyed_vae()
+        plan = vae_tiling.tile_shape_plan(vae, 128, 384)
+        vae_tiling.apply_tile_plan(vae, plan)
+
+        self.assertIsNone(vae_tiling.local_tiled_decode_for(vae))
+        self.assertIsNotNone(vae_tiling.tiled_decode_for(vae))
+
+
 class TestLatentRows(unittest.TestCase):
     """How many rows a planned tile leaves available for spatial sharding"""
 

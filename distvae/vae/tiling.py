@@ -82,6 +82,18 @@ def tile_window(vae) -> Optional[int]:
     return windows[0]
 
 
+def tile_shape(vae) -> Optional[Tuple[int, int]]:
+    """The VAE's pixel-space tile window as (height, width), if it carries one."""
+    height = getattr(vae, "tile_sample_min_height", None)
+    width = getattr(vae, "tile_sample_min_width", None)
+    if all(isinstance(value, int) and value > 0 for value in (height, width)):
+        return height, width
+    square = getattr(vae, "tile_sample_min_size", None)
+    if isinstance(square, int) and square > 0:
+        return square, square
+    return None
+
+
 def _tile_defaults(vae) -> dict:
     """Every tiling attribute the VAE carries, as the reference to rescale from"""
     defaults = {}
@@ -148,6 +160,97 @@ def tile_plan(vae, pixels: int) -> Optional[dict]:
     strides = [plan[attr] for attr in STRIDE_ATTRS if attr in plan]
     if ratio is not None and min([pixels] + strides) < ratio:
         return None
+    return plan
+
+
+def tile_shape_plan(vae, height: int, width: int) -> Optional[dict]:
+    """Tiling attributes rescaled independently to an exact (height, width) window.
+
+    Scalar-window VAEs receive complete per-axis attributes for DistVAE's replacement overlap
+    loop. VAEs that already carry per-axis windows retain their native attribute spelling.
+    """
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in (height, width)
+    ):
+        return None
+
+    defaults = _tile_defaults(vae)
+    legacy_scalar = all(
+        attr in defaults for attr in ("tile_sample_min_size", "tile_latent_min_size")
+    )
+    keyed = all(
+        attr in defaults
+        for attr in ("tile_sample_min_height", "tile_sample_min_width")
+    )
+    if keyed:
+        source_pixels = (
+            defaults["tile_sample_min_height"],
+            defaults["tile_sample_min_width"],
+        )
+        pixel_attrs = ("tile_sample_min_height", "tile_sample_min_width")
+        latent_attrs = ("tile_latent_min_height", "tile_latent_min_width")
+    elif "tile_sample_min_size" in defaults:
+        source_pixels = (defaults["tile_sample_min_size"],) * 2
+        pixel_attrs = ("tile_sample_min_height", "tile_sample_min_width")
+        latent_attrs = ("tile_latent_min_height", "tile_latent_min_width")
+    else:
+        return None
+
+    targets = (height, width)
+    plan = dict(zip(pixel_attrs, targets))
+    scalar_latent = defaults.get("tile_latent_min_size")
+    factors = (
+        defaults.get("tile_overlap_factor_height", defaults.get("tile_overlap_factor")),
+        defaults.get("tile_overlap_factor_width", defaults.get("tile_overlap_factor")),
+    )
+
+    for axis, (target, source) in enumerate(zip(targets, source_pixels)):
+        latent_source = defaults.get(latent_attrs[axis], scalar_latent)
+        if latent_source is not None:
+            latent = target * latent_source / source
+            if latent < 1 or not _is_whole(latent):
+                return None
+            latent = round(latent)
+            factor = factors[axis]
+            if (
+                isinstance(factor, float)
+                and factor < 1.0
+                and not _overlap_lands(latent, target, factor)
+            ):
+                return None
+            plan[latent_attrs[axis]] = latent
+
+        stride_attr = STRIDE_ATTRS[axis]
+        stride_source = defaults.get(stride_attr)
+        if stride_source is not None:
+            stride = target * stride_source / source
+            if stride < 1 or not _is_whole(stride):
+                return None
+            plan[stride_attr] = round(stride)
+
+    if legacy_scalar:
+        # AutoencoderKL and Flux decide whether to enter tiled_decode with one scalar threshold.
+        # The smaller axis is conservative: crossing either requested window must cross it, while
+        # overlap_windows reads the exact keyed rectangle above once the loop is entered.
+        plan["tile_sample_min_size"] = min(targets)
+        plan["tile_latent_min_size"] = min(
+            plan["tile_latent_min_height"], plan["tile_latent_min_width"]
+        )
+
+    granularity = _stride_granularity(vae) if any(
+        attr in plan for attr in STRIDE_ATTRS
+    ) else None
+    if granularity is not None and any(
+        value % granularity
+        for value in targets + tuple(plan[attr] for attr in STRIDE_ATTRS if attr in plan)
+    ):
+        return None
+
+    ratio = spatial_ratio(vae)
+    if ratio is not None and not any(attr in plan for attr in LATENT_ATTRS):
+        if any(target < ratio or target % ratio for target in targets):
+            return None
     return plan
 
 
@@ -226,10 +329,6 @@ def overlap_windows(vae) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
     1.5 carries an edge per axis. A square edge is the same number on both axes, so reading both
     into a pair lets one loop walk either.
     """
-    square = getattr(vae, "tile_latent_min_size", None)
-    if isinstance(square, int):
-        pixels = getattr(vae, "tile_sample_min_size", None)
-        return ((square, square), (pixels, pixels)) if isinstance(pixels, int) else None
     keyed = [
         getattr(vae, attr, None)
         for attr in (
@@ -239,9 +338,17 @@ def overlap_windows(vae) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
             "tile_sample_min_width",
         )
     ]
-    if not all(isinstance(value, int) for value in keyed):
-        return None
-    return (keyed[0], keyed[1]), (keyed[2], keyed[3])
+    if all(isinstance(value, int) and value > 0 for value in keyed):
+        return (keyed[0], keyed[1]), (keyed[2], keyed[3])
+    square = getattr(vae, "tile_latent_min_size", None)
+    if isinstance(square, int) and square > 0:
+        pixels = getattr(vae, "tile_sample_min_size", None)
+        return (
+            ((square, square), (pixels, pixels))
+            if isinstance(pixels, int) and pixels > 0
+            else None
+        )
+    return None
 
 
 def tiles_by_overlap_factor(vae) -> bool:
@@ -527,6 +634,29 @@ def tiled_decode_for(
     if dispatch is None and assemble is None:
         return None
     return strided_tiled_decode(vae, dispatch, assemble)
+
+
+def local_tiled_decode_for(vae) -> Optional[Callable]:
+    """A local replacement only when a legacy scalar VAE holds a rectangular plan."""
+    keyed = [
+        getattr(vae, attr, None)
+        for attr in (
+            "tile_latent_min_height",
+            "tile_latent_min_width",
+            "tile_sample_min_height",
+            "tile_sample_min_width",
+        )
+    ]
+    if not all(isinstance(value, int) and value > 0 for value in keyed):
+        return None
+    if not all(
+        isinstance(getattr(vae, attr, None), int)
+        for attr in ("tile_latent_min_size", "tile_sample_min_size")
+    ):
+        return None
+    if keyed[2] == keyed[3]:
+        return None
+    return overlap_tiled_decode(vae)
 
 
 def _latent_areas(down, across, window, bounds) -> List[int]:
