@@ -49,6 +49,9 @@ def worker(
     world_size: int,
     patch_dim: int,
     block_size: int,
+    height: int,
+    width: int,
+    patch_scale_factor: int,
     seed: int,
     master_port: int,
 ) -> None:
@@ -62,12 +65,7 @@ def worker(
 
     torch.manual_seed(seed)
     in_ch, out_ch = 8, 8
-    n, h, w = 1, 16, 16
-    if patch_dim == -2:
-        assert h % world_size == 0, "H must split evenly for Patchify chunk"
-    else:
-        assert patch_dim == -1
-        assert w % world_size == 0, "W must split evenly for Patchify chunk"
+    n, h, w = 1, height, width
 
     x_full = torch.randn(n, in_ch, h, w, device=device, dtype=torch.float32)
     layer = WanZeroPadConv2d(
@@ -85,7 +83,7 @@ def worker(
         patch_dim=patch_dim,
     ).eval()
 
-    patchify = Patchify(patch_dim=patch_dim)
+    patchify = Patchify(patch_dim=patch_dim, scale_factor=patch_scale_factor)
     depatchify = DePatchify(patch_dim=patch_dim)
 
     try:
@@ -113,11 +111,23 @@ def _run_one(
     block_size: int,
     seed: int,
     master_port: int,
+    height: int = 16,
+    width: int = 16,
+    patch_scale_factor: int = 1,
 ) -> None:
     spawn(
         worker,
         nprocs=world_size,
-        args=(world_size, patch_dim, block_size, seed, master_port),
+        args=(
+            world_size,
+            patch_dim,
+            block_size,
+            height,
+            width,
+            patch_scale_factor,
+            seed,
+            master_port,
+        ),
         join=True,
     )
 
@@ -154,6 +164,24 @@ def test_wan_zeropadconv2d_gloo_chunked_path(master_port, seed=42):
         world_size=2,
         patch_dim=-2,
         block_size=4,
+        seed=seed,
+        master_port=master_port,
+    )
+
+
+@pytest.mark.gloo
+@pytest.mark.parametrize("patch_dim,block_size", [(-2, 0), (-2, 4), (-1, 0), (-1, 4)])
+def test_wan_zeropadconv2d_matches_reference_for_unequal_patch_bands(
+    patch_dim, block_size, master_port, seed=42
+):
+    height, width = (40, 16) if patch_dim == -2 else (16, 40)
+    _run_one(
+        world_size=3,
+        patch_dim=patch_dim,
+        block_size=block_size,
+        height=height,
+        width=width,
+        patch_scale_factor=8,
         seed=seed,
         master_port=master_port,
     )
