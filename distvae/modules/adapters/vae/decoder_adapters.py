@@ -1,11 +1,8 @@
-import time
 from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from torch.profiler import profile, ProfilerActivity
 from diffusers.models.autoencoders.vae import Decoder
 from diffusers.models.unets.unet_2d_blocks import UpDecoderBlock2D
 from diffusers.models.autoencoders.autoencoder_kl_wan import (
@@ -31,6 +28,7 @@ from distvae.modules.adapters.layers.conv_adapters import (
 )
 from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from distvae.modules.adapters.unets.unet_2d_blocks_adapters import UpDecoderBlock2DAdapter
+from distvae.modules.adapters.vae.causal_setup import CausalVAEAdapterSetup
 from distvae.modules.adapters.upsampling_adapters import (
     HunyuanVideo15UpBlockAdapter,
     HunyuanVideoUpBlockAdapter,
@@ -48,16 +46,10 @@ from distvae.modules.adapters.midblock_adapters import (
 )
 from distvae.modules.patch_utils import Patchify, DePatchify
 from distvae.utils import (
-    DistributedEnv,
     cache_cursor,
     normalize_patch_dim,
     parallel_context,
 )
-
-try:
-    import torch_musa
-except ModuleNotFoundError:
-    pass
 
 QwenImageUpBlock = block(QWEN_IMAGE, "QwenImageUpBlock")
 HunyuanVideoUpBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoUpBlock3D")
@@ -65,42 +57,12 @@ HunyuanVideo15UpBlock3D = block(HUNYUAN_VIDEO_15, "HunyuanVideo15UpBlock3D")
 LTX2VideoUpBlock3d = block(LTX2_VIDEO, "LTX2VideoUpBlock3d")
 
 
-def _decode(run, label: str, *, use_profiler: bool, verbose: bool):
-    """Run a decode, optionally under the torch profiler, and report what it cost"""
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    device_type = DistributedEnv.get_device_type()
-    start_time = time.time()
-    if use_profiler:
-        if device_type == "musa":
-            torch.musa.memory._record_memory_history(enabled=None)
-            activities = [ProfilerActivity.CPU, ProfilerActivity.MUSA]
-        else:
-            torch.cuda.memory._record_memory_history(enabled=None)
-            activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
-
-        with profile(
-            activities=activities,
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                f"./profile/patch_vae_{rank}"
-            ),
-            profile_memory=True,
-            with_stack=True,
-            record_shapes=True,
-        ) as prof:
-            output = run()
-        prof.export_memory_timeline(f"patch_vae_profiler_mem_{rank}.html")
-    else:
-        output = run()
-
-    elapsed_time = time.time() - start_time
-    peak_memory = DistributedEnv.get_peak_memory(device_type)
-
-    if verbose and rank == 0:
-        print(
-            f"{label}: [elapsed_time: {elapsed_time:.2f} sec, "
-            f"peak_memory: {peak_memory/1e9} GB]"
+def _reject_benchmark_options(use_profiler: bool, verbose: bool):
+    if use_profiler or verbose:
+        raise ValueError(
+            "Decoder adapter profiling and verbose timing moved to the bench harness; "
+            "run bench/distvae_bench.py for benchmark instrumentation."
         )
-    return output
 
 
 class DecoderAdapter(nn.Module):
@@ -115,6 +77,7 @@ class DecoderAdapter(nn.Module):
         patch_dim: int = -2,
     ):
         super().__init__()
+        _reject_benchmark_options(use_profiler, verbose)
         assert isinstance(decoder.conv_norm_out, nn.GroupNorm), "DecoderAdapter does not support normalization method except GroupNorm"
         for up_block in decoder.up_blocks:
             assert isinstance(up_block, UpDecoderBlock2D), "DecoderAdapter does not support up block except UpDecoderBlock2D"
@@ -144,8 +107,6 @@ class DecoderAdapter(nn.Module):
         )
         self.decoder.patch = Patchify(**options)
         self.decoder.depatch = DePatchify(**options)
-        self.use_profiler = use_profiler
-        self.verbose = verbose
         self.vae_group = vae_group
 
     def forward(
@@ -153,12 +114,7 @@ class DecoderAdapter(nn.Module):
         sample: torch.FloatTensor,
         latent_embeds: Optional[torch.FloatTensor] = None,
     ):
-        return _decode(
-            lambda: self.decoder(sample, latent_embeds),
-            "Decoder",
-            use_profiler=self.use_profiler,
-            verbose=self.verbose,
-        )
+        return self.decoder(sample, latent_embeds)
 
 
 class _CausalDecoderAdapter(nn.Module):
@@ -181,6 +137,7 @@ class _CausalDecoderAdapter(nn.Module):
     _takes_feature_cache = True
     # Of those that do, Wan alone also passes first_chunk, to tell the cache it is starting over.
     _takes_first_chunk = True
+    _setup_type = CausalVAEAdapterSetup
 
     def __init__(
         self,
@@ -193,51 +150,31 @@ class _CausalDecoderAdapter(nn.Module):
         patch_dim: int = -2,
     ):
         super().__init__()
-        adapter = type(self).__name__
-        patch_dim = normalize_patch_dim(patch_dim, 5, spatial_only=True)
-        self.patch_dim = patch_dim
-        self.parallel_context = parallel_context(vae_group, patch_dim, ndim=5)
-        # Bands differ in size where the rows do not divide by the rank count, so every
-        # convolution has to read the sizes rather than assume its neighbours match it.
-        options = dict(
-            patch_dim=patch_dim, parallel_context=self.parallel_context
+        _reject_benchmark_options(use_profiler, verbose)
+        setup = self._setup_type.create(
+            adapter=type(self).__name__,
+            conv_adapter=self._conv_adapter,
+            block_adapters=self._up_block_adapters,
+            conv_block_size=conv_block_size,
+            patch_dim=patch_dim,
+            vae_group=vae_group,
         )
+        self._setup = setup
+        self.patch_dim = setup.patch_dim
+        self.parallel_context = setup.parallel_context
         self.decoder = decoder
-        self.decoder.conv_in = self._conv_adapter(
-            decoder.conv_in, block_size=conv_block_size, **options
-        )
+        self.decoder.conv_in = setup.adapt_convolution(decoder.conv_in)
         self.decoder.mid_block = self._mid_adapter(
-            decoder.mid_block, conv_block_size=conv_block_size, **options
+            decoder.mid_block, conv_block_size=conv_block_size, **setup.options
         )
-        self.decoder.up_blocks = nn.ModuleList([
-            self._adapt_up_block(up_block, adapter, conv_block_size, options)
-            for up_block in decoder.up_blocks
-        ])
-        self.decoder.conv_out = self._conv_adapter(
-            decoder.conv_out, block_size=conv_block_size, **options
-        )
+        self.decoder.up_blocks = setup.adapt_blocks(decoder.up_blocks, "up")
+        self.decoder.conv_out = setup.adapt_convolution(decoder.conv_out)
         # HunyuanVideo ends on a GroupNorm, whose statistics span the axis being split. The RMS
         # norms the other families end on do not, and are left as they are.
-        if isinstance(getattr(decoder, "conv_norm_out", None), nn.GroupNorm):
-            self.decoder.conv_norm_out = GroupNormAdapter(
-                decoder.conv_norm_out, **options
-            )
-        self.patchify = Patchify(**options)
-        self.depatchify = DePatchify(**options)
-        self.use_profiler = use_profiler
-        self.verbose = verbose
+        if hasattr(decoder, "conv_norm_out"):
+            self.decoder.conv_norm_out = setup.adapt_group_norm(decoder.conv_norm_out)
+        self.patchify, self.depatchify = setup.patchers()
         self.vae_group = vae_group
-
-    @classmethod
-    def _adapt_up_block(cls, up_block, adapter, conv_block_size, options):
-        for block_type, block_adapter in cls._up_block_adapters:
-            if block_type is not None and isinstance(up_block, block_type):
-                return block_adapter(up_block, conv_block_size=conv_block_size, **options)
-        handled = ", ".join(t.__name__ for t, _ in cls._up_block_adapters if t is not None)
-        raise TypeError(
-            f"{adapter} cannot shard an up block of type {type(up_block).__name__}. "
-            f"It handles {handled or 'no up block type the installed diffusers provides'}."
-        )
 
     def _run_decoder(self, sample, feat_cache, feat_idx, first_chunk):
         if not self._takes_feature_cache:
@@ -268,15 +205,10 @@ class _CausalDecoderAdapter(nn.Module):
         first_chunk: bool = False,
         patchify: bool = True,
     ):
-        return _decode(
-            lambda: self._sharded_decode(
-                sample,
-                patchify,
-                lambda x: self._run_decoder(x, feat_cache, feat_idx, first_chunk),
-            ),
-            self._label,
-            use_profiler=self.use_profiler,
-            verbose=self.verbose,
+        return self._sharded_decode(
+            sample,
+            patchify,
+            lambda x: self._run_decoder(x, feat_cache, feat_idx, first_chunk),
         )
 
 
@@ -335,11 +267,6 @@ class LTX2VideoDecoderAdapter(_CausalDecoderAdapter):
         causal: Optional[bool] = None,
         patchify: bool = True,
     ):
-        return _decode(
-            lambda: self._sharded_decode(
-                hidden_states, patchify, lambda x: self.decoder(x, temb, causal)
-            ),
-            self._label,
-            use_profiler=self.use_profiler,
-            verbose=self.verbose,
+        return self._sharded_decode(
+            hidden_states, patchify, lambda x: self.decoder(x, temb, causal)
         )

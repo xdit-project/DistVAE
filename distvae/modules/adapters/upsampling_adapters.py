@@ -3,7 +3,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from distvae.utils import DistributedEnv, ParallelContext, cache_cursor
+from distvae.modules.adapters.adapter_utils import replace_child_convolution
+from distvae.utils import ParallelContext, cache_cursor
 from distvae.models.upsampling import PatchUpsample2D
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
@@ -261,9 +262,10 @@ class _PaddedCausalUpsampleAdapter(nn.Module):
             f"{adapter} does not support upsampler except {self._requires}"
         )
         self.upsampler = upsampler
-        upsampler.conv = self._conv_adapter(
-            upsampler.conv,
-            block_size=conv_block_size,
+        replace_child_convolution(
+            upsampler,
+            self._conv_adapter,
+            conv_block_size=conv_block_size,
             patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
@@ -361,9 +363,10 @@ class LTX2VideoUpsamplerAdapter(nn.Module):
             f"{adapter} does not support upsampler except {self._requires}"
         )
         self.upsampler = upsampler
-        upsampler.conv = LTX2VideoCausalConv3dAdapter(
-            upsampler.conv,
-            block_size=conv_block_size,
+        replace_child_convolution(
+            upsampler,
+            LTX2VideoCausalConv3dAdapter,
+            conv_block_size=conv_block_size,
             patch_dim=patch_dim,
             parallel_context=parallel_context,
         )

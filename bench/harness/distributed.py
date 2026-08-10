@@ -1,5 +1,6 @@
 """Distributed process lifecycle and exact collective accounting."""
 
+import importlib
 import os
 import sys
 from collections import defaultdict
@@ -8,6 +9,20 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+
+
+def accelerator_backend():
+    """Return the available accelerator API and its distributed backend."""
+    if torch.cuda.is_available():
+        return "cuda", torch.cuda, "nccl"
+    try:
+        importlib.import_module("torch_musa")
+    except ModuleNotFoundError as error:
+        raise RuntimeError("measurement requires CUDA or MUSA") from error
+    musa = getattr(torch, "musa", None)
+    if musa is None or not musa.is_available():
+        raise RuntimeError("measurement requires CUDA or MUSA")
+    return "musa", musa, "mccl"
 
 
 class CollectiveLog:
@@ -133,12 +148,12 @@ class Runtime:
     device: torch.device
     group: object
     log: CollectiveLog
+    device_api: object
 
     @classmethod
     def start(cls, timeout_min):
         """Initialize the accelerator process group used by measurements."""
-        if not torch.cuda.is_available():
-            raise RuntimeError("measurement requires CUDA; use --describe-only on CPU")
+        device_type, device_api, backend = accelerator_backend()
         missing = [name for name in ("RANK", "WORLD_SIZE") if name not in os.environ]
         if missing:
             raise RuntimeError(
@@ -148,10 +163,10 @@ class Runtime:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ.get("LOCAL_RANK", rank))
-        torch.cuda.set_device(local_rank)
-        device = torch.device("cuda", local_rank)
+        device_api.set_device(local_rank)
+        device = torch.device(device_type, local_rank)
         dist.init_process_group(
-            backend="nccl",
+            backend=backend,
             init_method="env://",
             timeout=timedelta(minutes=timeout_min),
         )
@@ -159,7 +174,7 @@ class Runtime:
         log.install()
         group = dist.group.WORLD
         dist.all_reduce(torch.zeros(1, device=device), group=group)
-        return cls(rank, world_size, local_rank, device, group, log)
+        return cls(rank, world_size, local_rank, device, group, log, device_api)
 
     def close(self):
         """Synchronize, restore wrapped calls, and destroy the process group."""

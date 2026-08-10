@@ -2,7 +2,6 @@
 
 import argparse
 
-import torch
 import torch.distributed as dist
 
 from . import arms, catalog, measure, report
@@ -75,6 +74,26 @@ def parser():
         "--phase-timing",
         action="store_true",
         help="measure decoder calls separately from tiled decode overhead",
+    )
+    value.add_argument(
+        "--profile",
+        action="store_true",
+        help="profile one selected VAE-half call outside the timed iterations",
+    )
+    value.add_argument(
+        "--profile-trace",
+        action="store_true",
+        help="export a harness-named Chrome trace; implies --profile",
+    )
+    value.add_argument(
+        "--profile-memory",
+        action="store_true",
+        help="export a harness-named memory timeline; implies --profile",
+    )
+    value.add_argument(
+        "--profile-dir",
+        default="bench-profile",
+        help="directory for requested profiler artifacts",
     )
     value.add_argument(
         "--tile-shape-costs",
@@ -200,7 +219,7 @@ def _measure(args, cells, runtime):
                 flush=True,
             )
             composition, measurement = dict(cell), {}
-        torch.cuda.empty_cache()
+        runtime.device_api.empty_cache()
 
         failures = [None] * runtime.world_size
         dist.all_gather_object(failures, error, group=runtime.group)

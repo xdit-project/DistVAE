@@ -81,38 +81,12 @@ class QwenImageMidBlockAdapter(_CausalMidBlockAdapter):
     _resnet_adapter = QwenImageResidualBlockAdapter
 
 
-class HunyuanVideo15MidBlockAdapter(nn.Module):
+class HunyuanVideo15MidBlockAdapter(_CausalMidBlockAdapter):
     """Shards HunyuanVideo 1.5's mid block: residual blocks stay local, attentions gather"""
 
-    def __init__(
-        self,
-        mid_block: nn.Module,
-        conv_block_size = 0,
-        patch_dim: int = -2,
-        parallel_context: ParallelContext = None,
-    ):
-        super().__init__()
-        adapter = type(self).__name__
-        supported = resolved(HunyuanVideo15MidBlock)
-        require(supported, adapter, "HunyuanVideo15MidBlock")
-        assert isinstance(mid_block, supported), (
-            f"{adapter} does not support mid block except HunyuanVideo15MidBlock"
-        )
-        self.mid_block = mid_block
-        mid_block.resnets = nn.ModuleList([
-            HunyuanVideo15ResnetBlockAdapter(
-                resnet,
-                conv_block_size=conv_block_size,
-                patch_dim=patch_dim,
-                parallel_context=parallel_context,
-            ) for resnet in mid_block.resnets
-        ])
-        mid_block.attentions = nn.ModuleList([
-            GatheredAttentionAdapter(
-                attn, patch_dim=patch_dim, parallel_context=parallel_context
-            ) if attn is not None else attn
-            for attn in mid_block.attentions
-        ])
+    _supported = resolved(HunyuanVideo15MidBlock)
+    _requires = "HunyuanVideo15MidBlock"
+    _resnet_adapter = HunyuanVideo15ResnetBlockAdapter
 
     def forward(self, hidden_states):
         return self.mid_block(hidden_states)

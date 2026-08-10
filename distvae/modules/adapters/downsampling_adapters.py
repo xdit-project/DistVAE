@@ -3,6 +3,7 @@ from typing import Tuple
 import torch.nn as nn
 
 from distvae.models.layers.wan.zeropadconv2d import WanZeroPadConv2d
+from distvae.modules.adapters.adapter_utils import replace_child_convolution
 from distvae.utils import ParallelContext, cache_cursor
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
@@ -234,9 +235,10 @@ class _PaddedCausalDownsampleAdapter(nn.Module):
             f"{adapter} does not support downsampler except {self._requires}"
         )
         self.downsampler = downsampler
-        downsampler.conv = self._conv_adapter(
-            downsampler.conv,
-            block_size=conv_block_size,
+        replace_child_convolution(
+            downsampler,
+            self._conv_adapter,
+            conv_block_size=conv_block_size,
             patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
@@ -335,9 +337,10 @@ class LTX2VideoDownsamplerAdapter(nn.Module):
             f"{adapter} does not support downsampler except {self._requires}"
         )
         self.downsampler = downsampler
-        downsampler.conv = LTX2VideoCausalConv3dAdapter(
-            downsampler.conv,
-            block_size=conv_block_size,
+        replace_child_convolution(
+            downsampler,
+            LTX2VideoCausalConv3dAdapter,
+            conv_block_size=conv_block_size,
             patch_dim=patch_dim,
             parallel_context=parallel_context,
         )

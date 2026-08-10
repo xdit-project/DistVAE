@@ -28,7 +28,6 @@ from distvae.modules.adapters.layers.conv_adapters import (
     QwenImageCausalConv3dAdapter,
     WanCausalConv3dAdapter,
 )
-from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from distvae.modules.adapters.midblock_adapters import (
     HunyuanVideo15MidBlockAdapter,
     HunyuanVideoMidBlockAdapter,
@@ -41,9 +40,9 @@ from distvae.modules.adapters.resnet_adapters import (
     WanResidualBlockAdapter,
 )
 from distvae.modules.adapters.unets.unet_2d_blocks_adapters import DownEncoderBlock2DAdapter
+from distvae.modules.adapters.vae.causal_setup import CausalVAEAdapterSetup
 from distvae.modules.patch_utils import Patchify, DePatchify
 from distvae.utils import (
-    DistributedEnv,
     cache_cursor,
     normalize_patch_dim,
     parallel_context,
@@ -177,6 +176,7 @@ class _CausalEncoderAdapter(nn.Module):
     # Wan and the family forked from it thread a temporal cache through every forward. The
     # HunyuanVideo and LTX-2 encoders take a tensor and nothing else.
     _takes_feature_cache = True
+    _setup_type = CausalVAEAdapterSetup
 
     def __init__(
         self,
@@ -188,58 +188,33 @@ class _CausalEncoderAdapter(nn.Module):
         patch_dim: int = -2,
     ):
         super().__init__()
-        adapter = type(self).__name__
-        patch_dim = normalize_patch_dim(patch_dim, 5, spatial_only=True)
-        self.patch_dim = patch_dim
-        self.parallel_context = parallel_context(vae_group, patch_dim, ndim=5)
+        setup = self._setup_type.create(
+            adapter=type(self).__name__,
+            conv_adapter=self._conv_adapter,
+            block_adapters=self._down_block_adapters,
+            conv_block_size=conv_block_size,
+            patch_dim=patch_dim,
+            vae_group=vae_group,
+        )
+        self._setup = setup
+        self.patch_dim = setup.patch_dim
+        self.parallel_context = setup.parallel_context
         self.vae_scale_factor = vae_scale_factor
-        # Bands differ in size where the rows do not divide by the rank count, so every
-        # convolution has to read the sizes rather than assume its neighbours match it.
-        options = dict(
-            patch_dim=patch_dim, parallel_context=self.parallel_context
-        )
         self.encoder = encoder
-        self.encoder.conv_in = self._conv_adapter(
-            encoder.conv_in, block_size=conv_block_size, **options
-        )
-        self.encoder.down_blocks = nn.ModuleList([
-            self._adapt_down_block(down_block, adapter, conv_block_size, options)
-            for down_block in encoder.down_blocks
-        ])
+        self.encoder.conv_in = setup.adapt_convolution(encoder.conv_in)
+        self.encoder.down_blocks = setup.adapt_blocks(encoder.down_blocks, "down")
         self.encoder.mid_block = self._mid_adapter(
-            encoder.mid_block, conv_block_size=conv_block_size, **options
+            encoder.mid_block, conv_block_size=conv_block_size, **setup.options
         )
-        self.encoder.conv_out = self._conv_adapter(
-            encoder.conv_out, block_size=conv_block_size, **options
-        )
+        self.encoder.conv_out = setup.adapt_convolution(encoder.conv_out)
         # HunyuanVideo ends on a GroupNorm, whose statistics span the axis being split. The RMS
         # norms the other families end on do not, and are left as they are.
-        if isinstance(getattr(encoder, "conv_norm_out", None), nn.GroupNorm):
-            self.encoder.conv_norm_out = GroupNormAdapter(
-                encoder.conv_norm_out, **options
-            )
+        if hasattr(encoder, "conv_norm_out"):
+            self.encoder.conv_norm_out = setup.adapt_group_norm(encoder.conv_norm_out)
         # Each band is a whole multiple of what the encoder narrows by, so it starts on the grid
         # the strided convolutions step along and the latent rows it produces are its own.
-        self.patchify = Patchify(
-            patch_dim=patch_dim,
-            scale_factor=vae_scale_factor,
-            parallel_context=self.parallel_context,
-        )
-        self.depatchify = DePatchify(
-            patch_dim=patch_dim, parallel_context=self.parallel_context
-        )
+        self.patchify, self.depatchify = setup.patchers(vae_scale_factor)
         self.vae_group = vae_group
-
-    @classmethod
-    def _adapt_down_block(cls, down_block, adapter, conv_block_size, options):
-        for block_type, block_adapter in cls._down_block_adapters:
-            if block_type is not None and isinstance(down_block, block_type):
-                return block_adapter(down_block, conv_block_size=conv_block_size, **options)
-        handled = ", ".join(t.__name__ for t, _ in cls._down_block_adapters if t is not None)
-        raise TypeError(
-            f"{adapter} cannot shard a down block of type {type(down_block).__name__}. "
-            f"It handles {handled or 'no down block type the installed diffusers provides'}."
-        )
 
     def _run_encoder(self, sample, feat_cache, feat_idx):
         if not self._takes_feature_cache:

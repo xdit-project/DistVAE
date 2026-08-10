@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from bench.harness import arms, catalog, cli, measure, report
+from bench.harness import arms, catalog, cli, distributed, measure, report
 
 
 def test_harness_has_no_optional_runner_dependency():
@@ -27,7 +27,7 @@ def test_describe_only_runs_on_cpu_without_distributed_environment(
     for name in ("RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(
-        cli.torch.cuda,
+        measure.torch.cuda,
         "set_device",
         lambda *args: pytest.fail("describe-only touched CUDA"),
     )
@@ -165,6 +165,334 @@ def test_parser_exposes_tile_shape_cost_controls():
     assert args.tile_shape_sides == "8,16"
 
 
+def test_parser_exposes_harness_owned_profiler_controls(tmp_path):
+    args = cli.parser().parse_args(
+        [
+            "--profile",
+            "--profile-trace",
+            "--profile-memory",
+            "--profile-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert args.profile is True
+    assert args.profile_trace is True
+    assert args.profile_memory is True
+    assert args.profile_dir == str(tmp_path)
+
+
+def test_disabled_profiler_has_no_runtime_overhead(monkeypatch):
+    monkeypatch.setattr(
+        measure.torch.profiler,
+        "profile",
+        lambda **kwargs: pytest.fail("disabled profiling touched torch.profiler"),
+    )
+    args = SimpleNamespace(
+        profile=False,
+        profile_trace=False,
+        profile_memory=False,
+    )
+
+    assert measure.profile_once(lambda: pytest.fail("disabled profiling ran"), args) is None
+
+
+def test_profile_without_exports_returns_a_bounded_summary(monkeypatch):
+    table_calls = []
+
+    class Averages:
+        def table(self, **options):
+            table_calls.append(options)
+            return "x" * (measure.PROFILE_SUMMARY_LIMIT + 100)
+
+    class FakeProfile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def key_averages(self):
+            return Averages()
+
+    monkeypatch.setattr(
+        measure.torch.profiler,
+        "ProfilerActivity",
+        SimpleNamespace(CPU="cpu", CUDA="cuda"),
+    )
+    monkeypatch.setattr(
+        measure.torch.profiler, "profile", lambda **kwargs: FakeProfile()
+    )
+    args = SimpleNamespace(
+        profile=True,
+        profile_trace=False,
+        profile_memory=False,
+        profile_dir="unused",
+        family="kl",
+        half="encoder",
+    )
+
+    result = measure.profile_once(
+        lambda: object(),
+        args,
+        cell={"name": "single", "height": 256, "width": 128, "frames": 1},
+        runtime=SimpleNamespace(rank=0, device=SimpleNamespace(type="cuda")),
+    )
+
+    assert result["artifacts"] == {}
+    assert len(result["summary"]) == measure.PROFILE_SUMMARY_LIMIT
+    assert table_calls == [{"sort_by": "self_cuda_time_total", "row_limit": 20}]
+
+
+def test_profiler_exports_harness_named_trace_and_memory_artifacts(
+    tmp_path, monkeypatch
+):
+    exports = {}
+    history = []
+
+    class FakeProfile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def export_chrome_trace(self, path):
+            exports["trace"] = Path(path)
+
+        def export_memory_timeline(self, path):
+            exports["memory"] = Path(path)
+
+        def key_averages(self):
+            return SimpleNamespace(table=lambda **kwargs: "cuda summary")
+
+    monkeypatch.setattr(
+        measure.torch.profiler,
+        "ProfilerActivity",
+        SimpleNamespace(CPU="cpu", CUDA="cuda"),
+    )
+    monkeypatch.setattr(
+        measure.torch.cuda.memory,
+        "_record_memory_history",
+        lambda enabled=None: history.append(enabled),
+    )
+    monkeypatch.setattr(
+        measure.importlib,
+        "import_module",
+        lambda name: pytest.fail(f"CUDA profiling imported {name}"),
+    )
+    monkeypatch.setattr(
+        measure.torch.profiler,
+        "profile",
+        lambda **kwargs: exports.update(options=kwargs) or FakeProfile(),
+    )
+    args = SimpleNamespace(
+        profile=True,
+        profile_trace=True,
+        profile_memory=True,
+        profile_dir=str(tmp_path),
+        family="wan",
+        half="decoder",
+    )
+    runtime = SimpleNamespace(rank=2, device=SimpleNamespace(type="cuda"))
+    result = measure.profile_once(
+        lambda: object(),
+        args,
+        cell={"name": "tile-half", "height": 512, "width": 256, "frames": 17},
+        runtime=runtime,
+    )
+
+    assert result == {
+        "summary": "cuda summary",
+        "artifacts": {
+            "trace": str(
+                tmp_path / "wan-decoder-tile-half-512x256x17-rank2.trace.json"
+            ),
+            "memory": str(
+                tmp_path / "wan-decoder-tile-half-512x256x17-rank2.memory.html"
+            ),
+        },
+    }
+    assert exports["trace"] == Path(result["artifacts"]["trace"])
+    assert exports["memory"] == Path(result["artifacts"]["memory"])
+    assert exports["options"]["activities"] == ["cpu", "cuda"]
+    assert exports["options"]["profile_memory"] is True
+    assert exports["options"]["record_shapes"] is True
+    assert exports["options"]["with_stack"] is True
+    assert history == ["all", None]
+
+
+def test_musa_profiler_is_loaded_lazily_and_uses_musa_memory_history(
+    tmp_path, monkeypatch
+):
+    exports = {}
+    history = []
+    imported = []
+
+    class FakeProfile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def key_averages(self):
+            return SimpleNamespace(table=lambda **kwargs: "musa summary")
+
+        def export_memory_timeline(self, path):
+            exports["memory"] = Path(path)
+
+    musa = SimpleNamespace(
+        memory=SimpleNamespace(
+            _record_memory_history=lambda enabled=None: history.append(enabled)
+        )
+    )
+    monkeypatch.setattr(measure.torch, "musa", musa, raising=False)
+    monkeypatch.setattr(
+        measure.importlib,
+        "import_module",
+        lambda name: imported.append(name) or object(),
+    )
+    monkeypatch.setattr(
+        measure.torch.profiler,
+        "ProfilerActivity",
+        SimpleNamespace(CPU="cpu", MUSA="musa"),
+    )
+    monkeypatch.setattr(
+        measure.torch.profiler,
+        "profile",
+        lambda **kwargs: exports.update(options=kwargs) or FakeProfile(),
+    )
+    args = SimpleNamespace(
+        profile=True,
+        profile_trace=False,
+        profile_memory=True,
+        profile_dir=str(tmp_path),
+        family="wan",
+        half="decoder",
+    )
+
+    result = measure.profile_once(
+        lambda: object(),
+        args,
+        cell={"name": "single", "height": 64, "width": 64, "frames": 5},
+        runtime=SimpleNamespace(rank=1, device=SimpleNamespace(type="musa")),
+    )
+
+    assert imported == ["torch_musa"]
+    assert exports["options"]["activities"] == ["cpu", "musa"]
+    assert exports["memory"] == Path(result["artifacts"]["memory"])
+    assert history == ["all", None]
+    assert result["summary"] == "musa summary"
+
+
+def test_runtime_selects_cuda_without_importing_musa(monkeypatch):
+    monkeypatch.setattr(distributed.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        distributed.importlib,
+        "import_module",
+        lambda name: pytest.fail(f"CUDA runtime imported {name}"),
+    )
+
+    name, api, backend = distributed.accelerator_backend()
+
+    assert (name, api, backend) == ("cuda", distributed.torch.cuda, "nccl")
+
+
+def test_runtime_loads_musa_lazily_and_selects_mccl(monkeypatch):
+    imported = []
+    musa = SimpleNamespace(is_available=lambda: True)
+    monkeypatch.setattr(distributed.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(distributed.torch, "musa", musa, raising=False)
+    monkeypatch.setattr(
+        distributed.importlib,
+        "import_module",
+        lambda name: imported.append(name) or object(),
+    )
+
+    name, api, backend = distributed.accelerator_backend()
+
+    assert imported == ["torch_musa"]
+    assert (name, api, backend) == ("musa", musa, "mccl")
+
+
+def test_profile_summary_is_embedded_in_measurement(monkeypatch):
+    sample = measure.torch.zeros(1, 4, 2, 2)
+    profile = {"summary": "bounded profiler table", "artifacts": {}}
+    monkeypatch.setattr(measure.catalog, "build_vae", lambda *args: object())
+    monkeypatch.setattr(measure.catalog, "sample_for", lambda *args: sample)
+    monkeypatch.setattr(
+        measure.catalog, "describe_vae", lambda *args: {"adapter": "Adapter"}
+    )
+    monkeypatch.setattr(measure.catalog, "run_half", lambda *args: sample)
+    monkeypatch.setattr(measure, "configure_sharding", lambda *args: "Adapter")
+    monkeypatch.setattr(
+        measure, "configure_tiling", lambda *args: {"enabled": False}
+    )
+    monkeypatch.setattr(measure, "profile_once", lambda *args: profile)
+    monkeypatch.setattr(measure, "across_ranks", lambda *args: {})
+    monkeypatch.setattr(measure, "timed", lambda *args: {"median_s": 0.0})
+    monkeypatch.setattr(measure.torch.cuda, "synchronize", lambda *args: None)
+    monkeypatch.setattr(
+        measure.torch.cuda, "reset_peak_memory_stats", lambda *args: None
+    )
+    monkeypatch.setattr(
+        measure.torch.cuda, "max_memory_allocated", lambda *args: 0
+    )
+
+    class Log:
+        enabled = False
+        by_call = {}
+
+        def reset(self):
+            pass
+
+        def report(self):
+            return {}
+
+    args = SimpleNamespace(
+        family="kl",
+        half="decoder",
+        dtype="float32",
+        batch=1,
+        skip_reference=True,
+        reference_max_latent_elems=0,
+        phase_timing=False,
+        profile=True,
+        profile_trace=False,
+        profile_memory=False,
+        warmup=0,
+        iters=1,
+        max_rel=None,
+    )
+    cell = {
+        "name": "single",
+        "height": 16,
+        "width": 16,
+        "frames": 1,
+        "sharding": "unsharded",
+    }
+    runtime = SimpleNamespace(
+        device=SimpleNamespace(type="cuda"),
+        device_api=measure.torch.cuda,
+        rank=0,
+        world_size=1,
+        group=object(),
+        log=Log(),
+    )
+
+    _, measurement = measure.measure_cell(
+        args,
+        {"spatial": 8, "temporal": None},
+        cell,
+        runtime,
+        {},
+        lambda *args: None,
+    )
+
+    assert measurement["profile"] == profile
+
+
 def test_tile_shape_costs_measure_latency_memory_and_batch_scaling(monkeypatch):
     vae = object()
     calls = []
@@ -204,7 +532,13 @@ def test_tile_shape_costs_measure_latency_memory_and_batch_scaling(monkeypatch):
     result = measure.tile_shape_costs(
         args,
         spec,
-        SimpleNamespace(device="cpu", group=object(), rank=0, world_size=1),
+        SimpleNamespace(
+            device="cpu",
+            device_api=measure.torch.cuda,
+            group=object(),
+            rank=0,
+            world_size=1,
+        ),
         lambda *parts: None,
     )
 
@@ -271,7 +605,13 @@ def test_tile_shape_oom_is_synchronized_before_the_next_case(
     result = measure.tile_shape_costs(
         args,
         {"latent_channels": 16, "spatial": 8, "temporal": None},
-        SimpleNamespace(device="cpu", group=object(), rank=0, world_size=2),
+        SimpleNamespace(
+            device="cpu",
+            device_api=measure.torch.cuda,
+            group=object(),
+            rank=0,
+            world_size=2,
+        ),
         lambda *parts: None,
     )
 
@@ -312,7 +652,13 @@ def test_tile_shape_setup_failure_is_synchronized_before_cases(monkeypatch):
         measure.tile_shape_costs(
             args,
             {"latent_channels": 16, "spatial": 8, "temporal": None},
-            SimpleNamespace(device="cpu", group=object(), rank=0, world_size=2),
+            SimpleNamespace(
+                device="cpu",
+                device_api=measure.torch.cuda,
+                group=object(),
+                rank=0,
+                world_size=2,
+            ),
             lambda *parts: None,
         )
 
@@ -328,7 +674,9 @@ def test_measurement_records_effective_dtype_and_world_size(monkeypatch, shape_c
         frames=1,
         tile_shape_costs=shape_costs,
     )
-    runtime = SimpleNamespace(rank=0, world_size=3, group=object())
+    runtime = SimpleNamespace(
+        rank=0, world_size=3, group=object(), device_api=measure.torch.cuda
+    )
     cell = {
         "name": "single",
         "height": 512,

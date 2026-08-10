@@ -1,7 +1,9 @@
 """Benchmark execution, timing, memory, phase timing, and output agreement."""
 
+import importlib
 import time
 from collections import Counter
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -14,6 +16,77 @@ from .distributed import across_ranks
 from .report import set_agreement_policy
 
 MAX_REL = {"float32": 1e-4, "float16": 2e-2, "bfloat16": 5e-2}
+PROFILE_SUMMARY_LIMIT = 16_000
+
+
+def _device_api(runtime):
+    return runtime.device_api
+
+
+def _profiler_backend(device_type):
+    activity_name = device_type.upper()
+    if device_type == "musa":
+        try:
+            importlib.import_module("torch_musa")
+        except ModuleNotFoundError as error:
+            raise RuntimeError(
+                "MUSA profiling requires the optional torch_musa package"
+            ) from error
+    activity = getattr(torch.profiler.ProfilerActivity, activity_name, None)
+    if device_type != "cpu" and activity is None:
+        raise RuntimeError(f"torch.profiler has no {activity_name} activity")
+    device_api = getattr(torch, device_type, None)
+    memory = getattr(device_api, "memory", None)
+    recorder = getattr(memory, "_record_memory_history", None)
+    sort_by = f"self_{device_type}_time_total"
+    return activity, recorder, sort_by
+
+
+def profile_once(run, args, cell=None, runtime=None):
+    """Profile one VAE-half call and export only explicitly requested artifacts."""
+    enabled = args.profile or args.profile_trace or args.profile_memory
+    if not enabled:
+        return None
+
+    output_dir = Path(args.profile_dir)
+    shape = f"{cell['height']}x{cell['width']}x{cell['frames']}"
+    stem = (
+        f"{args.family}-{args.half}-{cell['name']}-{shape}-rank{runtime.rank}"
+    )
+    artifacts = {}
+    if args.profile_trace:
+        artifacts["trace"] = str(output_dir / f"{stem}.trace.json")
+    if args.profile_memory:
+        artifacts["memory"] = str(output_dir / f"{stem}.memory.html")
+    if artifacts:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    accelerator, memory_recorder, sort_by = _profiler_backend(runtime.device.type)
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if accelerator is not None:
+        activities.append(accelerator)
+
+    if args.profile_memory and memory_recorder is not None:
+        memory_recorder(enabled="all")
+    try:
+        with torch.profiler.profile(
+            activities=activities,
+            profile_memory=args.profile_memory,
+            record_shapes=args.profile_memory,
+            with_stack=args.profile_memory,
+        ) as profiler:
+            run()
+        summary = profiler.key_averages().table(
+            sort_by=sort_by, row_limit=20
+        )[:PROFILE_SUMMARY_LIMIT]
+        if args.profile_trace:
+            profiler.export_chrome_trace(artifacts["trace"])
+        if args.profile_memory:
+            profiler.export_memory_timeline(artifacts["memory"])
+    finally:
+        if args.profile_memory and memory_recorder is not None:
+            memory_recorder(enabled=None)
+    return {"summary": summary, "artifacts": artifacts}
 
 
 def _tile_latent_area(vae):
@@ -144,33 +217,33 @@ def configure_sharding(vae, cell, runtime, half):
 class PhaseTimer(nn.Module):
     """Measure decoder calls separately from the full tiled decode."""
 
-    def __init__(self, decoder, device, counters):
+    def __init__(self, decoder, runtime, counters):
         super().__init__()
         self.decoder = decoder
-        self.device = device
+        self.runtime = runtime
         self.counters = counters
 
     def forward(self, *args, **kwargs):
-        torch.cuda.synchronize(self.device)
+        _device_api(self.runtime).synchronize(self.runtime.device)
         start = time.perf_counter()
         output = self.decoder(*args, **kwargs)
-        torch.cuda.synchronize(self.device)
+        _device_api(self.runtime).synchronize(self.runtime.device)
         self.counters["decoder_s"] += time.perf_counter() - start
         self.counters["calls"] += 1
         return output
 
 
-def install_phase_timing(vae, device):
+def install_phase_timing(vae, runtime):
     """Wrap decoder and tiled decode calls for optional phase accounting."""
     counters = Counter()
-    vae.decoder = PhaseTimer(vae.decoder, device, counters)
+    vae.decoder = PhaseTimer(vae.decoder, runtime, counters)
     tiled_decode = vae.tiled_decode
 
     def timed_decode(*args, **kwargs):
-        torch.cuda.synchronize(device)
+        _device_api(runtime).synchronize(runtime.device)
         start = time.perf_counter()
         output = tiled_decode(*args, **kwargs)
-        torch.cuda.synchronize(device)
+        _device_api(runtime).synchronize(runtime.device)
         counters["total_s"] += time.perf_counter() - start
         counters["decodes"] += 1
         return output
@@ -213,10 +286,10 @@ def timed(run, iters, runtime):
     samples = []
     for _ in range(iters):
         dist.barrier(group=runtime.group)
-        torch.cuda.synchronize(runtime.device)
+        _device_api(runtime).synchronize(runtime.device)
         start = time.perf_counter()
         run()
-        torch.cuda.synchronize(runtime.device)
+        _device_api(runtime).synchronize(runtime.device)
         samples.append(time.perf_counter() - start)
     return _timing_report(samples)
 
@@ -259,10 +332,10 @@ def _shape_iterations(run, iterations, runtime):
         local_error = None
         elapsed = None
         try:
-            torch.cuda.synchronize(runtime.device)
+            _device_api(runtime).synchronize(runtime.device)
             start = time.perf_counter()
             run()
-            torch.cuda.synchronize(runtime.device)
+            _device_api(runtime).synchronize(runtime.device)
             elapsed = time.perf_counter() - start
         except Exception as error:
             local_error = _error_record(error, runtime.rank)
@@ -334,7 +407,7 @@ def tile_shape_costs(args, spec, runtime, say):
             try:
                 torch.manual_seed(1)
                 latent = torch.randn(*shape, dtype=dtype, device=runtime.device)
-                torch.cuda.reset_peak_memory_stats(runtime.device)
+                _device_api(runtime).reset_peak_memory_stats(runtime.device)
             except Exception as error:
                 local_error = _error_record(error, runtime.rank)
             failure, failed_ranks = _synchronize_failure(local_error, runtime)
@@ -357,7 +430,7 @@ def tile_shape_costs(args, spec, runtime, say):
                 )
                 say(f"{rows}x{columns} x{count}: out of memory during allocation")
                 latent = None
-                torch.cuda.empty_cache()
+                _device_api(runtime).empty_cache()
                 break
 
             def once():
@@ -393,7 +466,7 @@ def tile_shape_costs(args, spec, runtime, say):
                     f"{failure_phase}"
                 )
                 latent = None
-                torch.cuda.empty_cache()
+                _device_api(runtime).empty_cache()
                 break
             timing = _timing_report(samples)
 
@@ -413,7 +486,9 @@ def tile_shape_costs(args, spec, runtime, say):
                 "timing": timing,
                 "median_ms": median_ms,
                 "ms_per_tile": per_tile_ms,
-                "peak_vram_mb": torch.cuda.max_memory_allocated(runtime.device)
+                "peak_vram_mb": _device_api(runtime).max_memory_allocated(
+                    runtime.device
+                )
                 / (1024 * 1024),
                 "ms_per_1k_latent_area": per_tile_ms / area * 1000,
                 "against_area_prediction": per_tile_ms / predicted_ms,
@@ -425,7 +500,7 @@ def tile_shape_costs(args, spec, runtime, say):
                 f"{entry['peak_vram_mb']:.0f} MB"
             )
             latent = None
-            torch.cuda.empty_cache()
+            _device_api(runtime).empty_cache()
 
     fitted = [entry for entry in measured if not entry.get("out_of_memory")]
     batched = [entry for entry in fitted if entry["tiles_in_the_call"] > 1]
@@ -511,7 +586,7 @@ def measure_cell(args, spec, cell, runtime, references, say):
     adapter = configure_sharding(vae, cell, runtime, args.half)
     tiling = configure_tiling(vae, cell, runtime, args.half, say)
     counters = (
-        install_phase_timing(vae, runtime.device)
+        install_phase_timing(vae, runtime)
         if args.phase_timing and tiling["enabled"]
         else Counter()
     )
@@ -522,7 +597,7 @@ def measure_cell(args, spec, cell, runtime, references, say):
 
     for _ in range(args.warmup):
         once()
-    torch.cuda.synchronize(runtime.device)
+    _device_api(runtime).synchronize(runtime.device)
 
     runtime.log.reset()
     runtime.log.enabled = True
@@ -534,11 +609,16 @@ def measure_cell(args, spec, cell, runtime, references, say):
     collectives.update(
         across_ranks(runtime.log.by_call, runtime.world_size, runtime.group)
     )
+    profile = None
+    if args.profile or args.profile_trace or args.profile_memory:
+        profile = profile_once(once, args, cell, runtime)
 
     counters.clear()
-    torch.cuda.reset_peak_memory_stats(runtime.device)
+    _device_api(runtime).reset_peak_memory_stats(runtime.device)
     timing = timed(once, args.iters, runtime)
-    peak_mb = torch.cuda.max_memory_allocated(runtime.device) / (1024 * 1024)
+    peak_mb = _device_api(runtime).max_memory_allocated(runtime.device) / (
+        1024 * 1024
+    )
     phases = phase_report(counters, runtime)
     reference = references.get(key)
     agreement = (
@@ -564,6 +644,7 @@ def measure_cell(args, spec, cell, runtime, references, say):
         "collectives": collectives,
         "timing": timing,
         "phases": phases,
+        "profile": profile,
         "peak_vram_mb": peak_mb,
         "agreement": agreement,
     }
