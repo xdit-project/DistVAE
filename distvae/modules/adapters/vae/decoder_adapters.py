@@ -1,5 +1,5 @@
 import time
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -46,7 +46,7 @@ from distvae.modules.adapters.midblock_adapters import (
     WanMidBlockAdapter,
 )
 from distvae.modules.patch_utils import Patchify, DePatchify
-from distvae.utils import DistributedEnv
+from distvae.utils import DistributedEnv, cache_cursor
 
 try:
     import torch_musa
@@ -220,6 +220,7 @@ class _CausalDecoderAdapter(nn.Module):
     def _run_decoder(self, sample, feat_cache, feat_idx, first_chunk):
         if not self._takes_feature_cache:
             return self.decoder(sample)
+        feat_idx = cache_cursor(feat_idx)
         if self._takes_first_chunk:
             return self.decoder(
                 sample, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk
@@ -241,7 +242,7 @@ class _CausalDecoderAdapter(nn.Module):
         self,
         sample: torch.FloatTensor,
         feat_cache: Optional[torch.FloatTensor] = None,
-        feat_idx: Optional[int] = 0,
+        feat_idx: Optional[List[int]] = None,
         first_chunk: bool = False,
         patchify: bool = True,
     ):

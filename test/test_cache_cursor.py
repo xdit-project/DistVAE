@@ -44,7 +44,11 @@ class TestCacheCursor(unittest.TestCase):
         for name in ADAPTER_MODULES:
             module = importlib.import_module(name)
             for attribute, value in vars(module).items():
-                if not (isinstance(value, type) and issubclass(value, nn.Module)):
+                if not (
+                    isinstance(value, type)
+                    and issubclass(value, nn.Module)
+                    and value.__module__ == module.__name__
+                ):
                     continue
                 forward = value.__dict__.get("forward")
                 if forward is None:

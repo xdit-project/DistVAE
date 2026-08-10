@@ -1270,7 +1270,12 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
             f"{type(vae).__name__} {args.half}. Nothing to measure."
         )
     if args.describe_only:
-        return None
+        return {
+            "arm": cell["name"],
+            "family": args.family,
+            "half": args.half,
+            "description": built,
+        }
 
     # The reference has to be taken before sharding, which replaces the half in place. Every rank
     # computes it rather than rank 0 alone: the seeds match, so the weights match, and leaving it
@@ -1430,6 +1435,8 @@ def measure_cell(args, spec, cell, device, dtype, group, world_size, rank, say, 
 
 def print_report(report: dict, half: str) -> None:
     """One cell's numbers, in the shape the collector reads them back out of"""
+    if "description" in report:
+        return
     collectives, timing = report["collectives"], report["timing"]
     print(f"\n--- collectives per {half} call (rank 0, and the most any rank made) ---", flush=True)
     for name, entry in collectives["by_call"].items():

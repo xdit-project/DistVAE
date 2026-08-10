@@ -52,10 +52,28 @@ def worker(rank, world_size, frames, height, width, seed, master_port):
         dist.destroy_process_group()
 
 
+def cached_worker(rank, world_size, seed, master_port):
+    init_gloo(rank, world_size, master_port)
+    try:
+        torch.manual_seed(seed)
+        adapter = WanDecoderAdapter(build_decoder(), vae_group=None).eval()
+        latents = torch.randn(1, LATENT_CHANNELS, 1, 16, 16)
+
+        with torch.no_grad():
+            adapter(latents, feat_cache=[None] * 1000)
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.mark.gloo
 @pytest.mark.parametrize("world_size", [1, 2, 4])
 def test_a_sharded_wan_decode_matches_a_single_rank_one(world_size, master_port, seed=42):
     run_distributed(worker, world_size, (1, 16, 16, seed), master_port)
+
+
+@pytest.mark.gloo
+def test_cached_decode_gets_a_fresh_cursor_when_one_is_omitted(master_port, seed=42):
+    run_distributed(cached_worker, 1, (seed,), master_port)
 
 
 @pytest.mark.gloo
