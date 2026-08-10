@@ -1,5 +1,7 @@
 """Public VAE orchestration APIs for DistVAE."""
 
+from distvae.utils import ParallelContext
+
 from .parallel import (
     decoder_adapter_name,
     encoder_adapter_name,
@@ -45,6 +47,7 @@ from .tiling import (
 
 __all__ = [
     "Blend",
+    "ParallelContext",
     "apply_tile_plan",
     "assemble_here",
     "assemble_in_runs",
