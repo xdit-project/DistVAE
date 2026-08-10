@@ -14,6 +14,7 @@ from diffusers.models.upsampling import Upsample2D
 
 from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from distvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
+from distvae.utils import ParallelContext
 
 # class ResnetBlockCondNorm2D(nn.Module):
 #     r"""
@@ -216,6 +217,8 @@ class PatchResnetBlock2D(nn.Module):
         conv_shortcut_bias: bool = True,
         conv_2d_out_channels: Optional[int] = None,
         conv_block_size = 0,
+        patch_dim: int = -2,
+        parallel_context: ParallelContext = None,
     ):
         assert temb_channels is None, "temb_channels is not supported currently."
         assert up is False, "Upsampling is not supported currently."
@@ -247,10 +250,24 @@ class PatchResnetBlock2D(nn.Module):
 
         if groups_out is None:
             groups_out = groups
+        parallel_options = dict(
+            patch_dim=patch_dim, parallel_context=parallel_context
+        )
 
-        self.norm1 = GroupNormAdapter(torch.nn.GroupNorm(num_groups=groups, num_channels=in_channels, eps=eps, affine=True))
+        self.norm1 = GroupNormAdapter(
+            torch.nn.GroupNorm(
+                num_groups=groups, num_channels=in_channels, eps=eps, affine=True
+            ),
+            **parallel_options,
+        )
 
-        self.conv1 = Conv2dAdapter(conv_cls(in_channels, out_channels, kernel_size=3, stride=1, padding=1), block_size=conv_block_size)
+        self.conv1 = Conv2dAdapter(
+            conv_cls(
+                in_channels, out_channels, kernel_size=3, stride=1, padding=1
+            ),
+            block_size=conv_block_size,
+            **parallel_options,
+        )
 
         #TODO: Add support for temb_channels
         assert temb_channels is None, "temb_channels is not supported currently."
@@ -265,11 +282,26 @@ class PatchResnetBlock2D(nn.Module):
         # else:
         #     self.time_emb_proj = None
 
-        self.norm2 = GroupNormAdapter(torch.nn.GroupNorm(num_groups=groups_out, num_channels=out_channels, eps=eps, affine=True))
+        self.norm2 = GroupNormAdapter(
+            torch.nn.GroupNorm(
+                num_groups=groups_out, num_channels=out_channels, eps=eps, affine=True
+            ),
+            **parallel_options,
+        )
 
         self.dropout = torch.nn.Dropout(dropout)
         conv_2d_out_channels = conv_2d_out_channels or out_channels
-        self.conv2 = Conv2dAdapter(conv_cls(out_channels, conv_2d_out_channels, kernel_size=3, stride=1, padding=1), block_size=conv_block_size)
+        self.conv2 = Conv2dAdapter(
+            conv_cls(
+                out_channels,
+                conv_2d_out_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            ),
+            block_size=conv_block_size,
+            **parallel_options,
+        )
 
         self.nonlinearity = get_activation(non_linearity)
 
@@ -308,7 +340,8 @@ class PatchResnetBlock2D(nn.Module):
                     padding=0,
                     bias=conv_shortcut_bias,
                 ),
-                block_size=conv_block_size
+                block_size=conv_block_size,
+                **parallel_options,
             )
 
     def forward(self, input_tensor: torch.FloatTensor, temb: torch.FloatTensor, *args, **kwargs) -> torch.FloatTensor:

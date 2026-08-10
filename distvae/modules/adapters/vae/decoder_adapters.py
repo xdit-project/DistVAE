@@ -3,6 +3,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 from torch.profiler import profile, ProfilerActivity
 from diffusers.models.autoencoders.vae import Decoder
@@ -46,7 +47,12 @@ from distvae.modules.adapters.midblock_adapters import (
     WanMidBlockAdapter,
 )
 from distvae.modules.patch_utils import Patchify, DePatchify
-from distvae.utils import DistributedEnv, cache_cursor
+from distvae.utils import (
+    DistributedEnv,
+    cache_cursor,
+    normalize_patch_dim,
+    parallel_context,
+)
 
 try:
     import torch_musa
@@ -61,7 +67,7 @@ LTX2VideoUpBlock3d = block(LTX2_VIDEO, "LTX2VideoUpBlock3d")
 
 def _decode(run, label: str, *, use_profiler: bool, verbose: bool):
     """Run a decode, optionally under the torch profiler, and report what it cost"""
-    rank = DistributedEnv.get_global_rank()
+    rank = dist.get_rank() if dist.is_initialized() else 0
     device_type = DistributedEnv.get_device_type()
     start_time = time.time()
     if use_profiler:
@@ -106,22 +112,38 @@ class DecoderAdapter(nn.Module):
         use_profiler: bool = False,
         verbose: bool = False,
         conv_block_size = 0,
+        patch_dim: int = -2,
     ):
         super().__init__()
         assert isinstance(decoder.conv_norm_out, nn.GroupNorm), "DecoderAdapter does not support normalization method except GroupNorm"
         for up_block in decoder.up_blocks:
             assert isinstance(up_block, UpDecoderBlock2D), "DecoderAdapter does not support up block except UpDecoderBlock2D"
-        DistributedEnv.initialize(vae_group)
-        self.decoder = PatchDecoder()
+        patch_dim = normalize_patch_dim(patch_dim, 4, spatial_only=True)
+        self.patch_dim = patch_dim
+        self.parallel_context = parallel_context(vae_group, patch_dim, ndim=4)
+        options = dict(
+            patch_dim=patch_dim, parallel_context=self.parallel_context
+        )
+        # Build only the shell whose forward defines the sharded decode. Constructing a complete
+        # PatchDecoder would create temporary patch layers before this adapter can give them its
+        # immutable context, then discard every one of those layers below.
+        self.decoder = PatchDecoder.__new__(PatchDecoder)
+        nn.Module.__init__(self.decoder)
         self.decoder.layers_per_block = decoder.layers_per_block
         self.decoder.conv_in = decoder.conv_in
         self.decoder.mid_block = decoder.mid_block
         self.decoder.up_blocks = nn.ModuleList([
-            UpDecoderBlock2DAdapter(up_block, conv_block_size=conv_block_size) for up_block in decoder.up_blocks
+            UpDecoderBlock2DAdapter(
+                up_block, conv_block_size=conv_block_size, **options
+            ) for up_block in decoder.up_blocks
         ])
-        self.decoder.conv_norm_out = GroupNormAdapter(decoder.conv_norm_out)
+        self.decoder.conv_norm_out = GroupNormAdapter(decoder.conv_norm_out, **options)
         self.decoder.conv_act = decoder.conv_act
-        self.decoder.conv_out = Conv2dAdapter(decoder.conv_out, block_size=conv_block_size)
+        self.decoder.conv_out = Conv2dAdapter(
+            decoder.conv_out, block_size=conv_block_size, **options
+        )
+        self.decoder.patch = Patchify(**options)
+        self.decoder.depatch = DePatchify(**options)
         self.use_profiler = use_profiler
         self.verbose = verbose
         self.vae_group = vae_group
@@ -172,16 +194,14 @@ class _CausalDecoderAdapter(nn.Module):
     ):
         super().__init__()
         adapter = type(self).__name__
-        if patch_dim == -3:
-            raise ValueError(
-                f"{adapter} does not support patch_dim F (-3); use H (-2) or W (-1)."
-            )
-        DistributedEnv.initialize(vae_group)
+        patch_dim = normalize_patch_dim(patch_dim, 5, spatial_only=True)
         self.patch_dim = patch_dim
-        DistributedEnv.set_patch_dim(patch_dim)
+        self.parallel_context = parallel_context(vae_group, patch_dim, ndim=5)
         # Bands differ in size where the rows do not divide by the rank count, so every
         # convolution has to read the sizes rather than assume its neighbours match it.
-        options = dict(patch_dim=patch_dim)
+        options = dict(
+            patch_dim=patch_dim, parallel_context=self.parallel_context
+        )
         self.decoder = decoder
         self.decoder.conv_in = self._conv_adapter(
             decoder.conv_in, block_size=conv_block_size, **options
@@ -199,9 +219,11 @@ class _CausalDecoderAdapter(nn.Module):
         # HunyuanVideo ends on a GroupNorm, whose statistics span the axis being split. The RMS
         # norms the other families end on do not, and are left as they are.
         if isinstance(getattr(decoder, "conv_norm_out", None), nn.GroupNorm):
-            self.decoder.conv_norm_out = GroupNormAdapter(decoder.conv_norm_out)
-        self.patchify = Patchify(patch_dim=patch_dim)
-        self.depatchify = DePatchify(patch_dim=patch_dim)
+            self.decoder.conv_norm_out = GroupNormAdapter(
+                decoder.conv_norm_out, **options
+            )
+        self.patchify = Patchify(**options)
+        self.depatchify = DePatchify(**options)
         self.use_profiler = use_profiler
         self.verbose = verbose
         self.vae_group = vae_group

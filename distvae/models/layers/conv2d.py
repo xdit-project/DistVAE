@@ -14,6 +14,7 @@ from distvae.models.layers.conv_utils import (
     build_crop_slice,
 )
 from distvae.models.layers.conv_mixin import PatchConvMixin
+from distvae.utils import ParallelContext, normalize_patch_dim
 
 
 class PatchConv2d(nn.Conv2d, PatchConvMixin):
@@ -32,6 +33,7 @@ class PatchConv2d(nn.Conv2d, PatchConvMixin):
         dtype=None,
         block_size: Union[int, Tuple[int, int]] = 0,
         patch_dim: int = -2,
+        parallel_context: ParallelContext = None,
     ) -> None:
 
         if isinstance(dilation, int):
@@ -39,11 +41,10 @@ class PatchConv2d(nn.Conv2d, PatchConvMixin):
         else:
             for i in dilation:
                 assert i == 1, "dilation is not supported in PatchConv2d"
-        assert patch_dim in (-2, -1, 2, 3), (
-            "PatchConv2d patch_dim must be H (-2 or 2) or W (-1 or 3)"
-        )
+        patch_dim = normalize_patch_dim(patch_dim, 4, spatial_only=True)
         self.block_size = block_size
-        self.patch_dim = patch_dim
+        self.parallel_context = parallel_context
+        self.patch_dim = parallel_context.patch_dim if parallel_context is not None else patch_dim
         self.halo_buffer = {}
         super().__init__(
             in_channels, out_channels, kernel_size, stride, padding, dilation,
@@ -55,7 +56,9 @@ class PatchConv2d(nn.Conv2d, PatchConvMixin):
     def _conv_forward(self, input: Tensor, weight: Tensor, bias: Optional[Tensor]):
         bs, channels, h, w = input.shape
 
-        group_world_size, global_rank, rank_in_group, local_rank = get_world_size_and_rank()
+        group_world_size, global_rank, rank_in_group, local_rank = get_world_size_and_rank(
+            self.parallel_context
+        )
 
         if (group_world_size == 1):
             if self.padding_mode != 'zeros':

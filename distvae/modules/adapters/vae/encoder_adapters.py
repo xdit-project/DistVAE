@@ -42,7 +42,12 @@ from distvae.modules.adapters.resnet_adapters import (
 )
 from distvae.modules.adapters.unets.unet_2d_blocks_adapters import DownEncoderBlock2DAdapter
 from distvae.modules.patch_utils import Patchify, DePatchify
-from distvae.utils import DistributedEnv, cache_cursor
+from distvae.utils import (
+    DistributedEnv,
+    cache_cursor,
+    normalize_patch_dim,
+    parallel_context,
+)
 
 from diffusers.models.autoencoders.vae import Encoder
 from diffusers.models.unets.unet_2d_blocks import DownEncoderBlock2D
@@ -83,6 +88,7 @@ class EncoderAdapter(nn.Module):
     ):
         super().__init__()
         adapter = type(self).__name__
+        patch_dim = normalize_patch_dim(patch_dim, 4, spatial_only=True)
         if patch_dim != -2:
             # The resnet adapter this reaches through splits H and says nothing about which axis.
             raise ValueError(f"{adapter} only supports patch_dim H (-2).")
@@ -102,19 +108,32 @@ class EncoderAdapter(nn.Module):
                 f"{adapter} was told this encoder narrows by {vae_scale_factor}, but its "
                 f"down blocks narrow by {counted}."
             )
-        DistributedEnv.initialize(vae_group)
         self.patch_dim = patch_dim
-        DistributedEnv.set_patch_dim(patch_dim)
+        self.parallel_context = parallel_context(vae_group, patch_dim, ndim=4)
         self.encoder = encoder
-        encoder.conv_in = Conv2dAdapter(encoder.conv_in, block_size=conv_block_size)
+        encoder.conv_in = Conv2dAdapter(
+            encoder.conv_in,
+            block_size=conv_block_size,
+            patch_dim=patch_dim,
+            parallel_context=self.parallel_context,
+        )
         encoder.down_blocks = nn.ModuleList([
             DownEncoderBlock2DAdapter(
-                down_block, conv_block_size=conv_block_size, patch_dim=patch_dim
+                down_block,
+                conv_block_size=conv_block_size,
+                patch_dim=patch_dim,
+                parallel_context=self.parallel_context,
             )
             for down_block in encoder.down_blocks
         ])
-        self.patchify = Patchify(patch_dim=patch_dim, scale_factor=vae_scale_factor)
-        self.depatchify = DePatchify(patch_dim=patch_dim)
+        self.patchify = Patchify(
+            patch_dim=patch_dim,
+            scale_factor=vae_scale_factor,
+            parallel_context=self.parallel_context,
+        )
+        self.depatchify = DePatchify(
+            patch_dim=patch_dim, parallel_context=self.parallel_context
+        )
         self.vae_group = vae_group
 
     def forward(self, sample: torch.FloatTensor):
@@ -132,7 +151,11 @@ def _gathered(attention: nn.Module, **options) -> nn.Module:
     Written as a function so it can sit in a down block table beside the adapters that shard a
     convolution, none of whose sizing options a gather has any use for.
     """
-    return GatheredAttentionAdapter(attention, patch_dim=options["patch_dim"])
+    return GatheredAttentionAdapter(
+        attention,
+        patch_dim=options["patch_dim"],
+        parallel_context=options["parallel_context"],
+    )
 
 
 class _CausalEncoderAdapter(nn.Module):
@@ -166,17 +189,15 @@ class _CausalEncoderAdapter(nn.Module):
     ):
         super().__init__()
         adapter = type(self).__name__
-        if patch_dim == -3:
-            raise ValueError(
-                f"{adapter} does not support patch_dim F (-3); use H (-2) or W (-1)."
-            )
-        DistributedEnv.initialize(vae_group)
+        patch_dim = normalize_patch_dim(patch_dim, 5, spatial_only=True)
         self.patch_dim = patch_dim
-        DistributedEnv.set_patch_dim(patch_dim)
+        self.parallel_context = parallel_context(vae_group, patch_dim, ndim=5)
         self.vae_scale_factor = vae_scale_factor
         # Bands differ in size where the rows do not divide by the rank count, so every
         # convolution has to read the sizes rather than assume its neighbours match it.
-        options = dict(patch_dim=patch_dim)
+        options = dict(
+            patch_dim=patch_dim, parallel_context=self.parallel_context
+        )
         self.encoder = encoder
         self.encoder.conv_in = self._conv_adapter(
             encoder.conv_in, block_size=conv_block_size, **options
@@ -194,11 +215,19 @@ class _CausalEncoderAdapter(nn.Module):
         # HunyuanVideo ends on a GroupNorm, whose statistics span the axis being split. The RMS
         # norms the other families end on do not, and are left as they are.
         if isinstance(getattr(encoder, "conv_norm_out", None), nn.GroupNorm):
-            self.encoder.conv_norm_out = GroupNormAdapter(encoder.conv_norm_out)
+            self.encoder.conv_norm_out = GroupNormAdapter(
+                encoder.conv_norm_out, **options
+            )
         # Each band is a whole multiple of what the encoder narrows by, so it starts on the grid
         # the strided convolutions step along and the latent rows it produces are its own.
-        self.patchify = Patchify(patch_dim=patch_dim, scale_factor=vae_scale_factor)
-        self.depatchify = DePatchify(patch_dim=patch_dim)
+        self.patchify = Patchify(
+            patch_dim=patch_dim,
+            scale_factor=vae_scale_factor,
+            parallel_context=self.parallel_context,
+        )
+        self.depatchify = DePatchify(
+            patch_dim=patch_dim, parallel_context=self.parallel_context
+        )
         self.vae_group = vae_group
 
     @classmethod

@@ -8,7 +8,7 @@ import torch.distributed as dist
 from torch import Tensor
 
 from diffusers.models.activations import get_activation
-from distvae.utils import DistributedEnv
+from distvae.utils import DistributedEnv, ParallelContext, normalize_patch_dim
 
 
 class PatchGroupNorm(nn.GroupNorm):
@@ -66,8 +66,10 @@ class PatchGroupNorm(nn.GroupNorm):
         device=None,
         dtype=None,
         patch_dim: int = -2,
+        parallel_context: Optional[ParallelContext] = None,
     ) -> None:
-        self.patch_dim = patch_dim
+        self.parallel_context = parallel_context
+        self.patch_dim = parallel_context.patch_dim if parallel_context is not None else patch_dim
         super().__init__(
             num_groups=num_groups,
             num_channels=num_channels,
@@ -80,10 +82,20 @@ class PatchGroupNorm(nn.GroupNorm):
     def forward(self, x: Tensor) -> Tensor:
         ndim = x.ndim
         shape = x.shape
-        patch_dim = self.patch_dim if self.patch_dim >= 0 else ndim + self.patch_dim
+        patch_dim = ndim + normalize_patch_dim(
+            self.patch_dim, ndim, spatial_only=True
+        )
 
-        vae_group = DistributedEnv.get_vae_group()
-        group_world_size = DistributedEnv.get_group_world_size()
+        vae_group = (
+            self.parallel_context.group
+            if self.parallel_context is not None
+            else DistributedEnv.get_vae_group()
+        )
+        group_world_size = (
+            self.parallel_context.world_size
+            if self.parallel_context is not None
+            else DistributedEnv.get_group_world_size()
+        )
         x = x.detach()
         channels_per_group = shape[1] // self.num_groups
 

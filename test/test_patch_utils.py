@@ -18,6 +18,7 @@ import torch
 import torch.distributed as dist
 
 from distvae.modules.patch_utils import DePatchify, Patchify, gather_patches
+from distvae.utils import ParallelContext, normalize_patch_dim
 
 from distributed_harness import assert_matches_reference, init_gloo, run_distributed
 
@@ -110,6 +111,34 @@ def test_rows_that_are_not_a_multiple_of_the_ratio_are_refused(master_port):
 def test_more_ranks_than_bands_is_refused(master_port):
     # 16 rows at a ratio of 8 leaves two bands, which three ranks cannot share.
     run_distributed(refusal_worker, 3, (16, 8, "at most 2 ranks"), master_port)
+
+
+@pytest.mark.parametrize("patch_dim", [-2, 3])
+def test_video_height_spellings_normalize_to_the_same_axis(patch_dim):
+    assert normalize_patch_dim(patch_dim, ndim=5, spatial_only=True) == -2
+
+
+@pytest.mark.parametrize("patch_dim", [-1, 4])
+def test_video_width_spellings_normalize_to_the_same_axis(patch_dim):
+    assert normalize_patch_dim(patch_dim, ndim=5, spatial_only=True) == -1
+
+
+@pytest.mark.parametrize("patch_dim", [-3, 2])
+def test_video_frame_axis_spellings_are_rejected(patch_dim):
+    with pytest.raises(ValueError, match="frame axis"):
+        normalize_patch_dim(patch_dim, ndim=5, spatial_only=True)
+
+
+def test_patchifiers_keep_their_own_parallel_context():
+    first_context = ParallelContext(group=None, rank=0, world_size=2, patch_dim=-2)
+    first = Patchify(parallel_context=first_context)
+    second_context = ParallelContext(group=None, rank=1, world_size=2, patch_dim=-1)
+    second = Patchify(parallel_context=second_context)
+    whole = torch.arange(24).reshape(1, 1, 4, 6)
+
+    assert torch.equal(first(whole), whole[:, :, :2, :])
+    assert torch.equal(second(whole), whole[:, :, :, 3:])
+    assert first.parallel_context is first_context
 
 
 if __name__ == "__main__":

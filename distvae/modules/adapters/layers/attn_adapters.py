@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from distvae.modules.patch_utils import gather_patches
-from distvae.utils import DistributedEnv
+from distvae.utils import DistributedEnv, ParallelContext, normalize_patch_dim
 
 
 class GatheredAttentionAdapter(torch.nn.Module):
@@ -21,16 +21,26 @@ class GatheredAttentionAdapter(torch.nn.Module):
         self,
         module: nn.Module,
         patch_dim: int = -2,
+        parallel_context: ParallelContext = None,
     ) -> None:
         super().__init__()
         self.module = module
-        self.patch_dim = patch_dim
+        self.parallel_context = parallel_context
+        self.patch_dim = parallel_context.patch_dim if parallel_context is not None else patch_dim
 
     def forward(self, hidden_states: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
-        patch_dim = self.patch_dim if self.patch_dim >= 0 else hidden_states.ndim + self.patch_dim
-        rank = DistributedEnv.get_rank_in_vae_group()
+        patch_dim = hidden_states.ndim + normalize_patch_dim(
+            self.patch_dim, hidden_states.ndim, spatial_only=True
+        )
+        rank = (
+            self.parallel_context.rank
+            if self.parallel_context is not None
+            else DistributedEnv.get_rank_in_vae_group()
+        )
 
-        patches, sizes = gather_patches(hidden_states, patch_dim)
+        patches, sizes = gather_patches(
+            hidden_states, patch_dim, parallel_context=self.parallel_context
+        )
         whole = self.module(torch.cat(patches, dim=patch_dim), *args, **kwargs)
         return torch.narrow(whole, patch_dim, sum(sizes[:rank]), sizes[rank])
 

@@ -23,6 +23,7 @@ from distvae.models.layers.conv_utils import (
     build_crop_slice,
 )
 from distvae.models.layers.conv_mixin import PatchConvMixin
+from distvae.utils import ParallelContext, normalize_patch_dim
 
 
 class PatchConv3d(nn.Conv3d, PatchConvMixin):
@@ -49,6 +50,7 @@ class PatchConv3d(nn.Conv3d, PatchConvMixin):
         dtype=None,
         block_size: Union[int, Tuple[int, int, int]] = 0,
         patch_dim: int = -2,
+        parallel_context: ParallelContext = None,
     ) -> None:
         """patch_dim: which spatial dim is split (F=-3/3, H=-2/2, W=-1/4). block_size: 0 => prefer direct path; int or (F,H,W) => chunked when any spatial > block_size."""
         if isinstance(dilation, int):
@@ -56,11 +58,10 @@ class PatchConv3d(nn.Conv3d, PatchConvMixin):
         else:
             for i in dilation:
                 assert i == 1, "dilation is not supported in PatchConv3d"
-        assert patch_dim in (-3, -2, -1, 2, 3, 4), (
-            "PatchConv3d patch_dim must be F (-3 or 3) or H (-2 or 2) or W (-1 or 4)"
-        )
+        patch_dim = normalize_patch_dim(patch_dim, 5, spatial_only=True)
         self.block_size = block_size
-        self.patch_dim = patch_dim
+        self.parallel_context = parallel_context
+        self.patch_dim = parallel_context.patch_dim if parallel_context is not None else patch_dim
         self.halo_buffer = {}
         super().__init__(
             in_channels, out_channels, kernel_size, stride, padding, dilation,
@@ -73,7 +74,9 @@ class PatchConv3d(nn.Conv3d, PatchConvMixin):
     def _conv_forward(self, input: Tensor, weight: Tensor, bias: Optional[Tensor]):
         bs, channels, f, h, w = input.shape
 
-        group_world_size, global_rank, rank_in_group, local_rank = get_world_size_and_rank()
+        group_world_size, global_rank, rank_in_group, local_rank = get_world_size_and_rank(
+            self.parallel_context
+        )
 
         # Single rank: use standard F.conv3d (with optional padding_mode).
         if (group_world_size == 1):

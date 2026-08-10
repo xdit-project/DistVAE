@@ -13,6 +13,7 @@ from distvae.models.layers.conv_utils import (
     correct_start,
 )
 from distvae.models.layers.conv_mixin import PatchConvMixin
+from distvae.utils import ParallelContext, normalize_patch_dim
 
 
 class WanZeroPadConv2d(nn.Conv2d, PatchConvMixin):
@@ -30,15 +31,14 @@ class WanZeroPadConv2d(nn.Conv2d, PatchConvMixin):
         reversed_zero_padding: Union[int, _size_4_t] = 0,
         block_size: Union[int, Tuple[int, int, int]] = 0,
         patch_dim: int = -2,
+        parallel_context: ParallelContext = None,
     ) -> None:
         if isinstance(dilation, int):
             assert dilation == 1, "dilation is not supported in WanZeroPadConv2d"
         else:
             for i in dilation:
                 assert i == 1, "dilation is not supported in WanZeroPadConv2d"
-        assert patch_dim in (-2, -1), (
-            "WanZeroPadConv2d patch_dim must be H (-2) or W (-1)"
-        )
+        patch_dim = normalize_patch_dim(patch_dim, 4, spatial_only=True)
         if isinstance(reversed_zero_padding, int):
             reversed_zero_padding = (
                 reversed_zero_padding, reversed_zero_padding, reversed_zero_padding, reversed_zero_padding
@@ -68,7 +68,8 @@ class WanZeroPadConv2d(nn.Conv2d, PatchConvMixin):
 
         self.reversed_zero_padding = reversed_zero_padding
         self.block_size = block_size
-        self.patch_dim = patch_dim
+        self.parallel_context = parallel_context
+        self.patch_dim = parallel_context.patch_dim if parallel_context is not None else patch_dim
         self.halo_buffer = {}
         super().__init__(
             in_channels,
@@ -89,12 +90,14 @@ class WanZeroPadConv2d(nn.Conv2d, PatchConvMixin):
         return 4
 
     def _conv_forward(self, input: Tensor, weight: Tensor, bias: Optional[Tensor]):
-        group_world_size, global_rank, rank_in_group, local_rank = get_world_size_and_rank()
+        group_world_size, global_rank, rank_in_group, local_rank = get_world_size_and_rank(
+            self.parallel_context
+        )
 
         bs, channels, h, w = input.shape
         reversed_zero_padding = tuple(self.reversed_zero_padding)
 
-        patch_dim = self.patch_dim if self.patch_dim >= 0 else input.ndim + self.patch_dim
+        patch_dim = input.ndim + normalize_patch_dim(self.patch_dim, input.ndim)
         # The pad-then-stride-2 arithmetic below assumes each band halves cleanly. Bands are cut
         # in multiples of what the whole encoder narrows by, so they are still even here.
         assert input.shape[patch_dim] % 2 == 0, "input.shape[patch_dim] must be even"

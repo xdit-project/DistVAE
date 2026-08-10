@@ -19,6 +19,7 @@ import torch.nn as nn
 
 from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from distvae.modules.patch_utils import DePatchify, Patchify
+from distvae.utils import ParallelContext
 
 from distributed_harness import (
     assert_matches_reference,
@@ -28,13 +29,13 @@ from distributed_harness import (
 )
 
 
-def worker(rank, world_size, shape, num_groups, patch_dim, seed, master_port):
+def worker(rank, world_size, shape, num_groups, patch_dim, seed, affine, master_port):
     init_gloo(rank, world_size, master_port)
     try:
         torch.manual_seed(seed)
         channels = shape[1]
         norm = nn.GroupNorm(
-            num_groups=num_groups, num_channels=channels, eps=1e-6, affine=True
+            num_groups=num_groups, num_channels=channels, eps=1e-6, affine=affine
         ).eval()
         # Shifted per channel, so the group statistics are not already near zero mean and unit
         # variance and an incorrect reduction has somewhere to show up.
@@ -42,7 +43,7 @@ def worker(rank, world_size, shape, num_groups, patch_dim, seed, master_port):
 
         patchify = Patchify(patch_dim=patch_dim)
         depatchify = DePatchify(patch_dim=patch_dim)
-        sharded = GroupNormAdapter(norm)
+        sharded = GroupNormAdapter(norm, patch_dim=patch_dim)
 
         with torch.no_grad():
             expected = norm(x) if rank == 0 else None
@@ -56,7 +57,7 @@ def worker(rank, world_size, shape, num_groups, patch_dim, seed, master_port):
 @pytest.mark.gloo
 @pytest.mark.parametrize("world_size", [1, 2, 4])
 def test_it_matches_group_norm_on_a_feature_map(world_size, master_port, seed=42):
-    run_distributed(worker, world_size, ((1, 16, 16, 16), 8, -2, seed), master_port)
+    run_distributed(worker, world_size, ((1, 16, 16, 16), 8, -2, seed, True), master_port)
 
 
 @pytest.mark.gloo
@@ -64,12 +65,37 @@ def test_it_matches_group_norm_on_a_feature_map(world_size, master_port, seed=42
 def test_it_matches_group_norm_on_a_video_feature_map(world_size, master_port, seed=42):
     # The video VAEs normalise over (F, H, W), so the reduction has to cover the axes either
     # side of the one being split, not just the split one.
-    run_distributed(worker, world_size, ((1, 16, 3, 8, 8), 4, -2, seed), master_port)
+    run_distributed(worker, world_size, ((1, 16, 3, 8, 8), 4, -2, seed, True), master_port)
 
 
 @pytest.mark.gloo
 def test_it_matches_group_norm_when_the_width_is_split(master_port, seed=42):
-    run_distributed(worker, 2, ((1, 16, 16, 16), 8, -1, seed), master_port)
+    run_distributed(worker, 2, ((1, 16, 16, 16), 8, -1, seed, True), master_port)
+
+
+@pytest.mark.gloo
+def test_it_matches_group_norm_when_uneven_width_is_split_without_affine(master_port, seed=42):
+    run_distributed(
+        worker, 3, ((1, 16, 8, 10), 8, -1, seed, False), master_port
+    )
+
+
+def test_constructing_a_second_norm_adapter_does_not_reconfigure_the_first(monkeypatch):
+    first_group, second_group = object(), object()
+    first_context = ParallelContext(first_group, rank=0, world_size=2, patch_dim=-2)
+    second_context = ParallelContext(second_group, rank=0, world_size=2, patch_dim=-1)
+    first = GroupNormAdapter(nn.GroupNorm(1, 2), parallel_context=first_context)
+    GroupNormAdapter(nn.GroupNorm(1, 2), parallel_context=second_context)
+    used_groups = []
+
+    monkeypatch.setattr(
+        dist,
+        "all_reduce",
+        lambda tensor, group=None: used_groups.append(group),
+    )
+    first(torch.randn(1, 2, 2, 2))
+
+    assert used_groups == [first_group, first_group]
 
 
 def bfloat16_worker(rank, world_size, shape, num_groups, patch_dim, seed, master_port):
@@ -92,7 +118,7 @@ def bfloat16_worker(rank, world_size, shape, num_groups, patch_dim, seed, master
 
             patchify = Patchify(patch_dim=patch_dim)
             depatchify = DePatchify(patch_dim=patch_dim)
-            actual = depatchify(GroupNormAdapter(norm)(patchify(x)))
+            actual = depatchify(GroupNormAdapter(norm, patch_dim=patch_dim)(patchify(x)))
 
         assert_no_less_precise_than(rank, actual, stock, gold, "PatchGroupNorm in bfloat16")
     finally:

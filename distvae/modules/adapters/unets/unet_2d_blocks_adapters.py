@@ -10,6 +10,7 @@ from distvae.models.unets.unet_2d_blocks import PatchUpDecoderBlock2D
 from diffusers.models.unets.unet_2d_blocks import DownEncoderBlock2D, UpDecoderBlock2D
 from diffusers.models.resnet import ResnetBlock2D
 from diffusers.models.upsampling import Upsample2D
+from distvae.utils import ParallelContext
 
 
 class UpDecoderBlock2DAdapter(nn.Module):
@@ -18,6 +19,8 @@ class UpDecoderBlock2DAdapter(nn.Module):
         up_block: UpDecoderBlock2D,
         *,
         conv_block_size = 0,
+        patch_dim: int = -2,
+        parallel_context: ParallelContext = None,
     ):
         super().__init__()
         assert up_block is not None and isinstance(up_block, UpDecoderBlock2D), "up_block must be a UpDecoderBlock2D instance"
@@ -29,11 +32,21 @@ class UpDecoderBlock2DAdapter(nn.Module):
         )
         self.up_block.resolution_idx = up_block.resolution_idx
         self.up_block.resnets = nn.ModuleList([
-            ResnetBlock2DAdapter(resnet, conv_block_size=conv_block_size) for resnet in up_block.resnets if isinstance(resnet, ResnetBlock2D)
+            ResnetBlock2DAdapter(
+                resnet,
+                conv_block_size=conv_block_size,
+                patch_dim=patch_dim,
+                parallel_context=parallel_context,
+            ) for resnet in up_block.resnets if isinstance(resnet, ResnetBlock2D)
         ])
         if up_block.upsamplers is not None:
             self.up_block.upsamplers = nn.ModuleList([
-                Upsample2DAdapter(upsampler, conv_block_size=conv_block_size) for upsampler in up_block.upsamplers if isinstance(upsampler, Upsample2D)
+                Upsample2DAdapter(
+                    upsampler,
+                    conv_block_size=conv_block_size,
+                    patch_dim=patch_dim,
+                    parallel_context=parallel_context,
+                ) for upsampler in up_block.upsamplers if isinstance(upsampler, Upsample2D)
             ])
             assert len(self.up_block.upsamplers) == len(up_block.upsamplers), "Number of upsamplers in the adapter must match the number of upsamplers in the original block"
 
@@ -56,6 +69,7 @@ class DownEncoderBlock2DAdapter(nn.Module):
         *,
         conv_block_size = 0,
         patch_dim: int = -2,
+        parallel_context: ParallelContext = None,
     ):
         super().__init__()
         assert isinstance(down_block, DownEncoderBlock2D), (
@@ -63,7 +77,12 @@ class DownEncoderBlock2DAdapter(nn.Module):
         )
         self.down_block = down_block
         down_block.resnets = nn.ModuleList([
-            ResnetBlock2DAdapter(resnet, conv_block_size=conv_block_size)
+            ResnetBlock2DAdapter(
+                resnet,
+                conv_block_size=conv_block_size,
+                patch_dim=patch_dim,
+                parallel_context=parallel_context,
+            )
             for resnet in down_block.resnets
         ])
         if down_block.downsamplers is not None:
@@ -72,6 +91,7 @@ class DownEncoderBlock2DAdapter(nn.Module):
                     downsampler,
                     conv_block_size=conv_block_size,
                     patch_dim=patch_dim,
+                    parallel_context=parallel_context,
                 )
                 for downsampler in down_block.downsamplers
             ])

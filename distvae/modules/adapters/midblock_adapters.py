@@ -13,7 +13,7 @@ from distvae.modules.adapters.diffusers_blocks import (
     resolved,
 )
 from distvae.modules.adapters.layers.attn_adapters import GatheredAttentionAdapter
-from distvae.utils import cache_cursor
+from distvae.utils import ParallelContext, cache_cursor
 from distvae.modules.adapters.resnet_adapters import (
     HunyuanVideo15ResnetBlockAdapter,
     HunyuanVideoResnetBlockAdapter,
@@ -40,6 +40,7 @@ class _CausalMidBlockAdapter(nn.Module):
         mid_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
+        parallel_context: ParallelContext = None,
     ):
         super().__init__()
 
@@ -54,10 +55,13 @@ class _CausalMidBlockAdapter(nn.Module):
                 resnet,
                 conv_block_size=conv_block_size,
                 patch_dim=patch_dim,
+                parallel_context=parallel_context,
             ) for resnet in mid_block.resnets
         ])
         self.mid_block.attentions = nn.ModuleList([
-            GatheredAttentionAdapter(attn, patch_dim=patch_dim) if attn is not None else attn
+            GatheredAttentionAdapter(
+                attn, patch_dim=patch_dim, parallel_context=parallel_context
+            ) if attn is not None else attn
             for attn in mid_block.attentions
         ])
 
@@ -85,6 +89,7 @@ class HunyuanVideo15MidBlockAdapter(nn.Module):
         mid_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
+        parallel_context: ParallelContext = None,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -99,10 +104,13 @@ class HunyuanVideo15MidBlockAdapter(nn.Module):
                 resnet,
                 conv_block_size=conv_block_size,
                 patch_dim=patch_dim,
+                parallel_context=parallel_context,
             ) for resnet in mid_block.resnets
         ])
         mid_block.attentions = nn.ModuleList([
-            GatheredAttentionAdapter(attn, patch_dim=patch_dim) if attn is not None else attn
+            GatheredAttentionAdapter(
+                attn, patch_dim=patch_dim, parallel_context=parallel_context
+            ) if attn is not None else attn
             for attn in mid_block.attentions
         ])
 
@@ -127,6 +135,7 @@ class HunyuanVideoMidBlockAdapter(nn.Module):
         mid_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
+        parallel_context: ParallelContext = None,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -136,13 +145,16 @@ class HunyuanVideoMidBlockAdapter(nn.Module):
             f"{adapter} does not support mid block except HunyuanVideoMidBlock3D"
         )
         if any(attn is not None for attn in mid_block.attentions):
-            self.mid_block = GatheredAttentionAdapter(mid_block, patch_dim=patch_dim)
+            self.mid_block = GatheredAttentionAdapter(
+                mid_block, patch_dim=patch_dim, parallel_context=parallel_context
+            )
         else:
             mid_block.resnets = nn.ModuleList([
                 HunyuanVideoResnetBlockAdapter(
                     resnet,
                     conv_block_size=conv_block_size,
                     patch_dim=patch_dim,
+                    parallel_context=parallel_context,
                 ) for resnet in mid_block.resnets
             ])
             self.mid_block = mid_block
@@ -163,6 +175,7 @@ class LTX2VideoMidBlockAdapter(nn.Module):
         mid_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
+        parallel_context: ParallelContext = None,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -177,6 +190,7 @@ class LTX2VideoMidBlockAdapter(nn.Module):
                 resnet,
                 conv_block_size=conv_block_size,
                 patch_dim=patch_dim,
+                parallel_context=parallel_context,
             ) for resnet in mid_block.resnets
         ])
 

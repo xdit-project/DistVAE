@@ -11,17 +11,23 @@ from distvae.models.layers.conv3d import PatchConv3d
 class TestPatchConv3dConstructor:
     """Tests for PatchConv3d constructor."""
 
-    @pytest.mark.parametrize("patch_dim", [-3, -2, -1, 2, 3, 4])
-    def test_valid_patch_dim(self, patch_dim):
+    @pytest.mark.parametrize(
+        "patch_dim,expected", [(-2, -2), (3, -2), (-1, -1), (4, -1)]
+    )
+    def test_valid_patch_dim(self, patch_dim, expected):
         module = PatchConv3d(4, 8, 3, patch_dim=patch_dim)
-        assert module.patch_dim == patch_dim
+        assert module.patch_dim == expected
         assert module.block_size == 0
+
+    @pytest.mark.parametrize("patch_dim", [-3, 2])
+    def test_frame_patch_dim_raises(self, patch_dim):
+        with pytest.raises(ValueError, match="frame axis"):
+            PatchConv3d(4, 8, 3, patch_dim=patch_dim)
 
     @pytest.mark.parametrize("patch_dim", [0, 1, 5])
     def test_invalid_patch_dim_raises(self, patch_dim):
-        with pytest.raises(AssertionError) as exc_info:
+        with pytest.raises(ValueError):
             PatchConv3d(4, 8, 3, patch_dim=patch_dim)
-        assert "F (-3 or 3) or H (-2 or 2) or W (-1 or 4)" in str(exc_info.value)
 
     def test_dilation_int_raises(self):
         with pytest.raises(AssertionError) as exc_info:

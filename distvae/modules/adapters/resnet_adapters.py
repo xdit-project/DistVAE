@@ -22,7 +22,7 @@ from distvae.modules.adapters.layers.conv_adapters import (
     WanCausalConv3dAdapter,
 )
 from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
-from distvae.utils import cache_cursor
+from distvae.utils import ParallelContext, cache_cursor
 from diffusers.models.resnet import ResnetBlock2D
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, WanResidualBlock
 
@@ -38,6 +38,8 @@ class ResnetBlock2DAdapter(nn.Module):
         resnet: ResnetBlock2D, 
         *, 
         conv_block_size = 0,
+        patch_dim: int = -2,
+        parallel_context: ParallelContext = None,
     ):
         super().__init__()
         assert resnet.time_emb_proj is None, "temb_channels is not supported in ResnetBlock2DAdapter currently"
@@ -58,15 +60,24 @@ class ResnetBlock2DAdapter(nn.Module):
             use_in_shortcut=resnet.use_in_shortcut,
             up=resnet.up,
             down=resnet.down,
+            patch_dim=patch_dim,
+            parallel_context=parallel_context,
         )
         self.resnet.use_in_shortcut = resnet.use_in_shortcut
-        self.resnet.conv1 = Conv2dAdapter(resnet.conv1, block_size=conv_block_size)
-        self.resnet.norm1 = GroupNormAdapter(resnet.norm1)
-        self.resnet.conv2 = Conv2dAdapter(resnet.conv2, block_size=conv_block_size)
-        self.resnet.norm2 = GroupNormAdapter(resnet.norm2)
+        options = dict(patch_dim=patch_dim, parallel_context=parallel_context)
+        self.resnet.conv1 = Conv2dAdapter(
+            resnet.conv1, block_size=conv_block_size, **options
+        )
+        self.resnet.norm1 = GroupNormAdapter(resnet.norm1, **options)
+        self.resnet.conv2 = Conv2dAdapter(
+            resnet.conv2, block_size=conv_block_size, **options
+        )
+        self.resnet.norm2 = GroupNormAdapter(resnet.norm2, **options)
         self.resnet.dropout = resnet.dropout
         self.resnet.nonlinearity = resnet.nonlinearity
-        self.resnet.conv_shortcut = Conv2dAdapter(resnet.conv_shortcut, block_size=conv_block_size) if resnet.conv_shortcut is not None else None
+        self.resnet.conv_shortcut = Conv2dAdapter(
+            resnet.conv_shortcut, block_size=conv_block_size, **options
+        ) if resnet.conv_shortcut is not None else None
         
 
     def forward(self, x, temb: torch.FloatTensor = None, *args, **kwargs):
@@ -89,6 +100,7 @@ class _CausalResidualBlockAdapter(nn.Module):
         residual_block: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
+        parallel_context: ParallelContext = None,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -105,6 +117,7 @@ class _CausalResidualBlockAdapter(nn.Module):
                     getattr(residual_block, name),
                     block_size=conv_block_size,
                     patch_dim=patch_dim,
+                    parallel_context=parallel_context,
                 ),
             )
         # Adapt conv_shortcut if it's not nn.Identity
@@ -113,6 +126,7 @@ class _CausalResidualBlockAdapter(nn.Module):
                 residual_block.conv_shortcut,
                 block_size=conv_block_size,
                 patch_dim=patch_dim,
+                parallel_context=parallel_context,
             )
 
     def forward(self, x, feat_cache=None, feat_idx=None):
@@ -150,6 +164,7 @@ class _PaddedCausalResnetBlockAdapter(nn.Module):
         resnet: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
+        parallel_context: ParallelContext = None,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -166,12 +181,21 @@ class _PaddedCausalResnetBlockAdapter(nn.Module):
                     getattr(resnet, name),
                     block_size=conv_block_size,
                     patch_dim=patch_dim,
+                    parallel_context=parallel_context,
                 ),
             )
         for name in ("norm1", "norm2"):
             norm = getattr(resnet, name)
             if isinstance(norm, nn.GroupNorm):
-                setattr(resnet, name, GroupNormAdapter(norm))
+                setattr(
+                    resnet,
+                    name,
+                    GroupNormAdapter(
+                        norm,
+                        patch_dim=patch_dim,
+                        parallel_context=parallel_context,
+                    ),
+                )
         # Where the shortcut is a causal convolution it needs the same treatment; where it is a
         # bare 1x1x1 it reads one position per output and is already right on a patch.
         if isinstance(resnet.conv_shortcut, self._conv_adapter._supported):
@@ -179,6 +203,7 @@ class _PaddedCausalResnetBlockAdapter(nn.Module):
                 resnet.conv_shortcut,
                 block_size=conv_block_size,
                 patch_dim=patch_dim,
+                parallel_context=parallel_context,
             )
 
     def forward(self, hidden_states):
@@ -212,6 +237,7 @@ class LTX2VideoResnetBlockAdapter(nn.Module):
         resnet: nn.Module,
         conv_block_size = 0,
         patch_dim: int = -2,
+        parallel_context: ParallelContext = None,
     ):
         super().__init__()
         adapter = type(self).__name__
@@ -237,6 +263,7 @@ class LTX2VideoResnetBlockAdapter(nn.Module):
                     getattr(resnet, name),
                     block_size=conv_block_size,
                     patch_dim=patch_dim,
+                    parallel_context=parallel_context,
                 ),
             )
 

@@ -1,14 +1,18 @@
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from distvae.utils import DistributedEnv
+from distvae.utils import DistributedEnv, ParallelContext, normalize_patch_dim
 
 
-def gather_patches(patch: torch.Tensor, patch_dim: int) -> Tuple[List[torch.Tensor], List[int]]:
+def gather_patches(
+    patch: torch.Tensor,
+    patch_dim: int,
+    parallel_context: Optional[ParallelContext] = None,
+) -> Tuple[List[torch.Tensor], List[int]]:
     """All-gather patches that need not be the same size along patch_dim
 
     dist.all_gather insists every rank contributes the same shape, so a rank holding fewer rows
@@ -19,8 +23,19 @@ def gather_patches(patch: torch.Tensor, patch_dim: int) -> Tuple[List[torch.Tens
     Returns each rank's patch in rank order, and the sizes, which callers need to locate their
     own rows within the whole.
     """
-    group = DistributedEnv.get_vae_group()
-    world_size = DistributedEnv.get_group_world_size()
+    patch_dim = patch.ndim + normalize_patch_dim(
+        patch_dim, patch.ndim, spatial_only=True
+    )
+    group = (
+        parallel_context.group
+        if parallel_context is not None
+        else DistributedEnv.get_vae_group()
+    )
+    world_size = (
+        parallel_context.world_size
+        if parallel_context is not None
+        else DistributedEnv.get_group_world_size()
+    )
 
     # One rank already holds the whole thing, so there is nothing to collect and no other size to
     # discover. Both gathers below would be round trips whose answer is the argument. Callers
@@ -72,15 +87,27 @@ class Patchify(nn.Module):
         self,
         patch_dim: int = -2,
         scale_factor: int = 1,
+        parallel_context: Optional[ParallelContext] = None,
     ):
         super().__init__()
-        self.group_world_size = DistributedEnv.get_group_world_size()
-        self.rank_in_vae_group = DistributedEnv.get_rank_in_vae_group()
-        self.patch_dim = patch_dim
+        self.parallel_context = parallel_context
+        self.group_world_size = (
+            parallel_context.world_size
+            if parallel_context is not None
+            else DistributedEnv.get_group_world_size()
+        )
+        self.rank_in_vae_group = (
+            parallel_context.rank
+            if parallel_context is not None
+            else DistributedEnv.get_rank_in_vae_group()
+        )
+        self.patch_dim = parallel_context.patch_dim if parallel_context is not None else patch_dim
         self.scale_factor = scale_factor
 
     def forward(self, hidden_state):
-        patch_dim = self.patch_dim if self.patch_dim >= 0 else hidden_state.ndim + self.patch_dim
+        patch_dim = hidden_state.ndim + normalize_patch_dim(
+            self.patch_dim, hidden_state.ndim, spatial_only=True
+        )
         size = hidden_state.shape[patch_dim]
         factor = max(1, self.scale_factor)
         if size % factor:
@@ -105,13 +132,20 @@ class Patchify(nn.Module):
 
 
 class DePatchify(nn.Module):
-    def __init__(self, patch_dim: int = -2):
+    def __init__(
+        self,
+        patch_dim: int = -2,
+        parallel_context: Optional[ParallelContext] = None,
+    ):
         super().__init__()
-        self.patch_dim = patch_dim
+        self.parallel_context = parallel_context
+        self.patch_dim = parallel_context.patch_dim if parallel_context is not None else patch_dim
 
     def forward(self, patch_hidden_state):
-        patch_dim = (
-            self.patch_dim if self.patch_dim >= 0 else patch_hidden_state.ndim + self.patch_dim
+        patch_dim = patch_hidden_state.ndim + normalize_patch_dim(
+            self.patch_dim, patch_hidden_state.ndim, spatial_only=True
         )
-        patches, _ = gather_patches(patch_hidden_state, patch_dim)
+        patches, _ = gather_patches(
+            patch_hidden_state, patch_dim, parallel_context=self.parallel_context
+        )
         return torch.cat(patches, dim=patch_dim)
