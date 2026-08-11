@@ -104,6 +104,31 @@ def _axis_window(length, overlap, count):
     return math.ceil(length / count) + overlap
 
 
+def _overlap_options(length, count, native):
+    """Overlap candidates for one axis, in output pixels, widest first.
+
+    An inactive axis blends nothing, as before. On an active axis the pitch - the un-overlapped
+    share each tile advances by - is the only scale a blend means anything against, so the ladder
+    is a fraction of the pitch rather than one fixed pixel count.
+
+    Pinning every candidate to the VAE's native overlap is what kept this planner away from the
+    plans worth having. `window = pitch + overlap`, so a native overlap of 256px puts a 256px
+    floor under every window at every tile count. A tile is a memory win over row sharding
+    exactly when `window_area < (height / ranks) * width`, and with that floor in place the
+    smallest window the search could reach on a 1024x1024 sample at four ranks was 512x512 -
+    which ties the row baseline at 262144 and never beats it. Every plan the suite proposed was
+    therefore at best memory-neutral, which read as "tiling does not help" when it was really
+    "the search could not get there". Letting overlap shrink reaches 272x272 on the same sample.
+
+    `native` stays in the set so the previous behaviour remains reachable and comparable.
+    """
+    if count == 1:
+        return (0,)
+    pitch = math.ceil(length / count)
+    options = {native} | {pitch // share for share in (2, 4, 8)}
+    return tuple(sorted((option for option in options if option > 0), reverse=True))
+
+
 def topology_objectives(window, overlap, sample_shape, world_size):
     """Price actual clipped tile areas and deterministic scheduler imbalance."""
     axis_sizes = []
@@ -122,13 +147,20 @@ def topology_objectives(window, overlap, sample_shape, world_size):
         for rank in range(world_size)
     ]
     average = sum(loads) / world_size
+    window_area = window[0] * window[1]
+    # What a rank holds under plain row sharding, which is the baseline every tiled plan is
+    # really competing with - not the unsharded decode. Recording it makes "is this plan a
+    # memory win at all?" answerable from the report instead of by hand.
+    row_shard_area = math.ceil(sample_shape[0] / world_size) * sample_shape[1]
     return {
-        "window_area": window[0] * window[1],
+        "window_area": window_area,
         "decoded_area": sum(weights),
         "tile_count": tile_count,
         "max_rank_area": max(loads),
         "rank_imbalance": max(loads) / average - 1,
         "tile_grid": tuple(len(sizes) for sizes in axis_sizes),
+        "row_shard_area": row_shard_area,
+        "beats_row_sharding": window_area < row_shard_area,
     }
 
 
@@ -175,30 +207,37 @@ def select_plans(sample_shape, native_overlap, world_size, normalize):
             requested_tiles = down * across
             if not min_tiles <= requested_tiles <= max_tiles:
                 continue
-            overlap = (
-                0 if down == 1 else native_overlap[0],
-                0 if across == 1 else native_overlap[1],
-            )
-            window = (
-                _axis_window(sample_shape[0], overlap[0], down),
-                _axis_window(sample_shape[1], overlap[1], across),
-            )
-            normalized = normalize(window, overlap)
-            if normalized is None:
-                continue
-            window, overlap = normalized
-            if any(blend >= size for blend, size in zip(overlap, window)):
-                continue
-            objectives = topology_objectives(
-                window, overlap, sample_shape, world_size
-            )
-            if not min_tiles <= objectives["tile_count"] <= max_tiles:
-                continue
-            candidates[(window, overlap)] = {
-                "window": tuple(window),
-                "overlap": tuple(overlap),
-                "objectives": objectives,
-            }
+            # Overlap is a search dimension, not a constant. Reducing it shrinks the window
+            # without changing the grid - stride stays at the pitch either way - so it is the
+            # cheapest axis the planner has, and holding it fixed forfeited the whole region
+            # where tiling beats row sharding. See _overlap_options.
+            for down_overlap in _overlap_options(
+                sample_shape[0], down, native_overlap[0]
+            ):
+                for across_overlap in _overlap_options(
+                    sample_shape[1], across, native_overlap[1]
+                ):
+                    overlap = (down_overlap, across_overlap)
+                    window = (
+                        _axis_window(sample_shape[0], overlap[0], down),
+                        _axis_window(sample_shape[1], overlap[1], across),
+                    )
+                    normalized = normalize(window, overlap)
+                    if normalized is None:
+                        continue
+                    window, overlap = normalized
+                    if any(blend >= size for blend, size in zip(overlap, window)):
+                        continue
+                    objectives = topology_objectives(
+                        window, overlap, sample_shape, world_size
+                    )
+                    if not min_tiles <= objectives["tile_count"] <= max_tiles:
+                        continue
+                    candidates[(tuple(window), tuple(overlap))] = {
+                        "window": tuple(window),
+                        "overlap": tuple(overlap),
+                        "objectives": objectives,
+                    }
     frontier = pareto_frontier(list(candidates.values()))
     if len(frontier) < 3:
         raise ValueError(

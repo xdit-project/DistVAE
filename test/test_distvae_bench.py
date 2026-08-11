@@ -180,6 +180,55 @@ def test_selector_zeros_overlap_on_inactive_strip_axis():
             assert plan["overlap"][1] == 0
 
 
+def test_selector_searches_overlap_and_can_beat_row_sharding():
+    """A plan is only a memory win when its window is smaller than a row shard.
+
+    Overlap used to be pinned at the VAE native value, and since `window = pitch + overlap`
+    that put a floor under every window: on this sample the smallest reachable was 512x512,
+    which exactly ties the 262144 a rank holds under row sharding. The suite could therefore
+    never propose a memory win, which looked like a result about tiling and was really a
+    result about the search space.
+    """
+    sample_shape, world_size, native = (1024, 1024), 4, (256, 256)
+    plans = cases.select_plans(
+        sample_shape=sample_shape,
+        native_overlap=native,
+        world_size=world_size,
+        normalize=lambda window, overlap: (window, overlap),
+    )
+
+    row_shard_area = (sample_shape[0] // world_size) * sample_shape[1]
+    memory = next(plan for plan in plans if plan["profile"] == "memory")
+    assert memory["objectives"]["window_area"] < row_shard_area
+    assert memory["objectives"]["beats_row_sharding"]
+    # The pinned-overlap search could not get below the native value on an active axis.
+    assert min(memory["overlap"]) < min(native)
+
+
+def test_overlap_ladder_scales_with_pitch_and_keeps_the_native_value():
+    # An inactive axis still blends nothing, which the strip cases rely on.
+    assert cases._overlap_options(1024, 1, 256) == (0,)
+
+    options = cases._overlap_options(1024, 4, 256)
+    assert 256 in options, "the native overlap must stay reachable for comparability"
+    assert options == tuple(sorted(options, reverse=True)), "widest first"
+    assert all(option > 0 for option in options)
+    # Pitch is 256 here, so the ladder is halves, quarters and eighths of it.
+    assert {128, 64, 32} <= set(options)
+
+
+def test_row_shard_area_is_recorded_against_every_plan():
+    objectives = cases.topology_objectives(
+        window=(72, 72),
+        overlap=(8, 8),
+        sample_shape=(128, 128),
+        world_size=2,
+    )
+
+    assert objectives["row_shard_area"] == 64 * 128
+    assert objectives["beats_row_sharding"] is (72 * 72 < 64 * 128)
+
+
 def test_vae_normalizer_rejects_windows_with_too_few_latent_rows(monkeypatch):
     vae = object()
     monkeypatch.setattr(cases.vae_api, "tile_shape", lambda value: (64, 64))
