@@ -18,12 +18,13 @@ import torch.nn as nn
 
 from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from distvae.modules.patch_utils import DePatchify, Patchify
-from distvae.utils import DistributedEnv, ParallelContext
+from distvae.utils import ParallelContext
 
 from distributed_harness import (
     assert_matches_reference,
     assert_no_less_precise_than,
     init_gloo,
+    make_parallel_context,
     run_distributed,
 )
 
@@ -31,10 +32,6 @@ from distributed_harness import (
 def worker(rank, world_size, shape, num_groups, patch_dim, seed, affine, master_port):
     init_gloo(rank, world_size, master_port)
     try:
-        # As the decoder and encoder adapters do when they are built. GroupNormAdapter is reached
-        # through wrappers that do not thread the axis down to it, so this is how the norm finds
-        # out which axis the run splits on.
-        DistributedEnv.set_patch_dim(patch_dim)
         torch.manual_seed(seed)
         channels = shape[1]
         norm = nn.GroupNorm(
@@ -44,9 +41,10 @@ def worker(rank, world_size, shape, num_groups, patch_dim, seed, affine, master_
         # variance and an incorrect reduction has somewhere to show up.
         x = torch.randn(*shape) * 3.0 + 2.0
 
-        patchify = Patchify(patch_dim=patch_dim)
-        depatchify = DePatchify(patch_dim=patch_dim)
-        sharded = GroupNormAdapter(norm, patch_dim=patch_dim)
+        context = make_parallel_context(patch_dim)
+        patchify = Patchify(context)
+        depatchify = DePatchify(context)
+        sharded = GroupNormAdapter(norm, parallel_context=context)
 
         with torch.no_grad():
             expected = norm(x) if rank == 0 else None
@@ -116,7 +114,8 @@ def test_it_matches_group_norm_on_uneven_spatial_bands_without_affine(
 
 
 def test_video_frame_axis_is_rejected_in_its_positive_spelling():
-    norm = GroupNormAdapter(nn.GroupNorm(1, 2), patch_dim=2)
+    context = ParallelContext(None, rank=0, world_size=1, patch_dim=2)
+    norm = GroupNormAdapter(nn.GroupNorm(1, 2), parallel_context=context)
     with pytest.raises(ValueError, match="frame axis"):
         norm(torch.randn(1, 2, 3, 4, 4))
 
@@ -155,23 +154,20 @@ def test_it_matches_group_norm_when_an_odd_width_is_split(master_port, seed=42):
 
 
 def told_worker(rank, world_size, shape, num_groups, patch_dim, seed, master_port):
-    """A norm told its axis outright, against an environment holding the other one"""
+    """A norm reads its axis from its own context."""
     init_gloo(rank, world_size, master_port)
     try:
-        # What another adapter built later in the same process would have left behind. One class
-        # attribute serves the whole process, so an encoder splitting H and a decoder splitting W
-        # cannot both be described by it - which is why the adapters now say which they mean.
-        DistributedEnv.set_patch_dim(-2 if patch_dim == -1 else -1)
         torch.manual_seed(seed)
         norm = nn.GroupNorm(
             num_groups=num_groups, num_channels=shape[1], eps=1e-6, affine=True
         ).eval()
         x = torch.randn(*shape) * 3.0 + 2.0
+        context = make_parallel_context(patch_dim)
 
         with torch.no_grad():
             expected = norm(x) if rank == 0 else None
-            sharded = GroupNormAdapter(norm, patch_dim=patch_dim)
-            actual = DePatchify(patch_dim=patch_dim)(sharded(Patchify(patch_dim=patch_dim)(x)))
+            sharded = GroupNormAdapter(norm, parallel_context=context)
+            actual = DePatchify(context)(sharded(Patchify(context)(x)))
 
         assert_matches_reference(rank, actual, expected, "PatchGroupNorm told", atol=1e-5)
     finally:
@@ -180,7 +176,7 @@ def told_worker(rank, world_size, shape, num_groups, patch_dim, seed, master_por
 
 @pytest.mark.gloo
 @pytest.mark.parametrize("patch_dim", [-2, -1])
-def test_the_axis_it_is_told_beats_the_one_the_environment_holds(patch_dim, master_port, seed=42):
+def test_the_context_axis_selects_the_uneven_spatial_band(patch_dim, master_port, seed=42):
     # Uneven along whichever axis is split, so that being told the wrong one would show.
     shape = (1, 16, 15, 4) if patch_dim == -2 else (1, 16, 4, 15)
     run_distributed(told_worker, 2, (shape, 8, patch_dim, seed), master_port)
@@ -190,9 +186,6 @@ def bfloat16_worker(rank, world_size, shape, num_groups, patch_dim, seed, master
     """PatchGroupNorm's bf16 rounding against nn.GroupNorm's own, both judged by the fp32 answer"""
     init_gloo(rank, world_size, master_port)
     try:
-        # As the adapters do, and as `worker` above does. Left unsaid this worked only because
-        # every caller here passes the axis the environment already holds.
-        DistributedEnv.set_patch_dim(patch_dim)
         torch.manual_seed(seed)
         channels = shape[1]
         norm = nn.GroupNorm(
@@ -207,9 +200,12 @@ def bfloat16_worker(rank, world_size, shape, num_groups, patch_dim, seed, master
             x = x.to(torch.bfloat16)
             stock = norm(x) if rank == 0 else None
 
-            patchify = Patchify(patch_dim=patch_dim)
-            depatchify = DePatchify(patch_dim=patch_dim)
-            actual = depatchify(GroupNormAdapter(norm, patch_dim=patch_dim)(patchify(x)))
+            context = make_parallel_context(patch_dim)
+            patchify = Patchify(context)
+            depatchify = DePatchify(context)
+            actual = depatchify(
+                GroupNormAdapter(norm, parallel_context=context)(patchify(x))
+            )
 
         assert_no_less_precise_than(rank, actual, stock, gold, "PatchGroupNorm in bfloat16")
     finally:

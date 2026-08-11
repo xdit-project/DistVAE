@@ -19,7 +19,6 @@ class UpDecoderBlock2DAdapter(nn.Module):
         up_block: UpDecoderBlock2D,
         *,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -28,14 +27,14 @@ class UpDecoderBlock2DAdapter(nn.Module):
             in_channels=32,
             out_channels=32,
             add_upsample=False,
-            conv_block_size=conv_block_size
+            conv_block_size=conv_block_size,
+            parallel_context=parallel_context,
         )
         self.up_block.resolution_idx = up_block.resolution_idx
         self.up_block.resnets = nn.ModuleList([
             ResnetBlock2DAdapter(
                 resnet,
                 conv_block_size=conv_block_size,
-                patch_dim=patch_dim,
                 parallel_context=parallel_context,
             ) for resnet in up_block.resnets if isinstance(resnet, ResnetBlock2D)
         ])
@@ -44,7 +43,6 @@ class UpDecoderBlock2DAdapter(nn.Module):
                 Upsample2DAdapter(
                     upsampler,
                     conv_block_size=conv_block_size,
-                    patch_dim=patch_dim,
                     parallel_context=parallel_context,
                 ) for upsampler in up_block.upsamplers if isinstance(upsampler, Upsample2D)
             ])
@@ -68,7 +66,6 @@ class DownEncoderBlock2DAdapter(nn.Module):
         down_block: DownEncoderBlock2D,
         *,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -80,7 +77,6 @@ class DownEncoderBlock2DAdapter(nn.Module):
             ResnetBlock2DAdapter(
                 resnet,
                 conv_block_size=conv_block_size,
-                patch_dim=patch_dim,
                 parallel_context=parallel_context,
             )
             for resnet in down_block.resnets
@@ -90,7 +86,6 @@ class DownEncoderBlock2DAdapter(nn.Module):
                 Downsample2DAdapter(
                     downsampler,
                     conv_block_size=conv_block_size,
-                    patch_dim=patch_dim,
                     parallel_context=parallel_context,
                 )
                 for downsampler in down_block.downsamplers

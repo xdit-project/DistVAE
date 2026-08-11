@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
 from distvae.models.layers.conv2d import PatchConv2d
 from distvae.models.layers.conv3d import PatchConv3d
+from distvae.modules.adapters.adapter_utils import adopt_convolution_parameters
 from distvae.utils import ParallelContext
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
@@ -30,7 +31,6 @@ class Conv2dAdapter(nn.Module):
         conv2d: nn.Conv2d,
         *,
         block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -49,12 +49,9 @@ class Conv2dAdapter(nn.Module):
             device=conv2d.weight.device,
             dtype=conv2d.weight.dtype,
             block_size=block_size,
-            patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
-        self.conv2d.weight.data = conv2d.weight.data
-        if conv2d.bias is not None:
-            self.conv2d.bias.data = conv2d.bias.data
+        adopt_convolution_parameters(self.conv2d, conv2d)
 
     def forward(self, x):
         return self.conv2d(x)
@@ -66,7 +63,6 @@ class Conv3dAdapter(nn.Module):
         conv3d: nn.Conv3d,
         *,
         block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -85,12 +81,9 @@ class Conv3dAdapter(nn.Module):
             device=conv3d.weight.device,
             dtype=conv3d.weight.dtype,
             block_size=block_size,
-            patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
-        self.conv3d.weight.data = conv3d.weight.data
-        if conv3d.bias is not None:
-            self.conv3d.bias.data = conv3d.bias.data
+        adopt_convolution_parameters(self.conv3d, conv3d)
 
     def forward(self, x):
         return self.conv3d(x)
@@ -113,7 +106,6 @@ class _CausalConv3dAdapter(nn.Module):
         causal_conv3d: nn.Conv3d,
         *,
         block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -137,12 +129,9 @@ class _CausalConv3dAdapter(nn.Module):
             device=causal_conv3d.weight.device,
             dtype=causal_conv3d.weight.dtype,
             block_size=block_size,
-            patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
-        self.conv3d.weight.data = causal_conv3d.weight.data
-        if causal_conv3d.bias is not None:
-            self.conv3d.bias.data = causal_conv3d.bias.data
+        adopt_convolution_parameters(self.conv3d, causal_conv3d)
         self._padding = (0, 0, 0, 0, causal_conv3d._padding[4], causal_conv3d._padding[5])
 
     def forward(self, x, cache_x=None):
@@ -185,7 +174,6 @@ class _PaddedCausalConv3dAdapter(nn.Module):
         causal_conv3d: nn.Module,
         *,
         block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -216,12 +204,9 @@ class _PaddedCausalConv3dAdapter(nn.Module):
             device=conv.weight.device,
             dtype=conv.weight.dtype,
             block_size=block_size,
-            patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
-        self.conv3d.weight.data = conv.weight.data
-        if conv.bias is not None:
-            self.conv3d.bias.data = conv.bias.data
+        adopt_convolution_parameters(self.conv3d, conv)
         self.pad_mode = causal_conv3d.pad_mode
         self._padding = (0, 0, 0, 0, pad_front, pad_back)
 
@@ -259,7 +244,6 @@ class LTX2VideoCausalConv3dAdapter(nn.Module):
         causal_conv3d: nn.Module,
         *,
         block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -285,12 +269,9 @@ class LTX2VideoCausalConv3dAdapter(nn.Module):
             device=conv.weight.device,
             dtype=conv.weight.dtype,
             block_size=block_size,
-            patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
-        sharded.weight.data = conv.weight.data
-        if conv.bias is not None:
-            sharded.bias.data = conv.bias.data
+        adopt_convolution_parameters(sharded, conv)
         causal_conv3d.conv = sharded
 
     def forward(self, hidden_states, causal: bool = True):

@@ -38,11 +38,25 @@ def build_decoder():
     return diffusers.AutoencoderKL(**CONFIG).eval().decoder
 
 
-def worker(rank, world_size, height, width, conv_block_size, seed, master_port):
+def worker(
+    rank,
+    world_size,
+    height,
+    width,
+    conv_block_size,
+    training,
+    checkpointing,
+    seed,
+    master_port,
+):
     init_gloo(rank, world_size, master_port)
     try:
         torch.manual_seed(seed)
         decoder = build_decoder()
+        decoder.train(training)
+        decoder.gradient_checkpointing = checkpointing
+        runtime_sentinel = object()
+        decoder.runtime_sentinel = runtime_sentinel
         weights = decoder.state_dict()
 
         latents = torch.randn(1, LATENT_CHANNELS, height, width)
@@ -52,16 +66,29 @@ def worker(rank, world_size, height, width, conv_block_size, seed, master_port):
             if rank == 0:
                 reference = build_decoder()
                 reference.load_state_dict(weights)
+                reference.train(training)
+                reference.gradient_checkpointing = checkpointing
                 expected = reference(latents)
 
             adapter = DecoderAdapter(
                 decoder, vae_group=None, conv_block_size=conv_block_size
             )
+            assert adapter.decoder is decoder
+            assert adapter.decoder.runtime_sentinel is runtime_sentinel
             assert adapter.training is decoder.training
             assert adapter.decoder.training is decoder.training
             assert (
                 adapter.decoder.gradient_checkpointing
                 is decoder.gradient_checkpointing
+            )
+            child_contexts = [
+                module.parallel_context
+                for module in adapter.modules()
+                if hasattr(module, "parallel_context")
+            ]
+            assert child_contexts
+            assert all(
+                context is adapter.parallel_context for context in child_contexts
             )
             actual = adapter(latents)
 
@@ -75,21 +102,47 @@ def worker(rank, world_size, height, width, conv_block_size, seed, master_port):
 @pytest.mark.gloo
 @pytest.mark.parametrize("world_size", [1, 2, 4])
 def test_a_sharded_decode_matches_a_single_rank_one(world_size, master_port, seed=42):
-    run_distributed(worker, world_size, (16, 16, 0, seed), master_port)
+    run_distributed(worker, world_size, (16, 16, 0, False, False, seed), master_port)
+
+
+@pytest.mark.gloo
+def test_training_checkpoint_state_survives_adaptation(master_port, seed=42):
+    run_distributed(worker, 1, (16, 16, 0, True, True, seed), master_port)
+
+
+def grad_enabled_worker(rank, world_size, seed, master_port):
+    init_gloo(rank, world_size, master_port)
+    try:
+        torch.manual_seed(seed)
+        decoder = build_decoder().eval()
+        decoder.gradient_checkpointing = True
+        adapter = DecoderAdapter(decoder)
+        with pytest.raises(
+            RuntimeError,
+            match=r"torch\.no_grad.*inference mode",
+        ):
+            adapter(torch.randn(1, LATENT_CHANNELS, 16, 16))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.gloo
+def test_grad_enabled_forward_directs_callers_to_inference_mode(master_port, seed=42):
+    run_distributed(grad_enabled_worker, 1, (seed,), master_port)
 
 
 @pytest.mark.gloo
 def test_the_chunked_convolution_path_decodes_the_same(master_port, seed=42):
     # A conv_block_size under the feature map size sends PatchConv2d down its chunked path,
     # which splits and reassembles each convolution on top of the sharding.
-    run_distributed(worker, 2, (16, 16, 32, seed), master_port)
+    run_distributed(worker, 2, (16, 16, 32, False, False, seed), master_port)
 
 
 @pytest.mark.gloo
 def test_latent_rows_that_do_not_divide_by_the_rank_count(master_port, seed=42):
     # This adapter was never exposed to the pad-and-crop the causal ones used, because
-    # PatchDecoder splits after its mid block rather than before. Pinned so it stays that way.
-    run_distributed(worker, 3, (16, 16, 0, seed), master_port)
+    # DecoderAdapter splits after its mid block rather than before. Pinned so it stays that way.
+    run_distributed(worker, 3, (16, 16, 0, False, False, seed), master_port)
 
 
 if __name__ == "__main__":

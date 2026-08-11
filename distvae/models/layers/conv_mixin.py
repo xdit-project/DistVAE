@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from distvae.utils import DistributedEnv, normalize_patch_dim
+from distvae.utils import normalize_patch_dim
 from distvae.models.layers.conv_utils import (
     get_world_size_and_rank,
     calc_patch_index,
@@ -91,7 +91,7 @@ class PatchConvMixin:
         padding_patch_dim, stride_patch_dim, global_start, group_world_size, rank_in_group).
         """
         context = getattr(self, "parallel_context", None)
-        group_world_size, global_rank, rank_in_group, local_rank = get_world_size_and_rank(context)
+        group_world_size, rank_in_group = get_world_size_and_rank(context)
         patch_dim = input.ndim + normalize_patch_dim(
             self.patch_dim, input.ndim, spatial_only=True
         )
@@ -142,7 +142,7 @@ class PatchConvMixin:
                     dtype=torch.int64,
                     device=input.device,
                 ),
-                group=context.group if context is not None else DistributedEnv.get_vae_group(),
+                group=context.group,
             )
             patch_index = calc_patch_index(patch_list)
             halo_width = calc_halo_width(
@@ -186,10 +186,8 @@ class PatchConvMixin:
             halo_width,
             prev_bottom_halo_width,
             next_top_halo_width,
-            group_world_size,
-            rank_in_group,
-            halo_buffer,
             context,
+            halo_buffer,
         )
 
         # Where this rank's patch begins in the whole image. Only a strided conv needs it, and

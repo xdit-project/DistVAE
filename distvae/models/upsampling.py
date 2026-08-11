@@ -41,6 +41,7 @@ class PatchUpsample2D(Upsample2D):
         bias=True,
         interpolate=True,
         conv_block_size = 0,
+        parallel_context = None,
     ):
         assert norm_type is None, "norm_type has not been supported for PatchUpsample2D yat."
         assert use_conv_transpose is False, "use_conv_transpose has not been supported for PatchUpsample2D yet."
@@ -48,6 +49,14 @@ class PatchUpsample2D(Upsample2D):
                          kernel_size, padding, norm_type, eps, elementwise_affine, 
                          bias, interpolate)
         if name == "conv":
-            self.conv = Conv2dAdapter(self.conv, block_size=conv_block_size)
+            self.conv = Conv2dAdapter(
+                self.conv,
+                block_size=conv_block_size,
+                parallel_context=parallel_context,
+            )
         else:
-            self.Conv2d_0 = Conv2dAdapter(self.Conv2d_0, block_size=conv_block_size)
+            self.Conv2d_0 = Conv2dAdapter(
+                self.Conv2d_0,
+                block_size=conv_block_size,
+                parallel_context=parallel_context,
+            )

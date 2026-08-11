@@ -3,7 +3,10 @@ from typing import Tuple
 import torch.nn as nn
 
 from distvae.models.layers.wan.zeropadconv2d import WanZeroPadConv2d
-from distvae.modules.adapters.adapter_utils import replace_child_convolution
+from distvae.modules.adapters.adapter_utils import (
+    adopt_convolution_parameters,
+    replace_child_convolution,
+)
 from distvae.utils import ParallelContext, cache_cursor
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
@@ -41,7 +44,7 @@ LTX2VideoDownsampler3d = block(LTX2_VIDEO, "LTX2VideoDownsampler3d")
 LTX2VideoDownBlock3D = block(LTX2_VIDEO, "LTX2VideoDownBlock3D")
 
 
-def _zero_pad_strided_conv(conv, conv_block_size, patch_dim, parallel_context=None):
+def _zero_pad_strided_conv(conv, conv_block_size, parallel_context):
     """A sharded stand-in for a (0, 1, 0, 1) zero pad followed by a stride-2 convolution
 
     The pair cannot be split as written, because a rank's bottom row is padding only if it is the
@@ -65,13 +68,9 @@ def _zero_pad_strided_conv(conv, conv_block_size, patch_dim, parallel_context=No
         dtype=conv.weight.dtype,
         reversed_zero_padding=(0, 1, 0, 1),
         block_size=conv_block_size,
-        patch_dim=patch_dim,
         parallel_context=parallel_context,
     )
-    sharded.weight.data = conv.weight.data
-    if conv.bias is not None:
-        sharded.bias.data = conv.bias.data
-    return sharded
+    return adopt_convolution_parameters(sharded, conv)
 
 
 class Downsample2DAdapter(nn.Module):
@@ -92,7 +91,6 @@ class Downsample2DAdapter(nn.Module):
         self,
         downsampler: Downsample2D,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -106,13 +104,12 @@ class Downsample2DAdapter(nn.Module):
         conv = downsampler.conv
         if self.pads_by_hand:
             sharded = _zero_pad_strided_conv(
-                conv, conv_block_size, patch_dim, parallel_context
+                conv, conv_block_size, parallel_context
             )
         else:
             sharded = Conv2dAdapter(
                 conv,
                 block_size=conv_block_size,
-                patch_dim=patch_dim,
                 parallel_context=parallel_context,
             )
         downsampler.conv = sharded
@@ -148,7 +145,6 @@ class _CausalResampleDownAdapter(nn.Module):
         self,
         resample: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -157,17 +153,12 @@ class _CausalResampleDownAdapter(nn.Module):
         assert isinstance(resample, self._supported), (
             f"{adapter} does not support resample except {self._requires}"
         )
-        if patch_dim == -3:
-            raise ValueError(
-                f"{adapter} does not support patch_dim F (-3); use H (-2) or W (-1)."
-            )
         self.resample = resample
 
         if getattr(resample, "time_conv", None) is not None:
             resample.time_conv = self._conv_adapter(
                 resample.time_conv,
                 block_size=conv_block_size,
-                patch_dim=patch_dim,
                 parallel_context=parallel_context,
             )
 
@@ -181,13 +172,12 @@ class _CausalResampleDownAdapter(nn.Module):
                     f"{[type(layer).__name__ for layer in layers]}"
                 )
             resample.resample = _zero_pad_strided_conv(
-                convs[0], conv_block_size, patch_dim, parallel_context
+                convs[0], conv_block_size, parallel_context
             )
         elif isinstance(resample.resample, nn.Conv2d):
             resample.resample = Conv2dAdapter(
                 resample.resample,
                 block_size=conv_block_size,
-                patch_dim=patch_dim,
                 parallel_context=parallel_context,
             )
 
@@ -224,7 +214,6 @@ class _PaddedCausalDownsampleAdapter(nn.Module):
         self,
         downsampler: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -238,7 +227,6 @@ class _PaddedCausalDownsampleAdapter(nn.Module):
             downsampler,
             self._conv_adapter,
             conv_block_size=conv_block_size,
-            patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
 
@@ -270,7 +258,6 @@ class _PaddedCausalDownBlockAdapter(nn.Module):
         self,
         down_block: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -281,7 +268,6 @@ class _PaddedCausalDownBlockAdapter(nn.Module):
         )
         options = dict(
             conv_block_size=conv_block_size,
-            patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
         self.down_block = down_block
@@ -326,7 +312,6 @@ class LTX2VideoDownsamplerAdapter(nn.Module):
         self,
         downsampler: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -340,7 +325,6 @@ class LTX2VideoDownsamplerAdapter(nn.Module):
             downsampler,
             LTX2VideoCausalConv3dAdapter,
             conv_block_size=conv_block_size,
-            patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
 
@@ -363,7 +347,6 @@ class LTX2VideoDownBlockAdapter(nn.Module):
         self,
         down_block: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -374,7 +357,6 @@ class LTX2VideoDownBlockAdapter(nn.Module):
         )
         options = dict(
             conv_block_size=conv_block_size,
-            patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
         self.down_block = down_block
@@ -384,27 +366,25 @@ class LTX2VideoDownBlockAdapter(nn.Module):
         if down_block.downsamplers is not None:
             down_block.downsamplers = nn.ModuleList(
                 [self._adapt_downsampler(
-                    down, adapter, conv_block_size, patch_dim, parallel_context
+                    down, adapter, conv_block_size, parallel_context
                 )
                  for down in down_block.downsamplers]
             )
 
     @staticmethod
     def _adapt_downsampler(
-        downsampler, adapter, conv_block_size, patch_dim, parallel_context
+        downsampler, adapter, conv_block_size, parallel_context
     ):
         if LTX2VideoDownsampler3d is not None and isinstance(downsampler, LTX2VideoDownsampler3d):
             return LTX2VideoDownsamplerAdapter(
                 downsampler,
                 conv_block_size=conv_block_size,
-                patch_dim=patch_dim,
                 parallel_context=parallel_context,
             )
         if LTX2VideoCausalConv3d is not None and isinstance(downsampler, LTX2VideoCausalConv3d):
             return LTX2VideoCausalConv3dAdapter(
                 downsampler,
                 block_size=conv_block_size,
-                patch_dim=patch_dim,
                 parallel_context=parallel_context,
             )
         raise TypeError(
@@ -425,16 +405,12 @@ class WanResidualDownBlockAdapter(nn.Module):
         self,
         wan_residual_down_block: WanResidualDownBlock,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
         assert isinstance(wan_residual_down_block, WanResidualDownBlock), (
             "WanResidualDownBlockAdapter only supports WanResidualDownBlock"
         )
-        if patch_dim == -3:
-            raise ValueError("WanResidualDownBlockAdapter does not support patch_dim F (-3); use H (-2) or W (-1).")
-
         self.down_block = wan_residual_down_block
         if hasattr(wan_residual_down_block, "resnets"):
             adapted_resnets = []
@@ -443,7 +419,6 @@ class WanResidualDownBlockAdapter(nn.Module):
                     WanResidualBlockAdapter(
                         resnet,
                         conv_block_size=conv_block_size,
-                        patch_dim=patch_dim,
                         parallel_context=parallel_context,
                     )
                 )
@@ -453,7 +428,6 @@ class WanResidualDownBlockAdapter(nn.Module):
                 self.down_block.downsampler = WanResampleDownAdapter(
                     wan_residual_down_block.downsampler,
                     conv_block_size=conv_block_size,
-                    patch_dim=patch_dim,
                     parallel_context=parallel_context,
                 )
 

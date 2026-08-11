@@ -113,27 +113,22 @@ class EncoderAdapter(nn.Module):
         encoder.conv_in = Conv2dAdapter(
             encoder.conv_in,
             block_size=conv_block_size,
-            patch_dim=patch_dim,
             parallel_context=self.parallel_context,
         )
         encoder.down_blocks = nn.ModuleList([
             DownEncoderBlock2DAdapter(
                 down_block,
                 conv_block_size=conv_block_size,
-                patch_dim=patch_dim,
                 parallel_context=self.parallel_context,
             )
             for down_block in encoder.down_blocks
         ])
         self.patchify = Patchify(
-            patch_dim=patch_dim,
             scale_factor=vae_scale_factor,
             parallel_context=self.parallel_context,
             halo=widest_halo(self.encoder),
         )
-        self.depatchify = DePatchify(
-            patch_dim=patch_dim, parallel_context=self.parallel_context
-        )
+        self.depatchify = DePatchify(parallel_context=self.parallel_context)
         self.vae_group = vae_group
 
     def forward(self, sample: torch.FloatTensor):
@@ -153,7 +148,6 @@ def _gathered(attention: nn.Module, **options) -> nn.Module:
     """
     return GatheredAttentionAdapter(
         attention,
-        patch_dim=options["patch_dim"],
         parallel_context=options["parallel_context"],
     )
 

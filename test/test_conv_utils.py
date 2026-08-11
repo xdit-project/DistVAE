@@ -2,7 +2,6 @@
 
 import pytest
 import torch
-from unittest.mock import patch
 
 from distvae.models.layers.conv_utils import (
     calc_patch_index,
@@ -109,31 +108,23 @@ class TestCalcHaloWidth:
     many and the neighbour is asked for rows it does not have.
     """
 
-    @patch("distvae.models.layers.conv_utils.DistributedEnv.get_group_world_size")
-    def test_first_rank_top_zero(self, mock_world_size):
-        mock_world_size.return_value = 3
+    def test_first_rank_top_zero(self):
         # k=3, p=0, s=1: the rank below reads one row back over the boundary at 8.
         assert calc_halo_width(0, [0, 8, 16, 24], 3, 0, 1) == (0, 1)
 
-    @patch("distvae.models.layers.conv_utils.DistributedEnv.get_group_world_size")
-    def test_last_rank_bottom_zero(self, mock_world_size):
-        mock_world_size.return_value = 3
+    def test_last_rank_bottom_zero(self):
         assert calc_halo_width(2, [0, 8, 16, 24], 3, 0, 1) == (1, 0)
 
-    @patch("distvae.models.layers.conv_utils.DistributedEnv.get_group_world_size")
-    def test_middle_rank_both_nonzero(self, mock_world_size):
-        mock_world_size.return_value = 3
+    def test_middle_rank_both_nonzero(self):
         assert calc_halo_width(1, [0, 8, 16, 24], 3, 1, 1) == (1, 1)
 
-    @patch("distvae.models.layers.conv_utils.DistributedEnv.get_group_world_size")
-    def test_a_strided_middle_rank_reaches_further_one_way_than_the_other(self, mock_world_size):
+    def test_a_strided_middle_rank_reaches_further_one_way_than_the_other(self):
         """The case the symmetric ones cannot tell apart
 
         At stride 1 the two halves of the halo come out equal, so top and bottom can be
         swapped, or one computed twice, and every assertion above still holds. Striding
         moves the output grid relative to the patch boundary and the two stop matching.
         """
-        mock_world_size.return_value = 3
         # k=5, p=1, s=2 over even patches: one row above, two below.
         assert calc_halo_width(1, [0, 8, 16, 24], 5, 1, 2) == (1, 2)
         # k=3, p=0, s=2 over the uneven split: the output grid lands on the lower
@@ -161,9 +152,8 @@ class TestCalcHaloWidthUnitStride:
             [64, 63, 63, 63],
         ],
     )
-    @patch("distvae.models.layers.conv_utils.DistributedEnv.get_group_world_size")
     def test_it_agrees_with_the_gathered_boundaries(
-        self, mock_world_size, patch_sizes, padding, kernel_size
+        self, patch_sizes, padding, kernel_size
     ):
         world_size = len(patch_sizes)
         if min(patch_sizes) < kernel_size:
@@ -171,7 +161,6 @@ class TestCalcHaloWidthUnitStride:
             # reaches, so there is no gathered answer to agree with. DistVAE refuses that split
             # in Patchify well before a convolution sees it.
             pytest.skip("a patch narrower than the kernel is not a split DistVAE makes")
-        mock_world_size.return_value = world_size
         height_index = calc_patch_index([torch.tensor([s]) for s in patch_sizes])
 
         for rank in range(world_size):

@@ -16,11 +16,10 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from distvae.utils import DistributedEnv
 from distvae.modules.patch_utils import Patchify, DePatchify
 from distvae.modules.adapters.layers.conv_adapters import Conv3dAdapter
 
-from distributed_harness import run_distributed
+from distributed_harness import make_parallel_context, run_distributed
 
 
 def worker(
@@ -41,7 +40,6 @@ def worker(
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     dist.init_process_group(backend="gloo", init_method="env://")
-    DistributedEnv.initialize(None)
 
     torch.manual_seed(seed)
     in_ch, out_ch = 4, 8
@@ -62,9 +60,12 @@ def worker(
     ).to(device)
     ref_conv.eval()
 
-    patchify = Patchify(patch_dim=patch_dim)
-    depatchify = DePatchify(patch_dim=patch_dim)
-    adapter = Conv3dAdapter(ref_conv, block_size=block_size, patch_dim=patch_dim)
+    context = make_parallel_context(patch_dim)
+    patchify = Patchify(context)
+    depatchify = DePatchify(context)
+    adapter = Conv3dAdapter(
+        ref_conv, block_size=block_size, parallel_context=context
+    )
     adapter.eval()
 
     with torch.no_grad():

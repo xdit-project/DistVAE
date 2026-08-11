@@ -7,34 +7,24 @@ boundaries, and halo exchange between neighboring ranks.
 """
 
 import math
-import os
-from typing import List, Optional, Tuple, Union
+from typing import List, Tuple, Union
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from distvae.utils import DistributedEnv, ParallelContext
+from distvae.utils import ParallelContext
 
 
-def get_world_size_and_rank(parallel_context: Optional[ParallelContext] = None):
-    """Return distributed group and rank info from DistributedEnv.
+def get_world_size_and_rank(parallel_context: ParallelContext):
+    """Return rank metadata captured by an immutable parallel context.
 
     Returns:
-        Tuple of (group_world_size, global_rank, rank_in_group, local_rank).
+        Tuple of (group_world_size, rank_in_group).
     """
-    if parallel_context is not None:
-        return (
-            parallel_context.world_size,
-            dist.get_rank() if dist.is_initialized() else 0,
-            parallel_context.rank,
-            int(os.environ.get("LOCAL_RANK", 0)),
-        )
-    group_world_size = DistributedEnv.get_group_world_size()
-    global_rank = DistributedEnv.get_global_rank()
-    rank_in_group = DistributedEnv.get_rank_in_vae_group()
-    local_rank = DistributedEnv.get_local_rank()
-    return group_world_size, global_rank, rank_in_group, local_rank
+    if not isinstance(parallel_context, ParallelContext):
+        raise TypeError("patch convolution requires a ParallelContext")
+    return parallel_context.world_size, parallel_context.rank
 
 
 def calc_patch_index(patch_list: List[Tensor]):
@@ -122,8 +112,7 @@ def calc_halo_width(rank, height_index, kernel_size, padding=0, stride=1):
 
     The halo is the region used for convolution but not included in this rank's
     output. The first rank forces top to 0; the last rank (world_size - 1, inferred
-    from len(height_index) - 1 or DistributedEnv.get_group_world_size()) forces
-    bottom to 0.
+    from len(height_index) - 1) forces bottom to 0.
 
     Returns:
         Tuple (top_halo_width, bottom_halo_width) in patch-dim elements.
@@ -356,10 +345,8 @@ def exchange_halo(
     halo_width: tuple,
     prev_bottom_halo_width: int,
     next_top_halo_width: int,
-    group_world_size: int,
-    rank_in_group: int,
+    parallel_context: ParallelContext,
     halo_buffer: dict = None,
-    parallel_context: Optional[ParallelContext] = None,
 ) -> Tensor:
     """Exchange halo regions with previous and next ranks; return extended local tensor.
 
@@ -381,11 +368,11 @@ def exchange_halo(
     indices_start = [slice(None)] * ndim
     indices_start[patch_dim] = slice(0, prev_bottom_halo_width)
 
-    vae_group = (
-        parallel_context.group
-        if parallel_context is not None
-        else DistributedEnv.get_vae_group()
-    )
+    if not isinstance(parallel_context, ParallelContext):
+        raise TypeError("exchange_halo requires a ParallelContext")
+    vae_group = parallel_context.group
+    group_world_size = parallel_context.world_size
+    rank_in_group = parallel_context.rank
     ops = []
     top_halo_recv = None
     bottom_halo_recv = None
@@ -405,11 +392,7 @@ def exchange_halo(
         return halo_buffer[key]
 
     if next_top_halo_width > 0:
-        global_rank_of_next = (
-            parallel_context.global_rank(rank_in_group + 1)
-            if parallel_context is not None
-            else DistributedEnv.get_global_rank_from_group_rank(rank_in_group + 1)
-        )
+        global_rank_of_next = parallel_context.global_rank(rank_in_group + 1)
         bottom_halo_send = input[tuple(indices_end)].contiguous()
         ops.append(dist.P2POp(dist.isend, bottom_halo_send, global_rank_of_next, group=vae_group))
     if halo_width[0] > 0:
@@ -417,20 +400,12 @@ def exchange_halo(
             patch_index[rank_in_group] - halo_width[0] >= patch_index[rank_in_group - 1]
         ), "width of top halo region is larger than the input tensor of prev rank"
         top_halo_recv = recv_buffer("top_recv", halo_width[0])
-        global_rank_of_prev = (
-            parallel_context.global_rank(rank_in_group - 1)
-            if parallel_context is not None
-            else DistributedEnv.get_global_rank_from_group_rank(rank_in_group - 1)
-        )
+        global_rank_of_prev = parallel_context.global_rank(rank_in_group - 1)
         ops.append(dist.P2POp(dist.irecv, top_halo_recv, global_rank_of_prev, group=vae_group))
     if prev_bottom_halo_width > 0:
         top_halo_send = input[tuple(indices_start)].contiguous()
         if global_rank_of_prev is None:
-            global_rank_of_prev = (
-                parallel_context.global_rank(rank_in_group - 1)
-                if parallel_context is not None
-                else DistributedEnv.get_global_rank_from_group_rank(rank_in_group - 1)
-            )
+            global_rank_of_prev = parallel_context.global_rank(rank_in_group - 1)
         ops.append(dist.P2POp(dist.isend, top_halo_send, global_rank_of_prev, group=vae_group))
     if halo_width[1] > 0:
         assert patch_index is None or (
@@ -438,11 +413,7 @@ def exchange_halo(
         ), "width of bottom halo region is larger than the input tensor of next rank"
         bottom_halo_recv = recv_buffer("bottom_recv", halo_width[1])
         if global_rank_of_next is None:
-            global_rank_of_next = (
-                parallel_context.global_rank(rank_in_group + 1)
-                if parallel_context is not None
-                else DistributedEnv.get_global_rank_from_group_rank(rank_in_group + 1)
-            )
+            global_rank_of_next = parallel_context.global_rank(rank_in_group + 1)
         ops.append(dist.P2POp(dist.irecv, bottom_halo_recv, global_rank_of_next, group=vae_group))
 
     # Batching exposes both independent directions at once and lets NCCL reuse the wider group's

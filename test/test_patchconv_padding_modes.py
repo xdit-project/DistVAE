@@ -21,7 +21,12 @@ from distvae.models.layers.conv2d import PatchConv2d
 from distvae.models.layers.conv3d import PatchConv3d
 from distvae.modules.patch_utils import DePatchify, Patchify
 
-from distributed_harness import assert_matches_reference, init_gloo, run_distributed
+from distributed_harness import (
+    assert_matches_reference,
+    init_gloo,
+    make_parallel_context,
+    run_distributed,
+)
 
 
 def worker(
@@ -32,6 +37,7 @@ def worker(
     try:
         torch.manual_seed(seed)
         in_channels, out_channels = 4, 8
+        context = make_parallel_context(patch_dim)
         if ndim == 5:
             shape = (1, in_channels, 3, 16, 16)
             reference = nn.Conv3d(
@@ -40,7 +46,8 @@ def worker(
             ).eval()
             sharded = PatchConv3d(
                 in_channels, out_channels, kernel_size, padding=padding,
-                padding_mode=padding_mode, block_size=block_size, patch_dim=patch_dim,
+                padding_mode=padding_mode, block_size=block_size,
+                parallel_context=context,
             ).eval()
         else:
             shape = (1, in_channels, 16, 16)
@@ -50,14 +57,15 @@ def worker(
             ).eval()
             sharded = PatchConv2d(
                 in_channels, out_channels, kernel_size, padding=padding,
-                padding_mode=padding_mode, block_size=block_size, patch_dim=patch_dim,
+                padding_mode=padding_mode, block_size=block_size,
+                parallel_context=context,
             ).eval()
         sharded.weight.data = reference.weight.data
         sharded.bias.data = reference.bias.data
 
         x = torch.randn(*shape)
-        patchify = Patchify(patch_dim=patch_dim)
-        depatchify = DePatchify(patch_dim=patch_dim)
+        patchify = Patchify(context)
+        depatchify = DePatchify(context)
 
         with torch.no_grad():
             expected = reference(x) if rank == 0 else None

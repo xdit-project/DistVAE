@@ -84,7 +84,12 @@ def get_up_block(
     upsample_type: Optional[str] = None,
     dropout: float = 0.0,
     conv_block_size = 0,
+    parallel_context = None,
 ) -> nn.Module:
+    up_block_type = up_block_type[7:] if up_block_type.startswith("UNetRes") else up_block_type
+    if up_block_type == "UpDecoderBlock2D" and parallel_context is None:
+        raise TypeError("parallel_context must be provided for UpDecoderBlock2D")
+
     # If attn head dim is not defined, we default it to the number of heads
     if attention_head_dim is None:
         logger.warning(
@@ -92,7 +97,6 @@ def get_up_block(
         )
         attention_head_dim = num_attention_heads
 
-    up_block_type = up_block_type[7:] if up_block_type.startswith("UNetRes") else up_block_type
     if up_block_type == "UpBlock2D":
         return UpBlock2D(
             num_layers=num_layers,
@@ -237,6 +241,7 @@ def get_up_block(
             resnet_time_scale_shift=resnet_time_scale_shift,
             temb_channels=temb_channels,
             conv_block_size=conv_block_size,
+            parallel_context=parallel_context,
         )
     elif up_block_type == "AttnUpDecoderBlock2D":
         return AttnUpDecoderBlock2D(
@@ -301,7 +306,11 @@ class PatchUpDecoderBlock2D(UpDecoderBlock2D):
         add_upsample: bool = True,
         temb_channels: Optional[int] = None,
         conv_block_size = 0,
+        parallel_context = None,
     ):
+        if parallel_context is None:
+            raise TypeError("parallel_context must be provided for PatchUpDecoderBlock2D")
+
         #TODO: Add support for spatial time embedding
         assert resnet_time_scale_shift != "spatial", "'spatial' has not been supported for UpDecoderBlock2D yet."
         super().__init__(in_channels, out_channels, resolution_idx, 
@@ -310,11 +319,23 @@ class PatchUpDecoderBlock2D(UpDecoderBlock2D):
                          add_upsample, temb_channels)
         patched_resnet = []
         for resnet in self.resnets:
-            patched_resnet.append(ResnetBlock2DAdapter(resnet, conv_block_size=conv_block_size))
+            patched_resnet.append(
+                ResnetBlock2DAdapter(
+                    resnet,
+                    conv_block_size=conv_block_size,
+                    parallel_context=parallel_context,
+                )
+            )
         self.resnets = nn.ModuleList(patched_resnet)
 
         if add_upsample:
             patched_upsamplers = []
             for upsampler in self.upsamplers:
-                patched_upsamplers.append(Upsample2DAdapter(upsampler, conv_block_size=conv_block_size))
+                patched_upsamplers.append(
+                    Upsample2DAdapter(
+                        upsampler,
+                        conv_block_size=conv_block_size,
+                        parallel_context=parallel_context,
+                    )
+                )
             self.upsamplers = nn.ModuleList(patched_upsamplers)

@@ -1,6 +1,6 @@
 from distvae.modules.adapters.unets.unet_2d_blocks_adapters import UpDecoderBlock2DAdapter, UpDecoderBlock2D
 from distvae.modules.patch_utils import Patchify, DePatchify
-from distvae.utils import DistributedEnv
+from distvae.utils import DistributedEnv, parallel_context
 
 import torch
 import random
@@ -42,10 +42,12 @@ def main():
     dist.init_process_group(backend=backend)
     device = torch.distributed.get_rank() % device_count()
     set_device(device)
-    DistributedEnv.initialize(None)
+    context = parallel_context(None, -2, ndim=4)
 
     up_block = UpDecoderBlock2D(num_layers = 3, in_channels=256, out_channels=128).to(device)
-    patch_up_block = UpDecoderBlock2DAdapter(up_block).to(device)
+    patch_up_block = UpDecoderBlock2DAdapter(
+        up_block, parallel_context=context
+    ).to(device)
 
     hidden_state = torch.randn(1, 256, args.height, args.width, device=device)
     print("hidden state shape: ", hidden_state.shape)
@@ -54,8 +56,8 @@ def main():
     # if rank == 0:
         # print("result: ", result)
 
-    patch = Patchify()
-    depatch = DePatchify()
+    patch = Patchify(context)
+    depatch = DePatchify(context)
     patch_result = patch_up_block(patch(hidden_state))
     # print("patch_res:", rank, patch_result)
     patch_result = depatch(patch_result)

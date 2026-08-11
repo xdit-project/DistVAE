@@ -1,6 +1,6 @@
 from distvae.modules.patch_utils import Patchify, DePatchify
 from distvae.modules.adapters.resnet_adapters import ResnetBlock2DAdapter
-from distvae.utils import DistributedEnv
+from distvae.utils import DistributedEnv, parallel_context
 from torch.nn import GroupNorm
 
 from diffusers.models.resnet import ResnetBlock2D
@@ -45,7 +45,7 @@ def main():
     dist.init_process_group(backend=backend)
     device = torch.distributed.get_rank() % device_count()
     set_device(device)
-    DistributedEnv.initialize(None)
+    context = parallel_context(None, -2, ndim=4)
 
     resnet = ResnetBlock2D(
         in_channels=64,
@@ -59,7 +59,9 @@ def main():
         output_scale_factor=1.0,
         pre_norm=True,
     ).to(device)
-    patch_resnet = ResnetBlock2DAdapter(resnet).to(device)
+    patch_resnet = ResnetBlock2DAdapter(
+        resnet, parallel_context=context
+    ).to(device)
 
     hidden_state = torch.randn(1, 64, args.height, args.width, device=device)
 
@@ -67,8 +69,8 @@ def main():
     # if rank == 0:
         # print("result: ", result)
 
-    patch = Patchify()
-    depatch = DePatchify()
+    patch = Patchify(context)
+    depatch = DePatchify(context)
     patch_result = patch_resnet(patch(hidden_state))
     # print("patch_res:", rank, patch_result)
     patch_result = depatch(patch_result)

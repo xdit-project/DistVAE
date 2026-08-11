@@ -1,14 +1,12 @@
 import math
 import numbers
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch import Tensor
 
 from diffusers.models.activations import get_activation
-from distvae.utils import DistributedEnv, ParallelContext, normalize_patch_dim
+from distvae.utils import ParallelContext, normalize_patch_dim
 
 
 class PatchGroupNorm(nn.GroupNorm):
@@ -65,11 +63,12 @@ class PatchGroupNorm(nn.GroupNorm):
         affine: bool = True,
         device=None,
         dtype=None,
-        patch_dim: Optional[int] = None,
-        parallel_context: Optional[ParallelContext] = None,
+        parallel_context: ParallelContext = None,
     ) -> None:
+        if not isinstance(parallel_context, ParallelContext):
+            raise TypeError("PatchGroupNorm requires a ParallelContext")
         self.parallel_context = parallel_context
-        self.patch_dim = parallel_context.patch_dim if parallel_context is not None else patch_dim
+        self.patch_dim = parallel_context.patch_dim
         super().__init__(
             num_groups=num_groups,
             num_channels=num_channels,
@@ -82,19 +81,9 @@ class PatchGroupNorm(nn.GroupNorm):
     def forward(self, x: Tensor) -> Tensor:
         ndim = x.ndim
         shape = x.shape
-        axis = DistributedEnv.get_patch_dim() if self.patch_dim is None else self.patch_dim
-        patch_dim = ndim + normalize_patch_dim(axis, ndim, spatial_only=True)
-
-        vae_group = (
-            self.parallel_context.group
-            if self.parallel_context is not None
-            else DistributedEnv.get_vae_group()
-        )
-        group_world_size = (
-            self.parallel_context.world_size
-            if self.parallel_context is not None
-            else DistributedEnv.get_group_world_size()
-        )
+        patch_dim = ndim + normalize_patch_dim(self.patch_dim, ndim, spatial_only=True)
+        vae_group = self.parallel_context.group
+        group_world_size = self.parallel_context.world_size
         x = x.detach()
         channels_per_group = shape[1] // self.num_groups
 

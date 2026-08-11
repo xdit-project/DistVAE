@@ -10,7 +10,6 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
     WanResidualUpBlock,
 )
 
-from distvae.models.vae import PatchDecoder
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
     HUNYUAN_VIDEO_15,
@@ -84,18 +83,8 @@ class DecoderAdapter(nn.Module):
         patch_dim = normalize_patch_dim(patch_dim, 4, spatial_only=True)
         self.patch_dim = patch_dim
         self.parallel_context = parallel_context(vae_group, patch_dim, ndim=4)
-        options = dict(
-            patch_dim=patch_dim, parallel_context=self.parallel_context
-        )
-        # Build only the shell whose forward defines the sharded decode. Constructing a complete
-        # PatchDecoder would create temporary patch layers before this adapter can give them its
-        # immutable context, then discard every one of those layers below.
-        self.decoder = PatchDecoder.__new__(PatchDecoder)
-        nn.Module.__init__(self.decoder)
-        self.decoder.gradient_checkpointing = decoder.gradient_checkpointing
-        self.decoder.layers_per_block = decoder.layers_per_block
-        self.decoder.conv_in = decoder.conv_in
-        self.decoder.mid_block = decoder.mid_block
+        options = dict(parallel_context=self.parallel_context)
+        self.decoder = decoder
         self.decoder.up_blocks = nn.ModuleList([
             UpDecoderBlock2DAdapter(
                 up_block, conv_block_size=conv_block_size, **options
@@ -106,8 +95,8 @@ class DecoderAdapter(nn.Module):
         self.decoder.conv_out = Conv2dAdapter(
             decoder.conv_out, block_size=conv_block_size, **options
         )
-        self.decoder.patch = Patchify(**options)
-        self.decoder.depatch = DePatchify(**options)
+        self.patch = Patchify(**options)
+        self.depatch = DePatchify(**options)
         self.vae_group = vae_group
         self.train(decoder.training)
 
@@ -116,7 +105,29 @@ class DecoderAdapter(nn.Module):
         sample: torch.FloatTensor,
         latent_embeds: Optional[torch.FloatTensor] = None,
     ):
-        return self.decoder(sample, latent_embeds)
+        if torch.is_grad_enabled():
+            raise RuntimeError(
+                "DecoderAdapter is inference-only; use torch.no_grad() or inference mode "
+                "(torch.inference_mode())."
+            )
+
+        decoder = self.decoder
+        sample = decoder.conv_in(sample)
+        upscale_dtype = next(iter(decoder.up_blocks.parameters())).dtype
+
+        sample = decoder.mid_block(sample, latent_embeds)
+        sample = sample.to(upscale_dtype)
+        sample = self.patch(sample)
+        for up_block in decoder.up_blocks:
+            sample = up_block(sample, latent_embeds)
+
+        if latent_embeds is None:
+            sample = decoder.conv_norm_out(sample)
+        else:
+            sample = decoder.conv_norm_out(sample, latent_embeds)
+        sample = decoder.conv_act(sample)
+        sample = decoder.conv_out(sample)
+        return self.depatch(sample)
 
 
 class _CausalDecoderAdapter(nn.Module):

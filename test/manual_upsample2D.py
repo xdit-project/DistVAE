@@ -1,7 +1,7 @@
 from distvae.modules.adapters.upsampling_adapters import Upsample2DAdapter
 from distvae.modules.patch_utils import Patchify, DePatchify
 from diffusers.models.upsampling import Upsample2D
-from distvae.utils import DistributedEnv
+from distvae.utils import DistributedEnv, parallel_context
 
 import torch
 import random
@@ -44,10 +44,12 @@ def main():
     dist.init_process_group(backend=backend)
     device = torch.distributed.get_rank() % device_count()
     set_device(device)
-    DistributedEnv.initialize(None)
+    context = parallel_context(None, -2, ndim=4)
 
     upsampler = Upsample2D(64, use_conv=True, out_channels=64).to(device)
-    patch_upsampler = Upsample2DAdapter(upsampler).to(device)
+    patch_upsampler = Upsample2DAdapter(
+        upsampler, parallel_context=context
+    ).to(device)
 
     hidden_state = torch.randn(1, 64, args.height, args.width, device=device)
     print("hidden state shape: ", hidden_state.shape)
@@ -56,8 +58,8 @@ def main():
     # if rank == 0:
         # print("result: ", result)
 
-    patch = Patchify()
-    depatch = DePatchify()
+    patch = Patchify(context)
+    depatch = DePatchify(context)
     patch_result = patch_upsampler(patch(hidden_state))
     # print("patch_res:", rank, patch_result)
     patch_result = depatch(patch_result)

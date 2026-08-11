@@ -23,26 +23,45 @@ from distvae.models.layers.conv3d import PatchConv3d
 from distvae.modules.patch_utils import DePatchify, Patchify, gather_patches, widest_halo
 from distvae.utils import ParallelContext, normalize_patch_dim
 
-from distributed_harness import assert_matches_reference, init_gloo, run_distributed
+from distributed_harness import (
+    assert_matches_reference,
+    init_gloo,
+    make_parallel_context,
+    run_distributed,
+)
+
+
+def test_patchify_requires_an_explicit_parallel_context():
+    with pytest.raises(TypeError, match="parallel_context"):
+        Patchify()
 
 
 def test_the_widest_halo_is_half_the_widest_kernel_on_the_split_axis():
+    context = make_parallel_context()
     # Only the split axis counts: a kernel is only ever wide across rows a neighbour holds.
     stack = nn.Sequential(
-        PatchConv2d(1, 1, kernel_size=3),
-        PatchConv2d(1, 1, kernel_size=(7, 1)),
-        PatchConv2d(1, 1, kernel_size=(1, 9)),
+        PatchConv2d(1, 1, kernel_size=3, parallel_context=context),
+        PatchConv2d(1, 1, kernel_size=(7, 1), parallel_context=context),
+        PatchConv2d(1, 1, kernel_size=(1, 9), parallel_context=context),
     )
     assert widest_halo(stack) == 3
 
 
 def test_the_widest_halo_reads_the_axis_the_convolution_was_told_to_split():
-    across = nn.Sequential(PatchConv2d(1, 1, kernel_size=(1, 9), patch_dim=-1))
+    across = nn.Sequential(
+        PatchConv2d(
+            1, 1, kernel_size=(1, 9), parallel_context=make_parallel_context(-1)
+        )
+    )
     assert widest_halo(across) == 4
 
 
 def test_a_three_dimensional_kernel_is_read_on_its_split_axis_too():
-    stack = nn.Sequential(PatchConv3d(1, 1, kernel_size=(9, 5, 9)))
+    stack = nn.Sequential(
+        PatchConv3d(
+            1, 1, kernel_size=(9, 5, 9), parallel_context=make_parallel_context()
+        )
+    )
     assert widest_halo(stack) == 2
 
 
@@ -55,14 +74,15 @@ def round_trip_worker(rank, world_size, rows, scale_factor, patch_dim, seed, mas
     try:
         torch.manual_seed(seed)
         whole = torch.randn(1, 4, rows, rows)
+        context = make_parallel_context(patch_dim)
 
-        band = Patchify(patch_dim=patch_dim, scale_factor=scale_factor)(whole)
+        band = Patchify(context, scale_factor=scale_factor)(whole)
         # Every band is a whole number of scale_factor rows, which is what keeps a rank's share
         # of a strided convolution on the same grid as the reference's.
         assert band.shape[patch_dim] % scale_factor == 0, (
             f"rank {rank} got {band.shape[patch_dim]} rows, not a multiple of {scale_factor}"
         )
-        rebuilt = DePatchify(patch_dim=patch_dim)(band)
+        rebuilt = DePatchify(context)(band)
 
         assert_matches_reference(rank, rebuilt, whole if rank == 0 else None, "Patchify round trip")
     finally:
@@ -75,7 +95,7 @@ def gather_worker(rank, world_size, rows, seed, master_port):
         torch.manual_seed(seed + rank)
         # Deliberately lopsided: rank r contributes r + 1 rows, so no two ranks agree.
         band = torch.full((1, 2, rank + 1, 3), float(rank))
-        bands, sizes = gather_patches(band, patch_dim=2)
+        bands, sizes = gather_patches(band, make_parallel_context())
 
         assert sizes == [r + 1 for r in range(world_size)], f"rank {rank} read sizes {sizes}"
         for r, gathered in enumerate(bands):
@@ -123,7 +143,9 @@ def refusal_worker(rank, world_size, rows, scale_factor, halo, expected, master_
     init_gloo(rank, world_size, master_port)
     try:
         with pytest.raises(ValueError, match=expected):
-            Patchify(scale_factor=scale_factor, halo=halo)(torch.randn(1, 2, rows, 4))
+            Patchify(
+                make_parallel_context(), scale_factor=scale_factor, halo=halo
+            )(torch.randn(1, 2, rows, 4))
     finally:
         dist.destroy_process_group()
 
@@ -133,7 +155,10 @@ def halo_worker(rank, world_size, rows, halo, seed, master_port):
     try:
         torch.manual_seed(seed)
         whole = torch.randn(1, 4, rows, rows)
-        assert torch.equal(DePatchify()(Patchify(halo=halo)(whole)), whole)
+        context = make_parallel_context()
+        assert torch.equal(
+            DePatchify(context)(Patchify(context, halo=halo)(whole)), whole
+        )
     finally:
         dist.destroy_process_group()
 

@@ -49,7 +49,6 @@ class Upsample2DAdapter(nn.Module):
         upsample2d: Upsample2D,
         *,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -66,20 +65,19 @@ class Upsample2DAdapter(nn.Module):
             name=upsample2d.name,
             kernel_size=None,
             padding=1,
-            interpolate=upsample2d.interpolate
+            interpolate=upsample2d.interpolate,
+            parallel_context=parallel_context,
         )
         if upsample2d.name == "conv":
             self.upsample2d.conv = Conv2dAdapter(
                 upsample2d.conv,
                 block_size=conv_block_size,
-                patch_dim=patch_dim,
                 parallel_context=parallel_context,
             )
         else:
             self.upsample2d.Conv2d_0 = Conv2dAdapter(
                 upsample2d.Conv2d_0,
                 block_size=conv_block_size,
-                patch_dim=patch_dim,
                 parallel_context=parallel_context,
             )
         
@@ -105,7 +103,6 @@ class _CausalResampleAdapter(nn.Module):
         self,
         resample: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -114,16 +111,11 @@ class _CausalResampleAdapter(nn.Module):
         assert isinstance(resample, self._supported), (
             f"{adapter} does not support resample except {self._requires}"
         )
-        if patch_dim == -3:
-            raise ValueError(
-                f"{adapter} does not support patch_dim F (-3); use H (-2) or W (-1)."
-            )
         self.resample = resample
         if hasattr(resample, "time_conv"):
             resample.time_conv = self._conv_adapter(
                 resample.time_conv,
                 block_size=conv_block_size,
-                patch_dim=patch_dim,
                 parallel_context=parallel_context,
             )
         if isinstance(resample.resample, nn.Sequential):
@@ -131,7 +123,6 @@ class _CausalResampleAdapter(nn.Module):
                 Conv2dAdapter(
                     layer,
                     block_size=conv_block_size,
-                    patch_dim=patch_dim,
                     parallel_context=parallel_context,
                 ) if isinstance(layer, nn.Conv2d) else layer
                 for layer in resample.resample
@@ -171,7 +162,6 @@ class _CausalUpBlockAdapter(nn.Module):
         self,
         up_block: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -182,7 +172,6 @@ class _CausalUpBlockAdapter(nn.Module):
         )
         options = dict(
             conv_block_size=conv_block_size,
-            patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
         up_block.resnets = nn.ModuleList(
@@ -252,7 +241,6 @@ class _PaddedCausalUpsampleAdapter(nn.Module):
         self,
         upsampler: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -266,7 +254,6 @@ class _PaddedCausalUpsampleAdapter(nn.Module):
             upsampler,
             self._conv_adapter,
             conv_block_size=conv_block_size,
-            patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
 
@@ -298,7 +285,6 @@ class _PaddedCausalUpBlockAdapter(nn.Module):
         self,
         up_block: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -309,7 +295,6 @@ class _PaddedCausalUpBlockAdapter(nn.Module):
         )
         options = dict(
             conv_block_size=conv_block_size,
-            patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
         self.up_block = up_block
@@ -353,7 +338,6 @@ class LTX2VideoUpsamplerAdapter(nn.Module):
         self,
         upsampler: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -367,7 +351,6 @@ class LTX2VideoUpsamplerAdapter(nn.Module):
             upsampler,
             LTX2VideoCausalConv3dAdapter,
             conv_block_size=conv_block_size,
-            patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
 
@@ -389,7 +372,6 @@ class LTX2VideoUpBlockAdapter(nn.Module):
         self,
         up_block: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -400,7 +382,6 @@ class LTX2VideoUpBlockAdapter(nn.Module):
         )
         options = dict(
             conv_block_size=conv_block_size,
-            patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
         self.up_block = up_block

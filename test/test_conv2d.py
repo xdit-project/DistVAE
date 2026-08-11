@@ -27,7 +27,12 @@ import torch.nn as nn
 from distvae.modules.adapters.layers.conv_adapters import Conv2dAdapter
 from distvae.modules.patch_utils import DePatchify, Patchify
 
-from distributed_harness import assert_matches_reference, init_gloo, run_distributed
+from distributed_harness import (
+    assert_matches_reference,
+    init_gloo,
+    make_parallel_context,
+    run_distributed,
+)
 
 
 def worker(rank, world_size, size, kernel, stride, padding, patch_dim, seed, master_port):
@@ -40,10 +45,9 @@ def worker(rank, world_size, size, kernel, stride, padding, patch_dim, seed, mas
 
         with torch.no_grad():
             expected = conv(x) if rank == 0 else None
-            sharded = Conv2dAdapter(conv, patch_dim=patch_dim)
-            actual = DePatchify(patch_dim=patch_dim)(
-                sharded(Patchify(patch_dim=patch_dim)(x))
-            )
+            context = make_parallel_context(patch_dim)
+            sharded = Conv2dAdapter(conv, parallel_context=context)
+            actual = DePatchify(context)(sharded(Patchify(context)(x)))
 
         assert_matches_reference(rank, actual, expected, "PatchConv2d", atol=1e-5)
     finally:

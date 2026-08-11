@@ -47,10 +47,7 @@ class CausalVAEAdapterSetup:
 
     @property
     def options(self):
-        return {
-            "patch_dim": self.patch_dim,
-            "parallel_context": self.parallel_context,
-        }
+        return {"parallel_context": self.parallel_context}
 
     def adapt_convolution(self, convolution):
         return self.conv_adapter(

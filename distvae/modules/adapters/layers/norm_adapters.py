@@ -1,6 +1,4 @@
-import torch
 import torch.nn as nn
-from typing import Optional
 
 from distvae.models.layers.normalization import PatchGroupNorm
 from distvae.utils import ParallelContext
@@ -12,7 +10,6 @@ class GroupNormAdapter(nn.Module):
     def __init__(
         self,
         group_norm: nn.GroupNorm,
-        patch_dim: Optional[int] = None,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -21,7 +18,6 @@ class GroupNormAdapter(nn.Module):
             num_channels=group_norm.num_channels, 
             eps=group_norm.eps, 
             affine=group_norm.affine,
-            patch_dim=patch_dim,
             parallel_context=parallel_context,
         )
         if group_norm.affine:

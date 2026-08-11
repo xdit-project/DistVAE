@@ -1,7 +1,7 @@
 from distvae.modules.patch_utils import Patchify, DePatchify
 from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from torch.nn import GroupNorm
-from distvae.utils import DistributedEnv
+from distvae.utils import DistributedEnv, parallel_context
 
 import torch
 import random
@@ -49,10 +49,10 @@ def main():
     dist.init_process_group(backend=backend)
     device = torch.distributed.get_rank() % device_count()
     set_device(device)
-    DistributedEnv.initialize(None)
+    context = parallel_context(None, -2, ndim=4)
 
     norm = GroupNorm(num_groups=32, num_channels=args.channels, eps=1e-6, affine=True).to(device)
-    patch_norm = GroupNormAdapter(norm).to(device)
+    patch_norm = GroupNormAdapter(norm, parallel_context=context).to(device)
 
     hidden_state = torch.randn(1, args.channels, args.height, args.width, device=device)
 
@@ -60,8 +60,8 @@ def main():
     # if rank == 0:
         # print("result: ", result)
 
-    patch = Patchify()
-    depatch = DePatchify()
+    patch = Patchify(context)
+    depatch = DePatchify(context)
     patch_result = patch_norm(patch(hidden_state))
     # print("patch_res:", rank, patch_result)
     patch_result = depatch(patch_result)

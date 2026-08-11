@@ -47,7 +47,6 @@ class ResnetBlock2DAdapter(nn.Module):
         resnet: ResnetBlock2D,
         *,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -55,7 +54,7 @@ class ResnetBlock2DAdapter(nn.Module):
         assert resnet.up is False, "up sample is not supported in ResnetBlock2DAdapter currently"
         assert resnet.down is False, "ResnetBlock2DAdapter does not support down sample currently"
         self.resnet = resnet
-        options = dict(patch_dim=patch_dim, parallel_context=parallel_context)
+        options = dict(parallel_context=parallel_context)
         resnet.conv1 = Conv2dAdapter(
             resnet.conv1, block_size=conv_block_size, **options
         )
@@ -88,7 +87,6 @@ class _CausalResidualBlockAdapter(nn.Module):
         self,
         residual_block: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -105,7 +103,6 @@ class _CausalResidualBlockAdapter(nn.Module):
                 self._conv_adapter(
                     getattr(residual_block, name),
                     block_size=conv_block_size,
-                    patch_dim=patch_dim,
                     parallel_context=parallel_context,
                 ),
             )
@@ -114,7 +111,6 @@ class _CausalResidualBlockAdapter(nn.Module):
             self.residual_block.conv_shortcut = self._conv_adapter(
                 residual_block.conv_shortcut,
                 block_size=conv_block_size,
-                patch_dim=patch_dim,
                 parallel_context=parallel_context,
             )
 
@@ -152,7 +148,6 @@ class _PaddedCausalResnetBlockAdapter(nn.Module):
         self,
         resnet: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -169,7 +164,6 @@ class _PaddedCausalResnetBlockAdapter(nn.Module):
                 self._conv_adapter(
                     getattr(resnet, name),
                     block_size=conv_block_size,
-                    patch_dim=patch_dim,
                     parallel_context=parallel_context,
                 ),
             )
@@ -181,7 +175,6 @@ class _PaddedCausalResnetBlockAdapter(nn.Module):
                     name,
                     GroupNormAdapter(
                         norm,
-                        patch_dim=patch_dim,
                         parallel_context=parallel_context,
                     ),
                 )
@@ -191,7 +184,6 @@ class _PaddedCausalResnetBlockAdapter(nn.Module):
             resnet.conv_shortcut = self._conv_adapter(
                 resnet.conv_shortcut,
                 block_size=conv_block_size,
-                patch_dim=patch_dim,
                 parallel_context=parallel_context,
             )
 
@@ -225,7 +217,6 @@ class LTX2VideoResnetBlockAdapter(nn.Module):
         self,
         resnet: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -251,7 +242,6 @@ class LTX2VideoResnetBlockAdapter(nn.Module):
                 LTX2VideoCausalConv3dAdapter(
                     getattr(resnet, name),
                     block_size=conv_block_size,
-                    patch_dim=patch_dim,
                     parallel_context=parallel_context,
                 ),
             )

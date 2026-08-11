@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from distvae.models.layers.conv_mixin import PatchConvMixin
-from distvae.utils import DistributedEnv, ParallelContext, normalize_patch_dim
+from distvae.utils import ParallelContext, normalize_patch_dim
 
 def _patch_axis(conv) -> int:
     """Which entry of a convolution's per-axis tuples describes the axis being split"""
@@ -42,8 +42,7 @@ def widest_halo(module: nn.Module) -> int:
 
 def gather_patches(
     patch: torch.Tensor,
-    patch_dim: int,
-    parallel_context: Optional[ParallelContext] = None,
+    parallel_context: ParallelContext,
 ) -> Tuple[List[torch.Tensor], List[int]]:
     """All-gather patches that need not be the same size along patch_dim
 
@@ -55,19 +54,13 @@ def gather_patches(
     Returns each rank's patch in rank order, and the sizes, which callers need to locate their
     own rows within the whole.
     """
+    if not isinstance(parallel_context, ParallelContext):
+        raise TypeError("gather_patches requires a ParallelContext")
     patch_dim = patch.ndim + normalize_patch_dim(
-        patch_dim, patch.ndim, spatial_only=True
+        parallel_context.patch_dim, patch.ndim, spatial_only=True
     )
-    group = (
-        parallel_context.group
-        if parallel_context is not None
-        else DistributedEnv.get_vae_group()
-    )
-    world_size = (
-        parallel_context.world_size
-        if parallel_context is not None
-        else DistributedEnv.get_group_world_size()
-    )
+    group = parallel_context.group
+    world_size = parallel_context.world_size
 
     # One rank already holds the whole thing, so there is nothing to collect and no other size to
     # discover. Both gathers below would be round trips whose answer is the argument. Callers
@@ -120,24 +113,17 @@ class Patchify(nn.Module):
 
     def __init__(
         self,
-        patch_dim: int = -2,
+        parallel_context: ParallelContext,
         scale_factor: int = 1,
-        parallel_context: Optional[ParallelContext] = None,
         halo: int = 0,
     ):
         super().__init__()
+        if not isinstance(parallel_context, ParallelContext):
+            raise TypeError("Patchify requires a ParallelContext")
         self.parallel_context = parallel_context
-        self.group_world_size = (
-            parallel_context.world_size
-            if parallel_context is not None
-            else DistributedEnv.get_group_world_size()
-        )
-        self.rank_in_vae_group = (
-            parallel_context.rank
-            if parallel_context is not None
-            else DistributedEnv.get_rank_in_vae_group()
-        )
-        self.patch_dim = parallel_context.patch_dim if parallel_context is not None else patch_dim
+        self.group_world_size = parallel_context.world_size
+        self.rank_in_vae_group = parallel_context.rank
+        self.patch_dim = parallel_context.patch_dim
         self.scale_factor = scale_factor
         self.halo = halo
 
@@ -183,20 +169,16 @@ class Patchify(nn.Module):
 
 
 class DePatchify(nn.Module):
-    def __init__(
-        self,
-        patch_dim: int = -2,
-        parallel_context: Optional[ParallelContext] = None,
-    ):
+    def __init__(self, parallel_context: ParallelContext):
         super().__init__()
+        if not isinstance(parallel_context, ParallelContext):
+            raise TypeError("DePatchify requires a ParallelContext")
         self.parallel_context = parallel_context
-        self.patch_dim = parallel_context.patch_dim if parallel_context is not None else patch_dim
+        self.patch_dim = parallel_context.patch_dim
 
     def forward(self, patch_hidden_state):
         patch_dim = patch_hidden_state.ndim + normalize_patch_dim(
             self.patch_dim, patch_hidden_state.ndim, spatial_only=True
         )
-        patches, _ = gather_patches(
-            patch_hidden_state, patch_dim, parallel_context=self.parallel_context
-        )
+        patches, _ = gather_patches(patch_hidden_state, self.parallel_context)
         return torch.cat(patches, dim=patch_dim)

@@ -68,6 +68,15 @@ def worker(
                 vae_scale_factor=SCALE_FACTOR,
                 conv_block_size=conv_block_size,
             ).eval()
+            child_contexts = [
+                module.parallel_context
+                for module in adapter.modules()
+                if hasattr(module, "parallel_context")
+            ]
+            assert child_contexts
+            assert all(
+                context is adapter.parallel_context for context in child_contexts
+            )
             actual = adapter(pixels)
 
         # The sharded GroupNorms inside the down blocks sum their statistics across ranks in

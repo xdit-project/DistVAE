@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from distvae.modules.patch_utils import gather_patches
-from distvae.utils import DistributedEnv, ParallelContext, normalize_patch_dim
+from distvae.utils import ParallelContext, normalize_patch_dim
 
 
 class GatheredAttentionAdapter(torch.nn.Module):
@@ -20,27 +20,22 @@ class GatheredAttentionAdapter(torch.nn.Module):
     def __init__(
         self,
         module: nn.Module,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ) -> None:
         super().__init__()
+        if not isinstance(parallel_context, ParallelContext):
+            raise TypeError("GatheredAttentionAdapter requires a ParallelContext")
         self.module = module
         self.parallel_context = parallel_context
-        self.patch_dim = parallel_context.patch_dim if parallel_context is not None else patch_dim
+        self.patch_dim = parallel_context.patch_dim
 
     def forward(self, hidden_states: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         patch_dim = hidden_states.ndim + normalize_patch_dim(
             self.patch_dim, hidden_states.ndim, spatial_only=True
         )
-        rank = (
-            self.parallel_context.rank
-            if self.parallel_context is not None
-            else DistributedEnv.get_rank_in_vae_group()
-        )
+        rank = self.parallel_context.rank
 
-        patches, sizes = gather_patches(
-            hidden_states, patch_dim, parallel_context=self.parallel_context
-        )
+        patches, sizes = gather_patches(hidden_states, self.parallel_context)
         whole = self.module(torch.cat(patches, dim=patch_dim), *args, **kwargs)
         return torch.narrow(whole, patch_dim, sum(sizes[:rank]), sizes[rank])
 

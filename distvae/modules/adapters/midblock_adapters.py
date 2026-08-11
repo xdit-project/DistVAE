@@ -39,7 +39,6 @@ class _CausalMidBlockAdapter(nn.Module):
         self,
         mid_block: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -54,14 +53,12 @@ class _CausalMidBlockAdapter(nn.Module):
             self._resnet_adapter(
                 resnet,
                 conv_block_size=conv_block_size,
-                patch_dim=patch_dim,
                 parallel_context=parallel_context,
             ) for resnet in mid_block.resnets
         ])
         self.mid_block.attentions = nn.ModuleList([
-            GatheredAttentionAdapter(
-                attn, patch_dim=patch_dim, parallel_context=parallel_context
-            ) if attn is not None else attn
+            GatheredAttentionAdapter(attn, parallel_context=parallel_context)
+            if attn is not None else attn
             for attn in mid_block.attentions
         ])
 
@@ -108,7 +105,6 @@ class HunyuanVideoMidBlockAdapter(nn.Module):
         self,
         mid_block: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -120,14 +116,13 @@ class HunyuanVideoMidBlockAdapter(nn.Module):
         )
         if any(attn is not None for attn in mid_block.attentions):
             self.mid_block = GatheredAttentionAdapter(
-                mid_block, patch_dim=patch_dim, parallel_context=parallel_context
+                mid_block, parallel_context=parallel_context
             )
         else:
             mid_block.resnets = nn.ModuleList([
                 HunyuanVideoResnetBlockAdapter(
                     resnet,
                     conv_block_size=conv_block_size,
-                    patch_dim=patch_dim,
                     parallel_context=parallel_context,
                 ) for resnet in mid_block.resnets
             ])
@@ -148,7 +143,6 @@ class LTX2VideoMidBlockAdapter(nn.Module):
         self,
         mid_block: nn.Module,
         conv_block_size = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
@@ -163,7 +157,6 @@ class LTX2VideoMidBlockAdapter(nn.Module):
             LTX2VideoResnetBlockAdapter(
                 resnet,
                 conv_block_size=conv_block_size,
-                patch_dim=patch_dim,
                 parallel_context=parallel_context,
             ) for resnet in mid_block.resnets
         ])

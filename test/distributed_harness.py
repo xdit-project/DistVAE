@@ -15,7 +15,7 @@ import torch.distributed as dist
 from torch.multiprocessing import spawn
 from torch.multiprocessing.spawn import ProcessRaisedException
 
-from distvae.utils import DistributedEnv
+from distvae.utils import ParallelContext
 
 # How many ports to try before giving up on finding a free one.
 _RENDEZVOUS_ATTEMPTS = 4
@@ -28,8 +28,22 @@ def init_gloo(rank: int, world_size: int, master_port: int) -> torch.device:
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     dist.init_process_group(backend="gloo", init_method="env://")
-    DistributedEnv.initialize(None)
     return torch.device("cpu")
+
+
+def make_parallel_context(patch_dim: int = -2) -> ParallelContext:
+    """Capture the current test process group, or a one-rank local context."""
+    if not dist.is_initialized():
+        return ParallelContext(None, rank=0, world_size=1, patch_dim=patch_dim)
+    group = dist.group.WORLD
+    world_size = dist.get_world_size(group)
+    return ParallelContext(
+        group,
+        rank=dist.get_rank(group),
+        world_size=world_size,
+        patch_dim=patch_dim,
+        global_ranks=tuple(range(world_size)),
+    )
 
 
 def assert_matches_reference(

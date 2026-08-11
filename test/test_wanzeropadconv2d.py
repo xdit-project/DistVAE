@@ -25,7 +25,7 @@ from torch.multiprocessing import spawn
 
 from distvae.models.layers.wan.zeropadconv2d import WanZeroPadConv2d
 from distvae.modules.patch_utils import DePatchify, Patchify
-from distvae.utils import DistributedEnv
+from distributed_harness import make_parallel_context
 
 
 def reference_wan_zeropad_conv2d(x: torch.Tensor, module: WanZeroPadConv2d) -> torch.Tensor:
@@ -61,11 +61,11 @@ def worker(
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     dist.init_process_group(backend="gloo", init_method="env://")
-    DistributedEnv.initialize(None)
 
     torch.manual_seed(seed)
     in_ch, out_ch = 8, 8
     n, h, w = 1, height, width
+    context = make_parallel_context(patch_dim)
 
     x_full = torch.randn(n, in_ch, h, w, device=device, dtype=torch.float32)
     layer = WanZeroPadConv2d(
@@ -80,11 +80,11 @@ def worker(
         dtype=torch.float32,
         reversed_zero_padding=(0, 1, 0, 1),
         block_size=block_size,
-        patch_dim=patch_dim,
+        parallel_context=context,
     ).eval()
 
-    patchify = Patchify(patch_dim=patch_dim, scale_factor=patch_scale_factor)
-    depatchify = DePatchify(patch_dim=patch_dim)
+    patchify = Patchify(context, scale_factor=patch_scale_factor)
+    depatchify = DePatchify(context)
 
     try:
         with torch.no_grad():

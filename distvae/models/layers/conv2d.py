@@ -31,7 +31,6 @@ class PatchConv2d(nn.Conv2d, PatchConvMixin):
         device=None,
         dtype=None,
         block_size: Union[int, Tuple[int, int]] = 0,
-        patch_dim: int = -2,
         parallel_context: ParallelContext = None,
     ) -> None:
 
@@ -40,10 +39,13 @@ class PatchConv2d(nn.Conv2d, PatchConvMixin):
         else:
             for i in dilation:
                 assert i == 1, "dilation is not supported in PatchConv2d"
-        patch_dim = normalize_patch_dim(patch_dim, 4, spatial_only=True)
+        if not isinstance(parallel_context, ParallelContext):
+            raise TypeError("PatchConv2d requires a ParallelContext")
         self.block_size = block_size
         self.parallel_context = parallel_context
-        self.patch_dim = parallel_context.patch_dim if parallel_context is not None else patch_dim
+        self.patch_dim = normalize_patch_dim(
+            parallel_context.patch_dim, 4, spatial_only=True
+        )
         self.halo_buffer = {}
         super().__init__(
             in_channels, out_channels, kernel_size, stride, padding, dilation,
@@ -55,9 +57,7 @@ class PatchConv2d(nn.Conv2d, PatchConvMixin):
     def _conv_forward(self, input: Tensor, weight: Tensor, bias: Optional[Tensor]):
         bs, channels, h, w = input.shape
 
-        group_world_size, global_rank, rank_in_group, local_rank = get_world_size_and_rank(
-            self.parallel_context
-        )
+        group_world_size, rank_in_group = get_world_size_and_rank(self.parallel_context)
 
         if (group_world_size == 1):
             if self.padding_mode != 'zeros':

@@ -14,20 +14,15 @@ def test_resnet_wrappers_receive_the_adapters_parallel_settings(monkeypatch):
     received_norms = []
     received_convs = []
 
-    def recording_group_norm(norm, patch_dim=None, parallel_context=None):
-        received_norms.append((patch_dim, parallel_context))
-        return GroupNormAdapter(
-            norm,
-            patch_dim=-2 if patch_dim is None else patch_dim,
-            parallel_context=parallel_context,
-        )
+    def recording_group_norm(norm, parallel_context=None):
+        received_norms.append(parallel_context)
+        return GroupNormAdapter(norm, parallel_context=parallel_context)
 
-    def recording_conv(conv, *, block_size=0, patch_dim=None, parallel_context=None):
-        received_convs.append((patch_dim, parallel_context))
+    def recording_conv(conv, *, block_size=0, parallel_context=None):
+        received_convs.append(parallel_context)
         return Conv2dAdapter(
             conv,
             block_size=block_size,
-            patch_dim=-2 if patch_dim is None else patch_dim,
             parallel_context=parallel_context,
         )
 
@@ -41,7 +36,7 @@ def test_resnet_wrappers_receive_the_adapters_parallel_settings(monkeypatch):
         dropout=0.0,
     )
 
-    ResnetBlock2DAdapter(source, patch_dim=3, parallel_context=context)
+    ResnetBlock2DAdapter(source, parallel_context=context)
 
-    assert received_norms == [(3, context), (3, context)]
-    assert received_convs == [(3, context), (3, context), (3, context)]
+    assert received_norms == [context, context]
+    assert received_convs == [context, context, context]
