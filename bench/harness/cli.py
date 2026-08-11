@@ -4,8 +4,13 @@ import argparse
 
 import torch.distributed as dist
 
-from . import arms, catalog, measure, report
-from .distributed import Runtime
+from . import arms, catalog, measure, report, shape_costs
+from .distributed import (
+    Runtime,
+    aggregate_rank_errors,
+    exception_record,
+    gather_rank_errors,
+)
 
 
 def parser():
@@ -53,7 +58,7 @@ def parser():
     )
     value.add_argument(
         "--tile-overlap",
-        help="overlap fraction controlling tile stride; comma-separated for grids",
+        help="absolute HEIGHTxWIDTH pixel overlap; comma-separated pairs for grids",
     )
     value.add_argument(
         "--tile-distribution",
@@ -132,26 +137,7 @@ def _shape(spec, cell):
     }
 
 
-def _local_error(caught, rank):
-    return {
-        "type": type(caught).__name__,
-        "message": str(caught),
-        "rank": int(rank),
-    }
-
-
-def _aggregate_errors(failures):
-    details = [failure for failure in failures if failure is not None]
-    if not details:
-        return None
-    return {
-        **details[0],
-        "failed_ranks": [failure["rank"] for failure in details],
-        "failures": details,
-    }
-
-
-def _describe(args, cells):
+def _describe(args, cells, provenance_data=None):
     spec = catalog.FAMILIES[args.family]
     records = []
     for cell in cells:
@@ -171,18 +157,19 @@ def _describe(args, cells):
                 {"description": description},
                 dtype=args.dtype,
                 world_size=1,
+                provenance_data=provenance_data,
             )
         )
     return records
 
 
-def _measure(args, cells, runtime):
+def _measure(args, cells, runtime, provenance_data=None):
     spec = catalog.FAMILIES[args.family]
     if args.tile_shape_costs:
         error = None
         costs = {"frames": args.frames if spec["temporal"] else None}
         try:
-            costs = measure.tile_shape_costs(
+            costs = shape_costs.tile_shape_costs(
                 args,
                 spec,
                 runtime,
@@ -190,11 +177,9 @@ def _measure(args, cells, runtime):
             )
             measurement = {"tile_shape_costs": costs}
         except (Exception, SystemExit) as caught:
-            error = _local_error(caught, runtime.rank)
+            error = exception_record(caught, runtime.rank)
             measurement = {}
-        failures = [None] * runtime.world_size
-        dist.all_gather_object(failures, error, group=runtime.group)
-        aggregate_error = _aggregate_errors(failures)
+        aggregate_error = aggregate_rank_errors(gather_rank_errors(error, runtime))
         composition = {
             "name": "tile-shape-costs",
             "execution": "tile-shape-costs",
@@ -212,6 +197,7 @@ def _measure(args, cells, runtime):
             aggregate_error,
             dtype=args.dtype,
             world_size=runtime.world_size,
+            provenance_data=provenance_data,
         )
         if runtime.rank == 0:
             report.render(record, "decoder")
@@ -231,7 +217,7 @@ def _measure(args, cells, runtime):
                 args, spec, cell, runtime, references, say
             )
         except (Exception, SystemExit) as caught:
-            error = _local_error(caught, runtime.rank)
+            error = exception_record(caught, runtime.rank)
             print(
                 f"[rank {runtime.rank}] cell {cell['name']} failed: "
                 f"{error['type']}: {error['message']}",
@@ -240,9 +226,7 @@ def _measure(args, cells, runtime):
             composition, measurement = dict(cell), {}
         runtime.device_api.empty_cache()
 
-        failures = [None] * runtime.world_size
-        dist.all_gather_object(failures, error, group=runtime.group)
-        aggregate_error = _aggregate_errors(failures)
+        aggregate_error = aggregate_rank_errors(gather_rank_errors(error, runtime))
         record = report.make_record(
             args.family,
             args.half,
@@ -252,6 +236,7 @@ def _measure(args, cells, runtime):
             aggregate_error,
             dtype=args.dtype,
             world_size=runtime.world_size,
+            provenance_data=provenance_data,
         )
         records.append(record)
         if runtime.rank == 0:
@@ -263,15 +248,22 @@ def main(argv=None):
     """Run describe-only or accelerator measurement mode and return an exit status."""
     command = parser()
     args = command.parse_args(argv)
-    try:
-        cells = arms.cells_from_args(args)
-    except ValueError as error:
-        command.error(str(error))
     if args.tile_shape_costs and args.half != "decoder":
         command.error("--tile-shape-costs requires --half decoder")
+    if args.tile_shape_costs and args.describe_only:
+        command.error("--tile-shape-costs cannot be combined with --describe-only")
+    if args.tile_shape_costs:
+        cells = []
+    else:
+        try:
+            arms.normalize_legacy_args(args)
+            cells = arms.cells_from_args(args)
+        except ValueError as error:
+            command.error(str(error))
+    provenance_data = report.provenance()
 
     if args.describe_only:
-        records = _describe(args, cells)
+        records = _describe(args, cells, provenance_data)
         for record in records:
             report.render(record, args.half)
         if args.out:
@@ -280,7 +272,7 @@ def main(argv=None):
 
     runtime = Runtime.start(args.timeout_min)
     try:
-        records = _measure(args, cells, runtime)
+        records = _measure(args, cells, runtime, provenance_data)
         if runtime.rank == 0 and args.out:
             report.write_json(args.out, records)
         status = report.report_status(records)

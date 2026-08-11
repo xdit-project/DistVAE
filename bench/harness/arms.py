@@ -2,29 +2,53 @@
 
 from itertools import product
 
-ARM_ALIASES = {
-    "none": {"sharding": "unsharded", "tiling": None},
-    "pvae": {"sharding": "row", "tiling": None},
-    "tile": {"sharding": "row", "tiling": "native"},
-    "tile-half": {"sharding": "row", "tiling": "half"},
-    "tile-quarter": {"sharding": "row", "tiling": "quarter"},
-    "tile-nopvae": {"sharding": "unsharded", "tiling": "native"},
-    "tile-dist": {
+PRESETS = {
+    "unsharded": {"sharding": "unsharded", "tiling": None},
+    "row": {"sharding": "row", "tiling": None},
+    "row-tiled": {"sharding": "row", "tiling": "native"},
+    "row-tiled-half": {"sharding": "row", "tiling": "half"},
+    "row-tiled-quarter": {"sharding": "row", "tiling": "quarter"},
+    "tiled": {"sharding": "unsharded", "tiling": "native"},
+    "tile-runs": {
         "sharding": "unsharded",
         "tiling": "native",
         "tile_distribution": "runs",
     },
-    "tile-dist-half": {
+    "tile-runs-half": {
         "sharding": "unsharded",
         "tiling": "half",
         "tile_distribution": "runs",
     },
-    "tile-dist-quarter": {
+    "tile-runs-quarter": {
         "sharding": "unsharded",
         "tiling": "quarter",
         "tile_distribution": "runs",
     },
 }
+
+LEGACY_ARM_NAMES = {
+    "none": "unsharded",
+    "pvae": "row",
+    "tile": "row-tiled",
+    "tile-half": "row-tiled-half",
+    "tile-quarter": "row-tiled-quarter",
+    "tile-nopvae": "tiled",
+    "tile-dist": "tile-runs",
+    "tile-dist-half": "tile-runs-half",
+    "tile-dist-quarter": "tile-runs-quarter",
+}
+
+# Public compatibility table retained for callers that enumerate legacy arms.
+ARM_ALIASES = {name: PRESETS[preset] for name, preset in LEGACY_ARM_NAMES.items()}
+
+
+def normalize_legacy_args(args):
+    """Normalize compatibility preset names once at the CLI boundary."""
+    if args.grid_arms:
+        args.grid_arms = ",".join(
+            LEGACY_ARM_NAMES.get(name.strip(), name.strip())
+            for name in args.grid_arms.split(",")
+        )
 
 
 def parse_shapes(text, default_frames):
@@ -45,30 +69,59 @@ def parse_shapes(text, default_frames):
 
 
 def parse_overlap(value):
-    """Parse a numeric overlap or half of the VAE's native overlap."""
+    """Parse an explicit HEIGHTxWIDTH output-pixel overlap."""
     value = value.strip().lower()
-    if value == "half":
-        return value
+    parts = value.split("x")
+    if len(parts) != 2:
+        raise ValueError(
+            f"tile overlap must be an absolute HEIGHTxWIDTH pixel pair, not {value!r}"
+        )
     try:
-        return float(value)
+        overlap = tuple(int(part) for part in parts)
     except ValueError:
         raise ValueError(
-            f"tile overlap must be a fraction or 'half', not {value!r}"
+            f"tile overlap must be an absolute HEIGHTxWIDTH pixel pair, not {value!r}"
         ) from None
+    if any(axis < 0 for axis in overlap):
+        raise ValueError("tile overlap pixels must be non-negative")
+    return overlap
 
 
 def _overlap_label(overlap):
-    return overlap if isinstance(overlap, str) else f"{overlap:g}"
+    return f"{overlap[0]}x{overlap[1]}"
 
 
 def _overlaps(text):
-    return [None] if not text else [None, *(parse_overlap(value) for value in text.split(","))]
+    return (
+        [None]
+        if not text
+        else [None, *(parse_overlap(value) for value in text.split(","))]
+    )
 
 
 def _arm(name):
-    if name not in ARM_ALIASES:
-        raise ValueError(f"unknown arm {name!r}; choose from {sorted(ARM_ALIASES)}")
-    return ARM_ALIASES[name]
+    name = LEGACY_ARM_NAMES.get(name, name)
+    if name not in PRESETS:
+        choices = sorted({*PRESETS, *LEGACY_ARM_NAMES})
+        raise ValueError(f"unknown arm {name!r}; choose from {choices}")
+    return PRESETS[name]
+
+
+def validate_cell(cell):
+    """Validate one canonical ordinary benchmark cell."""
+    if cell["sharding"] not in ("unsharded", "row"):
+        raise ValueError(f"unknown sharding mode {cell['sharding']!r}")
+    if cell["height"] <= 0 or cell["width"] <= 0 or cell["frames"] <= 0:
+        raise ValueError("height, width, and frames must be positive")
+    if cell["tile_distribution"] is not None and cell["tiling"] is None:
+        raise ValueError("tile distribution requires a tile window")
+    if cell["tile_distribution"] is not None and cell["sharding"] == "row":
+        raise ValueError(
+            "row sharding and whole-tile distribution are alternative execution modes"
+        )
+    if cell["overlap"] is not None and cell["tiling"] is None:
+        raise ValueError("tile overlap requires a tile window")
+    return cell
 
 
 def expand_grid(arm_names, shapes, default_frames, overlaps):
@@ -81,17 +134,19 @@ def expand_grid(arm_names, shapes, default_frames, overlaps):
             if overlap is not None and arm["tiling"] is None:
                 continue
             cells.append(
-                {
-                    "name": (
-                        name
-                        if overlap is None
-                        else f"{name}-ov{_overlap_label(overlap)}"
-                    ),
-                    **arm,
-                    **shape,
-                    "overlap": overlap,
-                    "tile_distribution": arm.get("tile_distribution"),
-                }
+                validate_cell(
+                    {
+                        "name": (
+                            name
+                            if overlap is None
+                            else f"{name}-ov{_overlap_label(overlap)}"
+                        ),
+                        **arm,
+                        **shape,
+                        "overlap": overlap,
+                        "tile_distribution": arm.get("tile_distribution"),
+                    }
+                )
             )
     return cells
 
@@ -110,6 +165,24 @@ def cells_from_args(args):
     """Normalize a single invocation or a requested grid."""
     shapes = args.grid_shapes or f"{args.height}x{args.width}x{args.frames}"
     if args.grid_arms:
+        ambiguous = [
+            flag
+            for flag, present in (
+                ("--sharding", args.sharding is not None),
+                ("--no-parallel-vae", args.no_parallel_vae),
+                ("--enable-tiling", args.enable_tiling),
+                ("--tile-window", args.tile_window is not None),
+                ("--vae-tile-size", args.vae_tile_size is not None),
+                ("--tile-distribution", args.tile_distribution is not None),
+                ("--tile-split", args.tile_split is not None),
+            )
+            if present
+        ]
+        if ambiguous:
+            raise ValueError(
+                "--grid-arms cannot be combined with explicit composition axes: "
+                + ", ".join(ambiguous)
+            )
         return expand_grid(args.grid_arms, shapes, args.frames, args.tile_overlap)
 
     tiling = args.tile_window
@@ -151,18 +224,28 @@ def cells_from_args(args):
         raise ValueError(
             "row sharding and whole-tile distribution are alternative execution modes"
         )
-    overlap = parse_overlap(args.tile_overlap.split(",")[0]) if args.tile_overlap else None
+    overlap = None
+    if args.tile_overlap:
+        overlap_values = args.tile_overlap.split(",")
+        if len(overlap_values) > 1:
+            raise ValueError(
+                "multiple tile overlap pairs require --grid-arms; "
+                "non-grid runs accept exactly one HEIGHTxWIDTH pair"
+            )
+        overlap = parse_overlap(overlap_values[0])
     if overlap is not None and tiling is None:
         raise ValueError("tile overlap requires a tile window")
     return [
-        {
-            "name": "single",
-            "sharding": sharding,
-            "tiling": tiling,
-            "height": args.height,
-            "width": args.width,
-            "frames": args.frames,
-            "overlap": overlap,
-            "tile_distribution": distribution,
-        }
+        validate_cell(
+            {
+                "name": "single",
+                "sharding": sharding,
+                "tiling": tiling,
+                "height": args.height,
+                "width": args.width,
+                "frames": args.frames,
+                "overlap": overlap,
+                "tile_distribution": distribution,
+            }
+        )
     ]

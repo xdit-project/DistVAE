@@ -12,7 +12,7 @@ from pathlib import Path
 
 import torch
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 def _version(distribution, module=None):
@@ -75,10 +75,24 @@ def _source_checkout(module):
 
 def _benchmark_identity():
     try:
-        source = Path(sys.argv[0]).resolve()
+        launcher = Path(sys.argv[0]).resolve()
+        harness = Path(__file__).resolve().parent
+        sources = sorted(harness.glob("*.py"))
+        digest = hashlib.sha256()
+        if launcher.is_file() and launcher not in sources:
+            sources.append(launcher)
+        for source in sources:
+            try:
+                label = source.relative_to(harness.parent)
+            except ValueError:
+                label = Path(source.name)
+            digest.update(str(label).encode())
+            digest.update(b"\0")
+            digest.update(source.read_bytes())
         return {
-            "path": str(source),
-            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "path": str(launcher),
+            "sha256": digest.hexdigest(),
+            "implementation": [str(source) for source in sources],
         }
     except OSError:
         return None
@@ -117,12 +131,13 @@ def make_record(
     *,
     dtype,
     world_size,
+    provenance_data=None,
 ):
     """Build one self-contained schema-versioned result."""
     dtype_name = str(dtype).removeprefix("torch.")
     record = {
         "schema_version": SCHEMA_VERSION,
-        **provenance(),
+        **(provenance_data if provenance_data is not None else provenance()),
         "family": family,
         "half": half,
         "shape": shape,

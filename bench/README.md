@@ -5,8 +5,8 @@ checkpoint. It builds the true architecture from a config with random weights, b
 tune here is a property of the adapter stack rather than of the weights: `PatchGroupNorm` issues
 the same collectives whether its input came from Flux.2 or from `torch.randn`.
 
-It is one file, it takes no cluster, and it writes one JSON that says what produced it. That is
-the whole portability story — copy it to the box, run it, send back the JSON.
+The launcher and `harness/` package take no cluster, and write JSON that says what produced it.
+Copy the `bench` package to the box, run it, and send back the JSON.
 
 ## What the machine needs
 
@@ -15,17 +15,7 @@ the whole portability story — copy it to the box, run it, send back the JSON.
 | PyTorch with a working `torch.distributed` | ROCm and CUDA builds both work unchanged: torch presents HIP under `torch.cuda` and RCCL under the `nccl` backend, so nothing here branches on vendor |
 | `diffusers` | the VAE architectures are read from its classes |
 | DistVAE, installed | the thing under test |
-| xDiT (`xfuser`), installed | see below — needed for every arm except `main` |
-
-**On xDiT.** The DistVAE library imports nothing from xDiT and never will. The *bench* does, on
-purpose: xDiT is what chooses which adapter fits a VAE and what order the tiling calls happen in,
-and those choices are part of what is being measured. Letting this file pick an adapter instead
-would measure this file's opinion, and a run would sail on with the wrong one rather than tell you
-the installed xDiT is too old. The one exception is the `main` arm, which names its adapter
-directly and so runs with no xDiT present at all — at the cost of covering only the decoder of
-`flux2`, `kl` and `wan`.
-
-Install DistVAE and xDiT from the branches you mean to compare, not from a release. Two machines
+Install DistVAE from the branch you mean to compare, not from a release. Two machines
 can both hold `distvae 0.0.0b5` and disagree about everything that matters; the report records the
 branch and commit of each so this is at least visible afterwards.
 
@@ -65,13 +55,17 @@ A single run is one arm, chosen by flags, each differing from the one above by o
 (default)              sharded
 --enable-tiling        sharded and tiled at the VAE's own window
 --vae-tile-size N      the same, at a narrower window
---tile-overlap F       the same, at a wider stride between tiles
+--tile-overlap HxW     exact output-pixel overlap between tiles (for example 64x32)
 ```
 
 `--grid-arms` runs several in one job against one reference, which is both faster and more
-comparable than several jobs. Named arms are `none`, `pvae`, `tile`, `tile-half`, `tile-quarter`,
-`tile-nopvae`, `main`, `main-notile`. `--grid-shapes` takes `HxW` or `HxWxFRAMES`, comma
-separated.
+comparable than several jobs. Canonical presets are `unsharded`, `row`, `row-tiled`,
+`row-tiled-half`, `row-tiled-quarter`, `tiled`, `tile-runs`, `tile-runs-half`, and
+`tile-runs-quarter`. Existing names such as `none`, `pvae`, `tile`, and `tile-dist` remain
+accepted as compatibility aliases. `--grid-shapes` takes comma-separated `HxW` or
+`HxWxFRAMES` values. Explicit composition flags cannot be mixed with `--grid-arms`;
+`--tile-overlap` remains an orthogonal grid axis. A grid takes comma-separated pixel pairs,
+for example `--tile-overlap 64x32,32x16,0x0`.
 
 ```bash
 torchrun --nproc_per_node=4 bench/distvae_bench.py \
@@ -80,6 +74,14 @@ torchrun --nproc_per_node=4 bench/distvae_bench.py \
   --grid-shapes 720x1280x81,1080x1920x81 \
   --out wan-decoder-grid.json
 ```
+
+`--tile-shape-costs` is a separate decoder-only mode. It ignores ordinary composition axes and
+measures the decoder across tile shapes selected by `--tile-shape-sides` and batch sizes up to
+`--tile-shape-batch`.
+
+`--profile`, `--profile-trace`, and `--profile-memory` run one additional call after timed
+measurement. Requested artifacts are written under `--profile-dir`; repeated cells receive a
+numeric suffix rather than replacing an existing artifact.
 
 **Run the same arms and shapes on every machine.** Nothing enforces it, and a table assembled
 from runs that each picked their own shapes compares nothing.
@@ -97,16 +99,17 @@ Three things per cell, and the first is the point of the harness:
   change has to preserve. A run of a single cell exits non-zero if it disagrees; a grid does not,
   because a grid is expected to contain arms that disagree and is a measurement rather than a gate.
 
-The JSON is `{"schema": 1, "ran": {...}, "cells": [...]}`. The `ran` block carries the hardware,
-the world size, the branch and commit of everything installed, and the exact argv, so a file that
-arrives by scp needs no accompanying message to be read. Reports from before this envelope existed
-are a bare cell or a bare list, with no `schema` key.
+The JSON is one schema-versioned record for a single cell and a list of records for a grid. Each
+record retains its own versions and provenance so it remains self-contained when separated from
+the grid. Provenance is collected once per invocation and reused across those records. Schema 5
+records tile windows and overlaps as two-axis values: `native_window_px`, `window_px`,
+`native_overlap_px`, `overlap`, and the shape-cost `latent_window` are all `[height, width]`
+in JSON.
 
-It also carries a digest of this script itself, which is not the same claim as the commit of the
-installed DistVAE. The bench file travels by other means than the package does — copied to a box,
-mounted into a container, delivered by ConfigMap — so the commit beside it is no evidence of what
-actually ran. When two machines disagree, check the digests match before reading anything into the
-numbers.
+It also carries one digest over the launcher and harness implementation, which is not the same
+claim as the commit of the installed DistVAE. The bench package can travel by other means than the
+library, so the commit beside it is no evidence of what actually ran. When two machines disagree,
+check the digests match before reading anything into the numbers.
 
 ## What it cannot tell you
 

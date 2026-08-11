@@ -11,6 +11,53 @@ import torch
 import torch.distributed as dist
 
 
+def exception_record(error, rank):
+    """Represent a local exception without losing its originating rank or type."""
+    preserved = getattr(error, "rank_error", None)
+    if preserved is not None:
+        return preserved
+    return {"type": type(error).__name__, "message": str(error), "rank": int(rank)}
+
+
+def gather_rank_errors(local_error, runtime):
+    """Collect one optional error from every rank in collective order."""
+    failures = [None] * runtime.world_size
+    dist.all_gather_object(failures, local_error, group=runtime.group)
+    return failures
+
+
+def aggregate_rank_errors(failures):
+    """Combine rank errors while preserving each original failure record."""
+    details = []
+    for failure in failures:
+        if failure is None:
+            continue
+        nested = failure.get("failures")
+        details.extend(nested if nested is not None else [failure])
+    by_rank = {}
+    for failure in details:
+        by_rank.setdefault(failure["rank"], failure)
+    details = list(by_rank.values())
+    if not details:
+        return None
+    return {
+        **details[0],
+        "failed_ranks": [failure["rank"] for failure in details],
+        "failures": details,
+    }
+
+
+class RankError(RuntimeError):
+    """Propagate an aggregated rank failure without wrapping its identity."""
+
+    def __init__(self, error, context):
+        self.rank_error = error
+        super().__init__(
+            f"{context} failed on rank {error['rank']}: "
+            f"{error['type']}: {error['message']}"
+        )
+
+
 def accelerator_backend():
     """Return the available accelerator API and its distributed backend."""
     if torch.cuda.is_available():
