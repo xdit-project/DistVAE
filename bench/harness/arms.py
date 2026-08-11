@@ -44,8 +44,25 @@ def parse_shapes(text, default_frames):
     return shapes
 
 
+def parse_overlap(value):
+    """Parse a numeric overlap or half of the VAE's native overlap."""
+    value = value.strip().lower()
+    if value == "half":
+        return value
+    try:
+        return float(value)
+    except ValueError:
+        raise ValueError(
+            f"tile overlap must be a fraction or 'half', not {value!r}"
+        ) from None
+
+
+def _overlap_label(overlap):
+    return overlap if isinstance(overlap, str) else f"{overlap:g}"
+
+
 def _overlaps(text):
-    return [None] if not text else [None, *(float(value) for value in text.split(","))]
+    return [None] if not text else [None, *(parse_overlap(value) for value in text.split(","))]
 
 
 def _arm(name):
@@ -65,7 +82,11 @@ def expand_grid(arm_names, shapes, default_frames, overlaps):
                 continue
             cells.append(
                 {
-                    "name": name if overlap is None else f"{name}-ov{overlap:g}",
+                    "name": (
+                        name
+                        if overlap is None
+                        else f"{name}-ov{_overlap_label(overlap)}"
+                    ),
                     **arm,
                     **shape,
                     "overlap": overlap,
@@ -130,7 +151,7 @@ def cells_from_args(args):
         raise ValueError(
             "row sharding and whole-tile distribution are alternative execution modes"
         )
-    overlap = float(args.tile_overlap.split(",")[0]) if args.tile_overlap else None
+    overlap = parse_overlap(args.tile_overlap.split(",")[0]) if args.tile_overlap else None
     if overlap is not None and tiling is None:
         raise ValueError("tile overlap requires a tile window")
     return [

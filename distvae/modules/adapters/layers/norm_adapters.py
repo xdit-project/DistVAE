@@ -1,14 +1,18 @@
 import torch
 import torch.nn as nn
+from typing import Optional
+
 from distvae.models.layers.normalization import PatchGroupNorm
 from distvae.utils import ParallelContext
 
 
 class GroupNormAdapter(nn.Module):
+    """A GroupNorm whose statistics use this adapter's immutable group and split axis."""
+
     def __init__(
         self,
         group_norm: nn.GroupNorm,
-        patch_dim: int = -2,
+        patch_dim: Optional[int] = None,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()

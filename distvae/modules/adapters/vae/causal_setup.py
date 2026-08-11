@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.distributed import ProcessGroup
 
 from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
-from distvae.modules.patch_utils import DePatchify, Patchify
+from distvae.modules.patch_utils import DePatchify, Patchify, widest_halo
 from distvae.utils import (
     ParallelContext,
     normalize_patch_dim,
@@ -82,8 +82,12 @@ class CausalVAEAdapterSetup:
             return GroupNormAdapter(norm, **self.options)
         return norm
 
-    def patchers(self, scale_factor=1):
+    def patchers(self, module, scale_factor=1):
         return (
-            Patchify(scale_factor=scale_factor, **self.options),
+            Patchify(
+                scale_factor=scale_factor,
+                halo=widest_halo(module),
+                **self.options,
+            ),
             DePatchify(**self.options),
         )

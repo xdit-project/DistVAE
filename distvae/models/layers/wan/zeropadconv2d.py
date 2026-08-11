@@ -134,7 +134,6 @@ class WanZeroPadConv2d(nn.Conv2d, PatchConvMixin):
                 global_start,
                 group_world_size,
                 rank_in_group,
-                _,
             ) = self._multi_rank_metadata_and_halo(input, self.halo_buffer)
 
             # ZeroPad2d

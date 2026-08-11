@@ -1,8 +1,13 @@
 """Versioned benchmark records, provenance, rendering, and exit policy."""
 
+import hashlib
 import importlib.metadata
 import json
+import platform
+import socket
 import subprocess
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -38,6 +43,47 @@ def _distvae_revision():
         return None
 
 
+def _git(root, *arguments):
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=2,
+        )
+        return result.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _source_checkout(module):
+    location = getattr(module, "__file__", None)
+    if location is None:
+        return None
+    start = Path(location).resolve().parent
+    for root in (start, *start.parents):
+        if not (root / ".git").exists():
+            continue
+        return {
+            "branch": _git(root, "rev-parse", "--abbrev-ref", "HEAD"),
+            "commit": _git(root, "rev-parse", "HEAD"),
+            "dirty": bool(_git(root, "status", "--porcelain")),
+        }
+    return None
+
+
+def _benchmark_identity():
+    try:
+        source = Path(sys.argv[0]).resolve()
+        return {
+            "path": str(source),
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        }
+    except OSError:
+        return None
+
+
 def provenance():
     """Return library versions and the DistVAE source revision when available."""
     import diffusers
@@ -49,7 +95,15 @@ def provenance():
             "diffusers": _version("diffusers", diffusers),
             "distvae": _version("distvae", distvae),
         },
-        "provenance": {"distvae_git_revision": _distvae_revision()},
+        "provenance": {
+            "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "host": socket.gethostname(),
+            "python": platform.python_version(),
+            "argv": list(sys.argv),
+            "benchmark": _benchmark_identity(),
+            "distvae_git_revision": _distvae_revision(),
+            "distvae_checkout": _source_checkout(distvae),
+        },
     }
 
 

@@ -165,6 +165,24 @@ def configure_tiling(vae, cell, runtime, half, say):
 
     overlap = cell.get("overlap")
     if overlap is not None:
+        if overlap == "half":
+            native_overlap = facts["default_overlap"]
+            if native_overlap is None:
+                raise ValueError(
+                    f"half needs a native overlap for {type(vae).__name__}"
+                )
+            values = (
+                native_overlap
+                if isinstance(native_overlap, (tuple, list))
+                else (native_overlap,)
+            )
+            overlap = min(values) / 2
+            facts["requested_overlap"] = "half"
+            facts["native_overlap_min"] = min(values)
+            say(
+                f"tile overlap half of the VAE's native {min(values):.1%}, "
+                f"using {overlap:.1%}"
+            )
         plan = vae_api.tile_overlap_plan(vae, overlap)
         if plan is None:
             widest = vae_api.widest_tile_overlap(vae)

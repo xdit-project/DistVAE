@@ -9,8 +9,7 @@ from torch.nn.common_types import _size_2_t
 
 from distvae.models.layers.conv_utils import (
     get_world_size_and_rank,
-    correct_end,
-    correct_start,
+    chunk_bounds,
     build_crop_slice,
 )
 from distvae.models.layers.conv_mixin import PatchConvMixin
@@ -81,7 +80,6 @@ class PatchConv2d(nn.Conv2d, PatchConvMixin):
                 global_start,
                 group_world_size,
                 rank_in_group,
-                stride_shift,
             ) = self._multi_rank_metadata_and_halo(input, self.halo_buffer)
             conv_res: Tensor
             padding = self._adjust_padding_for_patch(
@@ -134,71 +132,30 @@ class PatchConv2d(nn.Conv2d, PatchConvMixin):
                     input = F.pad(input, padding, mode="constant")
 
                 _, _, h, w = input.shape
-                num_chunks_in_h = 0
-                num_chunks_in_w = 0
-                if isinstance(self.block_size, int):
-                    num_chunks_in_h = (h + self.block_size - 1) // self.block_size
-                    num_chunks_in_w = (w + self.block_size - 1) // self.block_size
-                elif isinstance(self.block_size, tuple):
-                    num_chunks_in_h = (h + self.block_size[0] - 1) // self.block_size[0]
-                    num_chunks_in_w = (w + self.block_size[1] - 1) // self.block_size[1]
-                unit_chunk_size_h = h // num_chunks_in_h
-                unit_chunk_size_w = w // num_chunks_in_w
-                if isinstance(self.kernel_size, int):
-                    kernel_size_h, kernel_size_w = self.kernel_size, self.kernel_size
-                elif isinstance(self.kernel_size, tuple):
-                    kernel_size_h, kernel_size_w = self.kernel_size
-                else:
-                    raise ValueError(
-                        f"kernel_size should be int or tuple, type:{type(self.kernel_size)}"
-                    )
+                # nn.Conv2d normalises all three of these to pairs in its own __init__, so they
+                # are read as pairs rather than tested for which they are.
+                block_h, block_w = _pair(self.block_size)
+                kernel_h, kernel_w = _pair(self.kernel_size)
+                stride_h, stride_w = _pair(self.stride)
+                rows = chunk_bounds(h, block_h, kernel_h, stride_h)
+                columns = chunk_bounds(w, block_w, kernel_w, stride_w)
 
-                if isinstance(self.stride, int):
-                    stride_h, stride_w = self.stride, self.stride
-                elif isinstance(self.stride, tuple):
-                    stride_h, stride_w = self.stride
-                else:
-                    raise ValueError(
-                        f"stride should be int or tuple, type: {type(self.stride)}"
-                    )
-
-                outputs = []
-                for idx_h in range(num_chunks_in_h):
-                    inner_output = []
-                    for idx_w in range(num_chunks_in_w):
-                        start_w = idx_w * unit_chunk_size_w
-                        start_h = idx_h * unit_chunk_size_h
-                        end_w = (idx_w + 1) * unit_chunk_size_w
-                        end_h = (idx_h + 1) * unit_chunk_size_h
-                        if idx_w + 1 < num_chunks_in_w:
-                            end_w = correct_end(end_w, kernel_size_w, stride_w)
-                        else:
-                            end_w = w
-                        if idx_h + 1 < num_chunks_in_h:
-                            end_h = correct_end(end_h, kernel_size_h, stride_h)
-                        else:
-                            end_h = h
-
-                        if idx_w > 0:
-                            start_w = correct_start(start_w, stride_w)
-                        if idx_h > 0:
-                            start_h = correct_start(start_h, stride_h)
-
-                        inner_output.append(
-                            F.conv2d(
-                                input[:, :, start_h:end_h, start_w:end_w],
-                                weight,
-                                bias,
-                                self.stride,
-                                0,
-                                self.dilation,
-                                self.groups,
-                            )
+                outputs = torch.cat([
+                    torch.cat([
+                        F.conv2d(
+                            input[:, :, top:bottom, left:right],
+                            weight,
+                            bias,
+                            self.stride,
+                            0,
+                            self.dilation,
+                            self.groups,
                         )
-                    outputs.append(torch.cat(inner_output, dim=-1))
-                outputs = torch.cat(outputs, dim=-2)
-                # Note: patch_size here is the LOCAL patch size (before halo exchange)
-                # but after stride_shift trimming
+                        for left, right in columns
+                    ], dim=-1)
+                    for top, bottom in rows
+                ], dim=-2)
+                # patch_size here is this rank's own, read before the halo was exchanged.
                 crop_slice = build_crop_slice(
                     patch_dim, patch_size, halo_width, outputs.shape[patch_dim], ndim=4,
                     global_start=global_start,

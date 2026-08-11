@@ -74,6 +74,13 @@ def test_arm_axes_expand_orthogonally():
     assert {cell["overlap"] for cell in cells if cell["tiling"]} == {None, 0.0, 0.25}
 
 
+def test_overlap_can_request_half_of_each_vaes_native_value():
+    cells = arms.expand_grid("tile", "512x256", 1, "half")
+
+    assert [cell["overlap"] for cell in cells] == [None, "half"]
+    assert cells[1]["name"] == "tile-ovhalf"
+
+
 def test_parser_exposes_independent_composition_axes():
     args = cli.parser().parse_args(
         [
@@ -903,6 +910,47 @@ def test_native_tile_window_enables_tiling_without_replanning(monkeypatch):
     assert vae.enabled is True
     assert facts["requested_window"] == "native"
     assert facts["window_px"] == 512
+
+
+def test_half_overlap_is_derived_from_the_vaes_native_overlap(monkeypatch):
+    class Vae:
+        def enable_tiling(self):
+            pass
+
+    vae = Vae()
+    applied = []
+    monkeypatch.setattr(measure.vae_api, "require_vae_support", lambda *args: None)
+    monkeypatch.setattr(measure.vae_api, "tile_window", lambda value: 512)
+    monkeypatch.setattr(measure.vae_api, "narrowest_useful_window", lambda value: 256)
+    monkeypatch.setattr(measure.vae_api, "tile_overlap", lambda value: (0.25, 0.20))
+    monkeypatch.setattr(measure.vae_api, "latent_rows", lambda value: 64)
+    monkeypatch.setattr(
+        measure.vae_api,
+        "tile_overlap_plan",
+        lambda value, overlap: {"overlap": overlap},
+    )
+    monkeypatch.setattr(
+        measure.vae_api,
+        "apply_tile_plan",
+        lambda value, plan: applied.append(plan),
+    )
+
+    facts = measure.configure_tiling(
+        vae,
+        {
+            "sharding": "unsharded",
+            "tiling": "native",
+            "overlap": "half",
+            "tile_distribution": None,
+        },
+        SimpleNamespace(world_size=1, group=object()),
+        "decoder",
+        lambda *parts: None,
+    )
+
+    assert applied == [{"overlap": 0.10}]
+    assert facts["requested_overlap"] == "half"
+    assert facts["native_overlap_min"] == 0.20
 
 
 def test_report_schema_contains_provenance_and_effective_composition():

@@ -41,6 +41,12 @@ class TestCacheCursor(unittest.TestCase):
         # Python binds one default per function at definition, not per call. A list bound there
         # is a single list for the life of the process, and what that gives is not an error but
         # a video conditioned on the tail of the previous decode.
+        #
+        # Only what we define: these modules also import the diffusers blocks they wrap, and
+        # those spell the cursor `feat_idx=[0]` themselves. That default is upstream's to keep -
+        # diffusers threads a fresh list from its own decode, and every adapter here passes one
+        # explicitly - so it is out of our hands and out of our way.
+        seen = set()
         for name in ADAPTER_MODULES:
             module = importlib.import_module(name)
             for attribute, value in vars(module).items():
@@ -50,12 +56,29 @@ class TestCacheCursor(unittest.TestCase):
                     and value.__module__ == module.__name__
                 ):
                     continue
+                if not value.__module__.startswith("distvae.") or value in seen:
+                    continue
+                seen.add(value)
                 forward = value.__dict__.get("forward")
                 if forward is None:
                     continue
                 for parameter in inspect.signature(forward).parameters.values():
-                    with self.subTest(module=name, adapter=attribute, arg=parameter.name):
+                    with self.subTest(adapter=value.__qualname__, arg=parameter.name):
                         self.assertNotIsInstance(parameter.default, (list, dict, set))
+
+    def test_the_walk_reaches_the_adapters_it_is_meant_to(self):
+        # Scoping the walk to what we define is what keeps diffusers' own `feat_idx=[0]` out of
+        # it, and a scope that matched nothing would pass just as quietly.
+        adapters = {
+            value.__qualname__
+            for name in ADAPTER_MODULES
+            for value in vars(importlib.import_module(name)).values()
+            if isinstance(value, type)
+            and issubclass(value, nn.Module)
+            and value.__module__.startswith("distvae.")
+        }
+        for expected in ("WanResidualBlockAdapter", "QwenImageUpBlockAdapter"):
+            self.assertIn(expected, adapters)
 
 
 if __name__ == "__main__":

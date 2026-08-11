@@ -33,7 +33,7 @@ from distvae.models.unets.unet_2d_blocks import (
 )
 from distvae.models.layers.conv2d import PatchConv2d
 from distvae.models.layers.normalization import PatchGroupNorm
-from distvae.modules.patch_utils import Patchify, DePatchify
+from distvae.modules.patch_utils import Patchify, DePatchify, widest_halo
 
 
 @dataclass
@@ -296,6 +296,9 @@ class PatchDecoder(nn.Module):
             self.conv_norm_out = PatchGroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=1e-6)
         self.conv_act = nn.SiLU()
         self.conv_out = PatchConv2d(block_out_channels[0], out_channels, 3, padding=1, block_size=conv_block_size)
+        # Set here rather than at construction because the convolutions it reads do not all exist
+        # until the blocks above are built.
+        self.patch.halo = widest_halo(self)
 
         self.gradient_checkpointing = False
 

@@ -16,10 +16,38 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from distvae.modules.patch_utils import DePatchify, Patchify, gather_patches
+import torch.nn as nn
+
+from distvae.models.layers.conv2d import PatchConv2d
+from distvae.models.layers.conv3d import PatchConv3d
+from distvae.modules.patch_utils import DePatchify, Patchify, gather_patches, widest_halo
 from distvae.utils import ParallelContext, normalize_patch_dim
 
 from distributed_harness import assert_matches_reference, init_gloo, run_distributed
+
+
+def test_the_widest_halo_is_half_the_widest_kernel_on_the_split_axis():
+    # Only the split axis counts: a kernel is only ever wide across rows a neighbour holds.
+    stack = nn.Sequential(
+        PatchConv2d(1, 1, kernel_size=3),
+        PatchConv2d(1, 1, kernel_size=(7, 1)),
+        PatchConv2d(1, 1, kernel_size=(1, 9)),
+    )
+    assert widest_halo(stack) == 3
+
+
+def test_the_widest_halo_reads_the_axis_the_convolution_was_told_to_split():
+    across = nn.Sequential(PatchConv2d(1, 1, kernel_size=(1, 9), patch_dim=-1))
+    assert widest_halo(across) == 4
+
+
+def test_a_three_dimensional_kernel_is_read_on_its_split_axis_too():
+    stack = nn.Sequential(PatchConv3d(1, 1, kernel_size=(9, 5, 9)))
+    assert widest_halo(stack) == 2
+
+
+def test_a_stack_that_shards_nothing_asks_for_no_halo():
+    assert widest_halo(nn.Sequential(nn.Conv2d(1, 1, kernel_size=11))) == 0
 
 
 def round_trip_worker(rank, world_size, rows, scale_factor, patch_dim, seed, master_port):
@@ -91,11 +119,21 @@ def test_the_gather_hands_back_every_rank_its_own_rows(world_size, master_port, 
     run_distributed(gather_worker, world_size, (0, seed), master_port)
 
 
-def refusal_worker(rank, world_size, rows, scale_factor, expected, master_port):
+def refusal_worker(rank, world_size, rows, scale_factor, halo, expected, master_port):
     init_gloo(rank, world_size, master_port)
     try:
         with pytest.raises(ValueError, match=expected):
-            Patchify(scale_factor=scale_factor)(torch.randn(1, 2, rows, 4))
+            Patchify(scale_factor=scale_factor, halo=halo)(torch.randn(1, 2, rows, 4))
+    finally:
+        dist.destroy_process_group()
+
+
+def halo_worker(rank, world_size, rows, halo, seed, master_port):
+    init_gloo(rank, world_size, master_port)
+    try:
+        torch.manual_seed(seed)
+        whole = torch.randn(1, 4, rows, rows)
+        assert torch.equal(DePatchify()(Patchify(halo=halo)(whole)), whole)
     finally:
         dist.destroy_process_group()
 
@@ -103,13 +141,32 @@ def refusal_worker(rank, world_size, rows, scale_factor, expected, master_port):
 @pytest.mark.gloo
 def test_rows_that_are_not_a_multiple_of_the_ratio_are_refused(master_port):
     # The encoder narrows by 8, so 20 rows cannot be cut into bands whose latent rows line up.
-    run_distributed(refusal_worker, 2, (20, 8, "multiples of 8"), master_port)
+    run_distributed(refusal_worker, 2, (20, 8, 0, "multiples of 8"), master_port)
 
 
 @pytest.mark.gloo
 def test_more_ranks_than_bands_is_refused(master_port):
     # 16 rows at a ratio of 8 leaves two bands, which three ranks cannot share.
-    run_distributed(refusal_worker, 3, (16, 8, "at most 2 ranks"), master_port)
+    run_distributed(refusal_worker, 3, (16, 8, 0, "at most 2 ranks"), master_port)
+
+
+@pytest.mark.gloo
+@pytest.mark.parametrize("world_size", [2, 3, 4])
+def test_a_halo_wider_than_the_thinnest_band_is_refused_by_every_rank(world_size, master_port):
+    # That every rank refuses is the whole point of asking here. Seven rows over two ranks is a
+    # band of four and a band of three, so a rank deciding from what it holds would have the wide
+    # one go on into a halo exchange with a rank that had already stopped - and that is a hang
+    # rather than a failure, because the rows it waits for are never sent.
+    run_distributed(
+        refusal_worker, world_size, (7, 1, 4, "reaching 4 rows past a band"), master_port
+    )
+
+
+@pytest.mark.gloo
+def test_a_halo_the_thinnest_band_can_just_lend_is_allowed(master_port, seed=42):
+    # Seven rows over two ranks leaves a band of three, and a halo of three is the last width
+    # that works rather than the first that does not. The guard has to let it through.
+    run_distributed(halo_worker, 2, (7, 3, seed), master_port)
 
 
 @pytest.mark.parametrize("patch_dim", [-2, 3])

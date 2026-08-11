@@ -173,7 +173,8 @@ class _CausalDecoderAdapter(nn.Module):
         # norms the other families end on do not, and are left as they are.
         if hasattr(decoder, "conv_norm_out"):
             self.decoder.conv_norm_out = setup.adapt_group_norm(decoder.conv_norm_out)
-        self.patchify, self.depatchify = setup.patchers()
+        # Read after the whole stack is adapted, so it sees every convolution that will exchange.
+        self.patchify, self.depatchify = setup.patchers(self.decoder)
         self.vae_group = vae_group
 
     def _run_decoder(self, sample, feat_cache, feat_idx, first_chunk):

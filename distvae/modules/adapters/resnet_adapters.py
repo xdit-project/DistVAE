@@ -3,7 +3,6 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
-from distvae.models.resnet import PatchResnetBlock2D
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
     HUNYUAN_VIDEO_15,
@@ -33,10 +32,20 @@ LTX2VideoResnetBlock3d = block(LTX2_VIDEO, "LTX2VideoResnetBlock3d")
 
 
 class ResnetBlock2DAdapter(nn.Module):
+    """Shards a 2D residual block: its two convolutions, its two group norms, and any shortcut
+
+    The block is wrapped where it stands, as every other adapter in this file does it. It used to
+    be rebuilt instead, as a PatchResnetBlock2D - a copy of diffusers' block with the paths this
+    adapter refuses removed - whose constructor allocated a fresh set of convolutions and norms
+    that were then all overwritten by adapters holding the originals. Every weight it made was
+    thrown away unread, at the size of the block being sharded, and anything about the source
+    block its argument list did not name was replaced by a default rather than carried over.
+    """
+
     def __init__(
-        self, 
-        resnet: ResnetBlock2D, 
-        *, 
+        self,
+        resnet: ResnetBlock2D,
+        *,
         conv_block_size = 0,
         patch_dim: int = -2,
         parallel_context: ParallelContext = None,
@@ -45,40 +54,20 @@ class ResnetBlock2DAdapter(nn.Module):
         assert resnet.time_emb_proj is None, "temb_channels is not supported in ResnetBlock2DAdapter currently"
         assert resnet.up is False, "up sample is not supported in ResnetBlock2DAdapter currently"
         assert resnet.down is False, "ResnetBlock2DAdapter does not support down sample currently"
-        self.resnet = PatchResnetBlock2D(
-            in_channels=resnet.in_channels,
-            out_channels=resnet.out_channels,
-            conv_shortcut=resnet.use_conv_shortcut,
-            dropout=0,
-            temb_channels=None,
-            groups=1,
-            groups_out=None,
-            pre_norm=resnet.pre_norm,
-            skip_time_act=resnet.skip_time_act,
-            time_embedding_norm=resnet.time_embedding_norm,
-            output_scale_factor=resnet.output_scale_factor,
-            use_in_shortcut=resnet.use_in_shortcut,
-            up=resnet.up,
-            down=resnet.down,
-            patch_dim=patch_dim,
-            parallel_context=parallel_context,
-        )
-        self.resnet.use_in_shortcut = resnet.use_in_shortcut
+        self.resnet = resnet
         options = dict(patch_dim=patch_dim, parallel_context=parallel_context)
-        self.resnet.conv1 = Conv2dAdapter(
+        resnet.conv1 = Conv2dAdapter(
             resnet.conv1, block_size=conv_block_size, **options
         )
-        self.resnet.norm1 = GroupNormAdapter(resnet.norm1, **options)
-        self.resnet.conv2 = Conv2dAdapter(
+        resnet.norm1 = GroupNormAdapter(resnet.norm1, **options)
+        resnet.conv2 = Conv2dAdapter(
             resnet.conv2, block_size=conv_block_size, **options
         )
-        self.resnet.norm2 = GroupNormAdapter(resnet.norm2, **options)
-        self.resnet.dropout = resnet.dropout
-        self.resnet.nonlinearity = resnet.nonlinearity
-        self.resnet.conv_shortcut = Conv2dAdapter(
-            resnet.conv_shortcut, block_size=conv_block_size, **options
-        ) if resnet.conv_shortcut is not None else None
-        
+        resnet.norm2 = GroupNormAdapter(resnet.norm2, **options)
+        if resnet.conv_shortcut is not None:
+            resnet.conv_shortcut = Conv2dAdapter(
+                resnet.conv_shortcut, block_size=conv_block_size, **options
+            )
 
     def forward(self, x, temb: torch.FloatTensor = None, *args, **kwargs):
         return self.resnet(x, temb, *args, **kwargs)

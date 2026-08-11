@@ -41,7 +41,7 @@ from distvae.modules.adapters.resnet_adapters import (
 )
 from distvae.modules.adapters.unets.unet_2d_blocks_adapters import DownEncoderBlock2DAdapter
 from distvae.modules.adapters.vae.causal_setup import CausalVAEAdapterSetup
-from distvae.modules.patch_utils import Patchify, DePatchify
+from distvae.modules.patch_utils import Patchify, DePatchify, widest_halo
 from distvae.utils import (
     cache_cursor,
     normalize_patch_dim,
@@ -129,6 +129,7 @@ class EncoderAdapter(nn.Module):
             patch_dim=patch_dim,
             scale_factor=vae_scale_factor,
             parallel_context=self.parallel_context,
+            halo=widest_halo(self.encoder),
         )
         self.depatchify = DePatchify(
             patch_dim=patch_dim, parallel_context=self.parallel_context
@@ -213,7 +214,12 @@ class _CausalEncoderAdapter(nn.Module):
             self.encoder.conv_norm_out = setup.adapt_group_norm(encoder.conv_norm_out)
         # Each band is a whole multiple of what the encoder narrows by, so it starts on the grid
         # the strided convolutions step along and the latent rows it produces are its own.
-        self.patchify, self.depatchify = setup.patchers(vae_scale_factor)
+        # The scale factor comes from the public VAE orchestration, because some families narrow
+        # by folding space into channels rather than by convolution stride. Read the halo only
+        # after the complete stack has been adapted.
+        self.patchify, self.depatchify = setup.patchers(
+            self.encoder, vae_scale_factor
+        )
         self.vae_group = vae_group
 
     def _run_encoder(self, sample, feat_cache, feat_idx):
@@ -241,6 +247,9 @@ class _CausalEncoderAdapter(nn.Module):
         feat_idx: Optional[List[int]] = None,
         patchify: bool = True,
     ):
+        # A one-element list the causal blocks advance in place; see the decoder's forward for
+        # why it is neither a mutable default nor the bare 0 this used to take.
+        feat_idx = cache_cursor(feat_idx)
         return self._sharded_encode(
             sample, patchify, lambda x: self._run_encoder(x, feat_cache, feat_idx)
         )

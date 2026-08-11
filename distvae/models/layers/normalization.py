@@ -65,7 +65,7 @@ class PatchGroupNorm(nn.GroupNorm):
         affine: bool = True,
         device=None,
         dtype=None,
-        patch_dim: int = -2,
+        patch_dim: Optional[int] = None,
         parallel_context: Optional[ParallelContext] = None,
     ) -> None:
         self.parallel_context = parallel_context
@@ -82,9 +82,8 @@ class PatchGroupNorm(nn.GroupNorm):
     def forward(self, x: Tensor) -> Tensor:
         ndim = x.ndim
         shape = x.shape
-        patch_dim = ndim + normalize_patch_dim(
-            self.patch_dim, ndim, spatial_only=True
-        )
+        axis = DistributedEnv.get_patch_dim() if self.patch_dim is None else self.patch_dim
+        patch_dim = ndim + normalize_patch_dim(axis, ndim, spatial_only=True)
 
         vae_group = (
             self.parallel_context.group
