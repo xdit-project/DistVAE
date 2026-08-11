@@ -3,6 +3,7 @@
 import hashlib
 import importlib.metadata
 import json
+import os
 import platform
 import socket
 import subprocess
@@ -12,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def _version(distribution, module=None):
@@ -112,6 +113,7 @@ def provenance():
         "provenance": {
             "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "host": socket.gethostname(),
+            "hardware_family": os.environ.get("HW_FAMILY"),
             "python": platform.python_version(),
             "argv": list(sys.argv),
             "benchmark": _benchmark_identity(),

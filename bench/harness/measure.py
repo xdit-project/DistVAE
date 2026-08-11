@@ -8,7 +8,6 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from distvae import vae as vae_api
-from distvae.vae.tile_parallel import dispatch_over
 from distvae.vae.tiling import latent_rows
 
 from . import catalog, profile
@@ -39,59 +38,38 @@ def _tile_latent_area(vae):
 
 def configure_tiling(vae, cell, runtime, half, say):
     """Apply the requested tile window, overlap, and whole-tile distribution."""
-    if cell["tiling"] is None:
+    if cell["window"] is None:
         return {"enabled": False}
     if half != "decoder":
         raise ValueError("tiling is a decode-side feature and requires --half decoder")
 
-    vae_api.require_vae_support(vae, "tiling", "--enable-tiling")
+    vae_api.require_vae_support(vae, "tiling", "--case")
     vae.enable_tiling()
     native = vae_api.tile_shape(vae)
     native_window = tuple(native) if native is not None else None
     native_overlap = vae_api.tile_overlap(vae)
     facts = {
         "enabled": True,
-        "requested_window": cell["tiling"],
+        "requested_window_px": tuple(cell["window"]),
         "native_window_px": native_window,
-        "window_px": native_window,
+        "window_px": tuple(cell["window"]),
         "native_overlap_px": native_overlap,
     }
 
-    requested = cell["tiling"]
-    if requested in ("half", "quarter"):
-        if native is None or native[0] != native[1]:
-            raise ValueError(
-                f"{requested} needs an equal-axis native tile shape for "
-                f"{type(vae).__name__}; got {native}"
-            )
-        requested = native[0] // (2 if requested == "half" else 4)
-    elif requested != "native":
-        requested = int(requested)
-
-    if requested != "native":
-        pixels = requested
-        plan = vae_api.tile_shape_plan(vae, requested, requested)
-        if plan is None:
-            raise ValueError(
-                f"tile shape ({requested}, {requested}) is invalid for "
-                f"{type(vae).__name__}"
-            )
-        rows = latent_rows(vae, plan)
-        if cell["sharding"] == "row" and rows is not None and rows < runtime.world_size:
-            raise ValueError(
-                f"a {pixels}px tile has {rows} latent rows for "
-                f"{runtime.world_size} row shards"
-            )
-        vae_api.apply_tile_plan(vae, plan)
-        facts.update(window_px=(pixels, pixels), tile_latent_rows=rows)
-    elif cell["sharding"] == "row":
-        rows = latent_rows(vae)
-        if rows is not None and rows < runtime.world_size:
-            raise ValueError(
-                f"native tile has {rows} latent rows for "
-                f"{runtime.world_size} row shards"
-            )
-        facts["tile_latent_rows"] = rows
+    requested = tuple(cell["window"])
+    plan = vae_api.tile_shape_plan(vae, *requested)
+    if plan is None:
+        raise ValueError(
+            f"tile shape {requested} is invalid for {type(vae).__name__}"
+        )
+    rows = latent_rows(vae, plan)
+    if cell["sharding"] == "row" and rows is not None and rows < runtime.world_size:
+        raise ValueError(
+            f"a {requested[0]}x{requested[1]}px tile has {rows} latent rows "
+            f"for {runtime.world_size} row shards"
+        )
+    vae_api.apply_tile_plan(vae, plan)
+    facts["tile_latent_rows"] = rows
 
     overlap = cell.get("overlap")
     if overlap is not None:
@@ -105,9 +83,9 @@ def configure_tiling(vae, cell, runtime, half, say):
                 f"tile overlap {overlap} is unavailable for {type(vae).__name__}"
             )
         vae_api.apply_tile_plan(vae, plan)
-        tiled_decode = vae_api.tiled_decode_for(vae)
-        if tiled_decode is not None:
-            vae.tiled_decode = tiled_decode
+    tiled_decode = vae_api.tiled_decode_for(vae)
+    if tiled_decode is not None:
+        vae.tiled_decode = tiled_decode
     facts.update(
         overlap=vae_api.tile_overlap(vae),
         tile_latent_area=_tile_latent_area(vae),
@@ -118,10 +96,7 @@ def configure_tiling(vae, cell, runtime, half, say):
             raise ValueError(
                 f"{type(vae).__name__} does not support whole-tile distribution"
             )
-        if cell["tile_distribution"] == "scattered":
-            dispatch, assemble = dispatch_over(runtime.group), None
-        else:
-            dispatch, assemble = vae_api.sharing(runtime.group)
+        dispatch, assemble = vae_api.sharing(runtime.group)
         tiled_decode = vae_api.tiled_decode_for(vae, dispatch, assemble)
         if tiled_decode is None:
             raise ValueError(f"{type(vae).__name__} has no distributable tiled decode")

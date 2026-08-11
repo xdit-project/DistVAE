@@ -50,8 +50,16 @@ Where a rank does hold one tile, the stride stops being a cost and becomes spare
 
 The window and the requested image shape fix the tile count, and that count is the ceiling on how many GPUs the image can use. The figure's fifteen tiles come within 14% of an even split at eight ranks. The square sixteen they beat come within 53%, because nine of those are full size and eight ranks cannot avoid giving one of them two full tiles. Narrowing to a 288 × 256 window gives thirty tiles and comes within 5%. That is arithmetic rather than a scheduling failure, and it is the one place where the GPU count does bear on the grid.
 
-## There is no search
+## The benchmark search is bounded
 
-Choosing a window is still a hand-tune. Nothing here searches for one: the planners answer whether a size you name can be set, not which size you should want. Name a few, read back the grid, the peak and the coverage, and pick. `bench/` is set up to do that per VAE and resolution.
+The DistVAE planners validate an exact request; they do not choose policy for an application.
+The benchmark adds a small topology search for measurement. It considers grids with at most four
+tiles per rank, rejects windows that the VAE cannot represent, and removes candidates dominated
+on window area, decoded area, and rank imbalance. Three plans remain in the timed suite:
+throughput, a frontier knee, and memory.
 
-DistVAE enforces no minimum window beyond what the VAE can represent. A useful size depends on the image you want, the memory you have, the tile count and how much fidelity you can lose, so measure those together. The window controls memory and how much of the image changes; the overlap controls time and how far the worst errors go.
+That frontier does not include visual quality. DistVAE enforces no minimum window beyond what the
+VAE can represent, and synthetic benchmark weights cannot price group-normalization drift or
+seams. Use the shortlist to measure latency and memory, then check the chosen window on a trained
+model. The window controls memory and how much of the image changes. Overlap controls redundant
+work and the blend at each seam.

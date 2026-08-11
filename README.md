@@ -26,8 +26,8 @@ dist.init_process_group(backend="nccl")
 device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}")
 torch.cuda.set_device(device)
 
-# The group the VAE is split over. dist.group.WORLD is every rank; pass a
-# dist.new_group([...]) instead if the VAE runs on a subset of them.
+# The group the VAE is split over. Every rank that enters the VAE call must be a
+# member. If you create a subgroup, gate the pipeline call to those ranks too.
 vae_group = dist.group.WORLD
 
 pipe = DiffusionPipeline.from_pretrained(
@@ -83,13 +83,17 @@ Two ways to cut a decode down to size, and they cost different things. The figur
 The quickstart uses `distvae.vae`, which picks the adapter for a whole VAE. To shard a single diffusers module instead, wrap it in its adapter:
 
 ``` python
+import os
+
 import torch
 import torch.distributed as dist
 from diffusers.models.autoencoders.vae import Decoder
 from distvae.modules.adapters.vae.decoder_adapters import DecoderAdapter
 
 dist.init_process_group(backend="nccl")
-device = f"cuda:{dist.get_rank()}"
+local_rank = int(os.environ["LOCAL_RANK"])
+device = torch.device(f"cuda:{local_rank}")
+torch.cuda.set_device(device)
 torch.manual_seed(42)  # every rank must build the same weights and the same input
 
 decoder = Decoder(
@@ -99,11 +103,15 @@ decoder = Decoder(
     norm_num_groups=32, act_fn="silu",
 ).to(device)
 
-patch_decoder = DecoderAdapter(decoder).to(device)
-
 hidden_state = torch.randn(1, 4, 128, 128, device=device)
 with torch.no_grad():
-    assert torch.allclose(decoder(hidden_state), patch_decoder(hidden_state), atol=1e-2)
+    expected = decoder(hidden_state)
+
+# The adapter takes ownership of decoder and replaces its distributed layers in
+# place. Do not use decoder as an unmodified reference after this call.
+patch_decoder = DecoderAdapter(decoder, dist.group.WORLD).to(device)
+with torch.no_grad():
+    assert torch.allclose(expected, patch_decoder(hidden_state), atol=1e-2)
 ```
 
 There are more runnable examples in `test/`.
@@ -153,17 +161,19 @@ Three things to know about the planners. Both return `None` when they cannot mee
 
 [Choosing a tile window](docs/tiling.md) covers what to ask them for: how the two axes differ, why clipping rather than tile count is what unbalances a grid, and where widening the overlap is free.
 
-## Scaling
+### xDiT integration
 
-Measured in `bench/` on four AMD Radeon AI Pro R9700S cards, decoder only, across flux2, `AutoencoderKL`, Qwen-Image, Wan and both HunyuanVideos. One machine and one interconnect, so trust the direction of these numbers more than the numbers.
+xDiT owns tile-policy choices and calls the DistVAE planners. Its
+`vae_tile_overlap_height` and `vae_tile_overlap_width` settings are exact output pixels and must
+be supplied together. Use zero for an inactive strip axis. Custom shape or overlap settings
+install a fresh tiled-decode replacement; a later installation replaces the earlier callable
+rather than wrapping it.
 
-- **Extra GPUs.** Tiling scales close to 2× from two ranks to four. Row sharding manages 1.3× to 1.6×, losing most of the gain to the collective inside every convolution. That gap is as much the interconnect as DistVAE, so faster hardware narrows it.
-- **Peak memory.** Both lower it. Tiling lowers it further, and is the only one that lowers it at all without adding GPUs.
-- **Fidelity.** Row sharding matches an untiled decode to reduction-order noise. Tiling does not, and its two controls go wrong differently. On the two 2D VAEs at 1024², narrowing the window puts 31% to 42% of pixels more than a percent out; reducing the pixel overlap leaves that share unchanged but increases the worst error. The window decides how much of the image moves, the overlap how far the worst of it goes.
-- **Controls.** Reducing the absolute pixel overlap widens the stride and costs seam quality. Narrowing the window cuts memory by well over half wherever a tile is one decoder call, and does nothing on the families that decode a tile frame by frame. Row sharding has no controls.
-- **Against no parallelism.** The best tiled configuration ran three to five times faster than a single-GPU decode, using a fifth to a ninth of the memory.
+## Performance
 
-See `bench/README.md` to run this on a machine of your own.
+Latency and memory depend on the VAE family, input shape, rank count, device, and interconnect.
+The benchmark chooses three bounded rectangular plans and records their work, memory proxy, and
+load imbalance before measuring them. See `bench/README.md` for the suite and its limits.
 
 ## Development
 

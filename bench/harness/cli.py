@@ -4,7 +4,7 @@ import argparse
 
 import torch.distributed as dist
 
-from . import arms, catalog, measure, report, shape_costs
+from . import cases, catalog, measure, report, shape_costs
 from .distributed import (
     Runtime,
     aggregate_rank_errors,
@@ -25,55 +25,23 @@ def parser():
     value.add_argument("--height", type=int, default=2048)
     value.add_argument("--width", type=int, default=2048)
     value.add_argument("--frames", type=int, default=17)
+    value.add_argument(
+        "--shape",
+        action="append",
+        help="explicit HxW or HxWxFRAMES input shape; repeat to request more",
+    )
     value.add_argument("--dtype", default="bfloat16", choices=sorted(measure.MAX_REL))
     value.add_argument("--warmup", type=int, default=2)
     value.add_argument("--iters", type=int, default=5)
     value.add_argument("--batch", type=int, default=1)
     value.add_argument(
-        "--sharding",
-        choices=["unsharded", "row"],
-        help="decoder/encoder execution: intact or DistVAE row sharding",
-    )
-    value.add_argument(
-        "--no-parallel-vae",
-        "--no_parallel_vae",
-        action="store_true",
-        help="leave each VAE call unsharded",
-    )
-    value.add_argument(
-        "--enable-tiling",
-        "--enable_tiling",
-        action="store_true",
-        help="tile at the VAE's native window",
-    )
-    value.add_argument(
-        "--tile-window",
-        type=arms.parse_tile_window,
-        help="native, half, quarter, or a positive pixel window; enables tiling",
-    )
-    value.add_argument(
-        "--vae-tile-size",
-        "--vae_tile_size",
-        help="custom pixel window, or half/quarter; implies tiling",
-    )
-    value.add_argument(
-        "--tile-overlap",
-        help="absolute HEIGHTxWIDTH pixel overlap; comma-separated pairs for grids",
-    )
-    value.add_argument(
-        "--tile-distribution",
-        choices=["runs", "scattered"],
-        help="distribute whole-tile runs or individual tile calls across ranks",
-    )
-    value.add_argument("--grid-arms", help="comma-separated compatibility arm names")
-    value.add_argument(
-        "--grid-shapes",
-        help="comma-separated HxW or HxWxFRAMES measurement shapes",
-    )
-    value.add_argument(
-        "--tile-split",
-        choices=["tiles", "scattered", "rows"],
-        help="compatibility spelling for tile distribution",
+        "--case",
+        action="append",
+        help=(
+            "exact case; repeat unsharded, row, or "
+            "MODE:WINDOW_HxW@OVERLAP_HxW where MODE is local, tile-runs, "
+            "or row-tiled. Omit for the bounded default suite"
+        ),
     )
     value.add_argument(
         "--phase-timing",
@@ -112,9 +80,9 @@ def parser():
         help="largest power-of-two tile batch to measure",
     )
     value.add_argument(
-        "--tile-shape-sides",
+        "--tile-shape-windows",
         default="",
-        help="comma-separated square latent tile sides to measure",
+        help="comma-separated latent HEIGHTxWIDTH windows to measure",
     )
     value.add_argument("--max-rel", type=float)
     value.add_argument("--skip-reference", action="store_true")
@@ -139,6 +107,11 @@ def _shape(spec, cell):
 
 def _describe(args, cells, provenance_data=None):
     spec = catalog.FAMILIES[args.family]
+    if not cells:
+        cells = [
+            cases.parse_case("unsharded", height, width, frames)
+            for height, width, frames in cases.shapes_from_args(args)
+        ]
     records = []
     for cell in cells:
         vae = catalog.build_vae(args.family, args.dtype, "meta")
@@ -184,7 +157,7 @@ def _measure(args, cells, runtime, provenance_data=None):
             "name": "tile-shape-costs",
             "execution": "tile-shape-costs",
             "sharding": "unsharded",
-            "tiling": None,
+            "window": None,
             "overlap": None,
             "tile_distribution": None,
         }
@@ -202,6 +175,22 @@ def _measure(args, cells, runtime, provenance_data=None):
         if runtime.rank == 0:
             report.render(record, "decoder")
         return [record]
+
+    if not cells:
+        cells = []
+        selector = (
+            catalog.build_vae(args.family, args.dtype, "meta")
+            if args.half == "decoder"
+            else None
+        )
+        for height, width, frames in cases.shapes_from_args(args):
+            if args.half == "encoder":
+                cells.extend(cases.baseline_suite(height, width, frames))
+            else:
+                plans = cases.plans_for_vae(
+                    selector, height, width, runtime.world_size
+                )
+                cells.extend(cases.default_suite(plans, height, width, frames))
 
     references = {}
     records = []
@@ -256,8 +245,7 @@ def main(argv=None):
         cells = []
     else:
         try:
-            arms.normalize_legacy_args(args)
-            cells = arms.cells_from_args(args)
+            cells = cases.cells_from_args(args)
         except ValueError as error:
             command.error(str(error))
     provenance_data = report.provenance()

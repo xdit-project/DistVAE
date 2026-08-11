@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from bench.harness import (
-    arms,
     catalog,
+    cases,
     cli,
     distributed,
     measure,
@@ -28,6 +28,16 @@ def test_smoke_families_imports_catalog_without_path_mutation():
     source = (Path(__file__).parents[1] / "bench" / "smoke_families.py").read_text()
     assert "sys.path" not in source
     assert "harness.catalog" in source
+
+
+def test_benchmark_docs_use_the_schema_6_case_cli():
+    text = (Path(__file__).parents[1] / "bench" / "README.md").read_text()
+
+    assert "schema 6" in text
+    assert "--case" in text
+    assert "--tile-shape-windows" in text
+    for removed in ("--grid-arms", "--vae-tile-size", "--tile-shape-sides"):
+        assert removed not in text
 
 
 def test_describe_only_runs_on_cpu_without_distributed_environment(
@@ -62,120 +72,159 @@ def test_catalog_samples_decoder_and_encoder_on_meta():
     assert tuple(image.shape) == (1, 3, 512, 256)
 
 
-def test_arm_axes_expand_orthogonally():
-    cells = arms.expand_grid(
-        arm_names="none,pvae,tile-nopvae,tile-dist",
-        shapes="512x256",
-        default_frames=1,
-        overlaps="0x0,64x32",
-    )
-    base = {(cell["sharding"], cell["tiling"]) for cell in cells}
-    assert ("unsharded", None) in base
-    assert ("row", None) in base
-    assert ("unsharded", "native") in base
-    assert any(
-        cell["sharding"] == "unsharded"
-        and cell["tiling"] == "native"
-        and cell["tile_distribution"] == "runs"
-        for cell in cells
-    )
-    assert all(cell["overlap"] is None for cell in cells if cell["tiling"] is None)
-    assert {cell["overlap"] for cell in cells if cell["tiling"]} == {
-        None,
-        (0, 0),
-        (64, 32),
-    }
-
-
-def test_overlap_grid_labels_explicit_pixel_pairs():
-    cells = arms.expand_grid("tile", "512x256", 1, "64x32")
-
-    assert [cell["overlap"] for cell in cells] == [None, (64, 32)]
-    assert cells[1]["name"] == "tile-ov64x32"
-
-
-def test_parser_exposes_independent_composition_axes():
+def test_exact_cases_do_not_form_a_cartesian_product():
     args = cli.parser().parse_args(
         [
-            "--sharding",
+            "--case",
             "unsharded",
-            "--tile-window",
-            "256",
-            "--tile-overlap",
-            "64x32",
-            "--tile-distribution",
-            "runs",
+            "--case",
+            "local:256x512@64x32",
+            "--case",
+            "tile-runs:384x256@32x16",
         ]
     )
 
-    [cell] = arms.cells_from_args(args)
+    cells = cases.cells_from_args(args)
 
-    assert cell["sharding"] == "unsharded"
-    assert cell["tiling"] == 256
-    assert cell["overlap"] == (64, 32)
-    assert cell["tile_distribution"] == "runs"
+    assert [cell["name"] for cell in cells] == [
+        "unsharded",
+        "local-256x512-ov64x32",
+        "tile-runs-384x256-ov32x16",
+    ]
+    assert cells[1]["window"] == (256, 512)
+    assert cells[2]["tile_distribution"] == "runs"
 
 
-def test_non_grid_rejects_multiple_overlap_pairs():
+def test_default_suite_is_deferred_until_vae_and_world_size_are_known():
+    args = cli.parser().parse_args([])
+
+    assert cases.cells_from_args(args) == []
+
+
+def test_additional_shapes_are_explicit_and_do_not_mix_with_exact_cases():
     args = cli.parser().parse_args(
-        ["--enable-tiling", "--tile-overlap", "64x32,32x16"]
+        ["--shape", "720x1280x81", "--shape", "1080x1920x81"]
     )
 
-    with pytest.raises(ValueError, match=r"multiple.*--grid-arms"):
-        arms.cells_from_args(args)
+    assert cases.shapes_from_args(args) == [
+        (720, 1280, 81),
+        (1080, 1920, 81),
+    ]
+
+    mixed = cli.parser().parse_args(
+        ["--shape", "512x512", "--case", "unsharded"]
+    )
+    with pytest.raises(ValueError, match="cannot be combined"):
+        cases.cells_from_args(mixed)
 
 
 @pytest.mark.parametrize(
-    ("legacy", "sharding", "distribution"),
-    [
-        ("tiles", "unsharded", "runs"),
-        ("scattered", "unsharded", "scattered"),
-        ("rows", "row", None),
-    ],
+    "value",
+    ["none", "row:256x256@32x32", "local:256@32x32", "local:256x256"],
 )
-def test_legacy_tile_split_selects_a_complete_composition(
-    legacy, sharding, distribution
-):
-    args = cli.parser().parse_args(["--enable-tiling", "--tile-split", legacy])
+def test_case_parser_rejects_legacy_or_incomplete_spelling(value):
+    with pytest.raises(ValueError):
+        cases.parse_case(value, 512, 256, 1)
 
-    [cell] = arms.cells_from_args(args)
 
-    assert (cell["sharding"], cell["tile_distribution"]) == (
-        sharding,
-        distribution,
+def test_selector_returns_three_distinct_rectangular_pareto_plans():
+    plans = cases.select_plans(
+        sample_shape=(1024, 2048),
+        native_overlap=(64, 64),
+        world_size=4,
+        normalize=lambda window, overlap: (window, overlap),
     )
 
-
-@pytest.mark.parametrize(
-    "arguments",
-    [
-        ["--enable-tiling", "--tile-split", "tiles", "--sharding", "row"],
-        ["--enable-tiling", "--tile-split", "rows", "--tile-distribution", "runs"],
-        ["--enable-tiling", "--tile-split", "rows", "--no-parallel-vae"],
-    ],
-)
-def test_legacy_tile_split_rejects_conflicting_explicit_axes(arguments):
-    args = cli.parser().parse_args(arguments)
-
-    with pytest.raises(ValueError, match="conflicts"):
-        arms.cells_from_args(args)
+    assert [plan["profile"] for plan in plans] == [
+        "throughput",
+        "balanced",
+        "memory",
+    ]
+    assert len({plan["window"] for plan in plans}) == 3
+    assert any(height != width for height, width in (p["window"] for p in plans))
+    assert all(plan["selection"]["pareto_optimal"] for plan in plans)
+    assert all(plan["objectives"]["tile_count"] <= 16 for plan in plans)
 
 
-def test_unknown_arms_are_rejected_without_expanding_supported_choices():
-    assert set(arms.ARM_ALIASES) == {
-        "none",
-        "pvae",
-        "tile",
-        "tile-half",
-        "tile-quarter",
-        "tile-nopvae",
-        "tile-dist",
-        "tile-dist-half",
-        "tile-dist-quarter",
-    }
-    for name in ("removed-arm", "legacy-comparison"):
-        with pytest.raises(ValueError, match="unknown arm"):
-            arms.expand_grid(name, "512x512", 1, None)
+def test_topology_objectives_price_clipped_tiles_and_scheduler_loads():
+    objectives = cases.topology_objectives(
+        window=(72, 72),
+        overlap=(8, 8),
+        sample_shape=(128, 128),
+        world_size=2,
+    )
+
+    assert objectives["tile_grid"] == (2, 2)
+    assert objectives["decoded_area"] == (72 + 64) ** 2
+    assert objectives["rank_imbalance"] == pytest.approx(32 / 9248)
+
+
+def test_selector_zeros_overlap_on_inactive_strip_axis():
+    plans = cases.select_plans(
+        sample_shape=(512, 2048),
+        native_overlap=(64, 96),
+        world_size=2,
+        normalize=lambda window, overlap: (window, overlap),
+    )
+
+    strips = [
+        plan
+        for plan in plans
+        if plan["window"][0] >= 512 or plan["window"][1] >= 2048
+    ]
+    assert strips
+    for plan in strips:
+        if plan["window"][0] >= 512:
+            assert plan["overlap"][0] == 0
+        if plan["window"][1] >= 2048:
+            assert plan["overlap"][1] == 0
+
+
+def test_vae_normalizer_rejects_windows_with_too_few_latent_rows(monkeypatch):
+    vae = object()
+    monkeypatch.setattr(cases.vae_api, "tile_shape", lambda value: (64, 64))
+    monkeypatch.setattr(
+        cases.vae_api,
+        "tile_shape_plan",
+        lambda value, height, width: {"window": (height, width)},
+    )
+    monkeypatch.setattr(cases, "latent_rows", lambda value, plan: 3)
+    monkeypatch.setattr(
+        cases.vae_api,
+        "tile_overlap_plan",
+        lambda *args, **kwargs: pytest.fail("invalid row window planned overlap"),
+    )
+
+    normalize = cases.normalizer_for_vae(vae, (512, 512), world_size=4)
+
+    assert normalize((256, 256), (32, 32)) is None
+
+
+def test_default_suite_is_bounded_to_nine_cases():
+    plans = cases.select_plans(
+        sample_shape=(1024, 2048),
+        native_overlap=(64, 64),
+        world_size=4,
+        normalize=lambda window, overlap: (window, overlap),
+    )
+
+    suite = cases.default_suite(plans, 1024, 2048, 1)
+
+    assert len(suite) == 9
+    assert [cell["name"] for cell in suite[:2]] == ["unsharded", "row"]
+    assert sum(cell["tile_distribution"] == "runs" for cell in suite) == 3
+    assert [
+        cell["profile"]
+        for cell in suite
+        if cell["sharding"] == "row" and cell["window"] is not None
+    ] == ["memory"]
+
+
+def test_encoder_baseline_suite_has_no_decode_only_tiling():
+    suite = cases.baseline_suite(720, 1280, 81)
+
+    assert [cell["name"] for cell in suite] == ["unsharded", "row"]
+    assert all(cell["window"] is None for cell in suite)
 
 
 def test_parser_exposes_tile_shape_cost_controls():
@@ -184,21 +233,21 @@ def test_parser_exposes_tile_shape_cost_controls():
             "--tile-shape-costs",
             "--tile-shape-batch",
             "4",
-            "--tile-shape-sides",
-            "8,16",
+            "--tile-shape-windows",
+            "8x16,16x32",
         ]
     )
 
     assert args.tile_shape_costs is True
     assert args.tile_shape_batch == 4
-    assert args.tile_shape_sides == "8,16"
+    assert args.tile_shape_windows == "8x16,16x32"
 
 
 def test_tile_shape_cost_mode_bypasses_ordinary_cell_normalization(monkeypatch):
     runtime = SimpleNamespace(rank=0, world_size=1, group=object())
     runtime.close = lambda: None
     monkeypatch.setattr(
-        arms,
+        cases,
         "cells_from_args",
         lambda args: pytest.fail("shape-cost mode normalized ordinary cells"),
     )
@@ -211,7 +260,7 @@ def test_tile_shape_cost_mode_bypasses_ordinary_cell_normalization(monkeypatch):
         lambda values, value, **kwargs: values.__setitem__(0, value),
     )
 
-    assert cli.main(["--tile-shape-costs", "--tile-overlap", "irrelevant"]) == 0
+    assert cli.main(["--tile-shape-costs"]) == 0
 
 
 def test_tile_shape_cost_mode_rejects_describe_only():
@@ -237,27 +286,19 @@ def test_invocation_provenance_is_collected_once_and_reused(monkeypatch):
     )
     monkeypatch.setattr(report, "render", lambda *args: None)
 
-    assert cli.main(["--describe-only", "--grid-arms", "none,pvae"]) == 0
+    assert (
+        cli.main(
+            ["--describe-only", "--case", "unsharded", "--case", "row"]
+        )
+        == 0
+    )
     assert calls == ["provenance"]
 
 
-@pytest.mark.parametrize(
-    "axis",
-    [
-        ["--sharding", "row"],
-        ["--no-parallel-vae"],
-        ["--enable-tiling"],
-        ["--tile-window", "256"],
-        ["--vae-tile-size", "256"],
-        ["--tile-distribution", "runs"],
-        ["--tile-split", "rows"],
-    ],
-)
-def test_grid_arms_reject_ambiguous_explicit_composition_axes(axis):
-    args = cli.parser().parse_args(["--grid-arms", "none", *axis])
+def test_provenance_records_explicit_hardware_family(monkeypatch):
+    monkeypatch.setenv("HW_FAMILY", "mi355")
 
-    with pytest.raises(ValueError, match="--grid-arms"):
-        arms.cells_from_args(args)
+    assert report.provenance()["provenance"]["hardware_family"] == "mi355"
 
 
 def test_rank_error_helpers_preserve_original_rank_and_type(monkeypatch):
@@ -281,14 +322,6 @@ def test_rank_error_helpers_preserve_original_rank_and_type(monkeypatch):
         {"type": "RuntimeError", "message": "local", "rank": 0},
         peer,
     ]
-
-
-def test_legacy_arm_names_are_normalized_at_the_cli_boundary():
-    args = cli.parser().parse_args(["--grid-arms", "none,pvae,tile-dist"])
-
-    arms.normalize_legacy_args(args)
-
-    assert args.grid_arms == "unsharded,row,tile-runs"
 
 
 def test_extracted_benchmark_modules_own_shape_costs_and_profiling():
@@ -822,7 +855,7 @@ def test_tile_shape_costs_measure_latency_memory_and_batch_scaling(monkeypatch):
         frames=1,
         iters=1,
         tile_shape_batch=2,
-        tile_shape_sides="8,4",
+        tile_shape_windows="8x4,4x8",
         warmup=0,
     )
     spec = {"latent_channels": 16, "spatial": 8, "temporal": None}
@@ -847,12 +880,23 @@ def test_tile_shape_costs_measure_latency_memory_and_batch_scaling(monkeypatch):
     assert result["analysis"]["worst_batch_scaling"]["tiles_in_the_call"] == 2
     assert result["latent_window"] == (8, 8)
     assert result["frames"] is None
-    assert calls == [(1, 16, 8, 8), (2, 16, 8, 8), (1, 16, 4, 4), (2, 16, 4, 4)]
+    assert calls == [(1, 16, 8, 4), (2, 16, 8, 4), (1, 16, 4, 8), (2, 16, 4, 8)]
 
 
-def test_explicit_shape_sides_accept_an_asymmetric_native_window(monkeypatch):
-    monkeypatch.setattr(shape_costs.catalog, "build_vae", lambda *args: object())
+def test_default_shape_costs_reuse_bounded_rectangular_plans(monkeypatch):
+    vae = object()
+    monkeypatch.setattr(shape_costs.catalog, "build_vae", lambda *args: vae)
     monkeypatch.setattr(shape_costs.vae_api, "tile_shape", lambda value: (64, 32))
+    selected = [
+        {"window": (64, 48)},
+        {"window": (48, 64)},
+        {"window": (32, 32)},
+    ]
+    monkeypatch.setattr(
+        shape_costs.cases,
+        "plans_for_vae",
+        lambda value, height, width, world_size: selected,
+    )
     monkeypatch.setattr(
         shape_costs.dist,
         "all_gather_object",
@@ -873,7 +917,9 @@ def test_explicit_shape_sides_accept_an_asymmetric_native_window(monkeypatch):
         frames=1,
         iters=1,
         tile_shape_batch=1,
-        tile_shape_sides="8",
+        tile_shape_windows="",
+        height=512,
+        width=1024,
         warmup=0,
     )
 
@@ -892,7 +938,9 @@ def test_explicit_shape_sides_accept_an_asymmetric_native_window(monkeypatch):
 
     assert result["latent_window"] == (8, 4)
     assert [(entry["rows"], entry["columns"]) for entry in result["shapes"]] == [
-        (8, 8)
+        (8, 6),
+        (6, 8),
+        (4, 4),
     ]
 
 
@@ -943,7 +991,7 @@ def test_tile_shape_oom_is_synchronized_before_the_next_case(
         frames=17,
         iters=1,
         tile_shape_batch=1,
-        tile_shape_sides="8",
+        tile_shape_windows="8x8",
         warmup=1,
     )
 
@@ -1008,7 +1056,7 @@ def test_tile_shape_mixed_rank_failure_is_not_treated_as_oom(
         frames=1,
         iters=1,
         tile_shape_batch=1,
-        tile_shape_sides="8",
+        tile_shape_windows="8x8",
         warmup=1,
     )
 
@@ -1055,7 +1103,7 @@ def test_tile_shape_setup_failure_is_synchronized_before_cases(monkeypatch):
         frames=1,
         iters=1,
         tile_shape_batch=1,
-        tile_shape_sides="8",
+        tile_shape_windows="8x8",
         warmup=0,
     )
 
@@ -1221,7 +1269,7 @@ def test_enforced_agreement_and_execution_errors_fail():
     assert report.report_status([{}, {"error": {"type": "RuntimeError"}}]) == 1
 
 
-def test_square_tile_shape_and_stride_are_applied_through_distvae_plans(monkeypatch):
+def test_rectangular_tile_shape_and_overlap_use_exact_distvae_plans(monkeypatch):
     class Vae:
         tile_sample_min_size = 512
         overlap = (128, 128)
@@ -1274,7 +1322,7 @@ def test_square_tile_shape_and_stride_are_applied_through_distvae_plans(monkeypa
     monkeypatch.setattr(measure.vae_api, "apply_tile_plan", apply)
     cell = {
         "sharding": "unsharded",
-        "tiling": 256,
+        "window": (256, 384),
         "height": 2048,
         "width": 2048,
         "overlap": (64, 32),
@@ -1290,14 +1338,15 @@ def test_square_tile_shape_and_stride_are_applied_through_distvae_plans(monkeypa
     )
 
     assert calls == [
-        ("tile_shape_plan", (256, 256)),
+        ("tile_shape_plan", (256, 384)),
         ("apply_tile_plan", {"tile_sample_min_size": 256}),
         ("tile_overlap_plan", (64, 32), (2048, 2048)),
         ("apply_tile_plan", {"tile_sample_stride_height": 192}),
         ("tiled_decode_for",),
     ]
     assert facts["native_window_px"] == (512, 512)
-    assert facts["window_px"] == (256, 256)
+    assert facts["requested_window_px"] == (256, 384)
+    assert facts["window_px"] == (256, 384)
     assert facts["native_overlap_px"] == (128, 128)
     assert facts["overlap"] == (64, 32)
     assert "default_overlap" not in facts
@@ -1315,12 +1364,14 @@ def test_an_invalid_exact_tile_shape_is_not_silently_snapped(monkeypatch):
     monkeypatch.setattr(measure.vae_api, "tile_overlap", lambda value: (128, 128))
     monkeypatch.setattr(measure.vae_api, "tile_shape_plan", lambda *args: None)
 
-    with pytest.raises(ValueError, match=r"tile shape \(255, 255\) is invalid for Vae"):
+    with pytest.raises(ValueError, match=r"tile shape \(255, 257\) is invalid for Vae"):
         measure.configure_tiling(
             Vae(),
             {
                 "sharding": "unsharded",
-                "tiling": 255,
+                "window": (255, 257),
+                "height": 2048,
+                "width": 2048,
                 "overlap": None,
                 "tile_distribution": None,
             },
@@ -1328,43 +1379,6 @@ def test_an_invalid_exact_tile_shape_is_not_silently_snapped(monkeypatch):
             "decoder",
             lambda *parts: None,
         )
-
-
-def test_native_tile_window_enables_tiling_without_replanning(monkeypatch):
-    class Vae:
-        def __init__(self):
-            self.enabled = False
-
-        def enable_tiling(self):
-            self.enabled = True
-
-    vae = Vae()
-    monkeypatch.setattr(measure.vae_api, "require_vae_support", lambda *args: None)
-    monkeypatch.setattr(measure.vae_api, "tile_shape", lambda value: (512, 512))
-    monkeypatch.setattr(measure.vae_api, "tile_overlap", lambda value: (128, 128))
-    monkeypatch.setattr(measure, "latent_rows", lambda value: 64)
-    monkeypatch.setattr(
-        measure.vae_api,
-        "tile_shape_plan",
-        lambda *args: pytest.fail("native tiling must not create a replacement plan"),
-    )
-
-    facts = measure.configure_tiling(
-        vae,
-        {
-            "sharding": "unsharded",
-            "tiling": "native",
-            "overlap": None,
-            "tile_distribution": None,
-        },
-        SimpleNamespace(world_size=1, group=object()),
-        "decoder",
-        lambda *parts: None,
-    )
-
-    assert vae.enabled is True
-    assert facts["requested_window"] == "native"
-    assert facts["window_px"] == (512, 512)
 
 
 def test_custom_overlap_installs_the_per_axis_replacement(monkeypatch):
@@ -1377,7 +1391,12 @@ def test_custom_overlap_installs_the_per_axis_replacement(monkeypatch):
     monkeypatch.setattr(measure.vae_api, "require_vae_support", lambda *args: None)
     monkeypatch.setattr(measure.vae_api, "tile_shape", lambda value: (512, 512))
     monkeypatch.setattr(measure.vae_api, "tile_overlap", lambda value: (64, 32))
-    monkeypatch.setattr(measure, "latent_rows", lambda value: 64)
+    monkeypatch.setattr(measure, "latent_rows", lambda value, plan=None: 64)
+    monkeypatch.setattr(
+        measure.vae_api,
+        "tile_shape_plan",
+        lambda value, height, width: {"window": (height, width)},
+    )
     monkeypatch.setattr(
         measure.vae_api,
         "tile_overlap_plan",
@@ -1400,7 +1419,7 @@ def test_custom_overlap_installs_the_per_axis_replacement(monkeypatch):
         vae,
         {
             "sharding": "unsharded",
-            "tiling": "native",
+            "window": (512, 512),
             "height": 2048,
             "width": 2048,
             "overlap": (64, 32),
@@ -1412,6 +1431,7 @@ def test_custom_overlap_installs_the_per_axis_replacement(monkeypatch):
     )
 
     assert applied == [
+        {"window": (512, 512)},
         {"overlap": (64, 32), "sample_shape": (2048, 2048)}
     ]
     assert vae.tiled_decode is replacement
@@ -1424,7 +1444,7 @@ def test_report_schema_contains_provenance_and_effective_composition():
         shape={"height": 512, "width": 512, "frames": 1},
         composition={
             "sharding": "row",
-            "tiling": "native",
+            "window": (512, 384),
             "overlap": (64, 32),
             "tile_distribution": None,
         },
@@ -1433,8 +1453,8 @@ def test_report_schema_contains_provenance_and_effective_composition():
         world_size=4,
     )
 
-    assert report.SCHEMA_VERSION == 5
-    assert record["schema_version"] == 5
+    assert report.SCHEMA_VERSION == 6
+    assert record["schema_version"] == 6
     assert set(record["versions"]) >= {"torch", "diffusers", "distvae"}
     assert "distvae_git_revision" in record["provenance"]
     assert record["composition"]["sharding"] == "row"

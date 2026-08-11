@@ -7,7 +7,7 @@ import torch.distributed as dist
 
 from distvae import vae as vae_api
 
-from . import catalog
+from . import cases, catalog
 from .distributed import (
     RankError,
     aggregate_rank_errors,
@@ -78,24 +78,21 @@ def tile_shape_costs(args, spec, runtime, say):
         latent_window = tuple(value // spec["spatial"] for value in window)
         depth = 1 + (args.frames - 1) // spec["temporal"] if spec["temporal"] else None
 
-        if args.tile_shape_sides:
-            sides = [int(value) for value in args.tile_shape_sides.split(",")]
-            if any(value <= 0 for value in sides):
-                raise ValueError("--tile-shape-sides values must be positive")
-            shapes = [(value, value) for value in sides]
+        if args.tile_shape_windows:
+            shapes = [
+                cases.parse_pair(value, "latent tile window")
+                for value in args.tile_shape_windows.split(",")
+            ]
+            if any(min(shape) <= 0 for shape in shapes):
+                raise ValueError("--tile-shape-windows axes must be positive")
         else:
-            if window[0] != window[1]:
-                raise ValueError(
-                    f"{type(vae).__name__} has asymmetric native tile shape {window}; "
-                    "default shape analysis requires equal axes"
-                )
-            side = latent_window[0]
-            shapes = []
-            for down in (1, 2, 4):
-                for across in (1, 2, 4):
-                    shape = (side // down, side // across)
-                    if min(shape) >= 8 and shape not in shapes:
-                        shapes.append(shape)
+            plans = cases.plans_for_vae(
+                vae, args.height, args.width, runtime.world_size
+            )
+            shapes = [
+                tuple(axis // spec["spatial"] for axis in plan["window"])
+                for plan in plans
+            ]
         if not shapes:
             raise ValueError(
                 f"tile window produces no representative shapes at {latent_window}"

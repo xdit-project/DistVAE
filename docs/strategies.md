@@ -22,7 +22,7 @@ DistVAE deals whole tiles out across ranks rather than sharding the rows of each
 
 What that costs is granularity. A tile cannot be split, so the decode waits for whichever rank holds the most. Tiles are dealt by area rather than counted, because the grid's last row and column are clipped and so are cheap, and a rank can hold five of them where its neighbour holds three while doing much the same work. That gets the figure's fifteen tiles within half a percent of an even split. No dealing fixes an indivisible remainder, though, and the fewer the tiles the more it costs: nine tiles over four GPUs leaves someone decoding three against an average of 2.25. With fewer tiles than ranks the dispatch gives up altogether and every rank decodes all of them, so choose a window that yields at least a tile per GPU. Row sharding splits rows instead, a fine enough unit that the remainder rarely matters, though it still needs a row per rank.
 
-Which is faster is not obvious. Tiling does more arithmetic, row sharding does more round trips, and a deep decoder on small tensors can lose more to the round trips than tiling loses to its overlap. Peak memory is the clearer call. `bench/` measures the rest, per VAE, resolution and GPU count, and the [scaling section](../README.md#scaling) reports what it found on one machine.
+Which is faster is not obvious. Tiling does more arithmetic, row sharding does more round trips, and a deep decoder on small tensors can lose more to the round trips than tiling loses to its overlap. Peak memory is the clearer call. `bench/` measures latency, memory, collectives, and agreement for each VAE, resolution, and GPU count; the [benchmark guide](../bench/README.md) defines the cases.
 
 ## Why the window is rectangular
 
