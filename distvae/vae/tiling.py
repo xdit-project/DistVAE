@@ -33,15 +33,6 @@ OVERLAP_ATTRS = (
     "tile_overlap_factor_height",
     "tile_overlap_factor_width",
 )
-# Which overlap fraction governs which latent window. A VAE that carries one unkeyed fraction
-# applies it to both axes.
-OVERLAP_AXES = {
-    "tile_latent_min_height": "tile_overlap_factor_height",
-    "tile_latent_min_width": "tile_overlap_factor_width",
-    "tile_latent_min_size": "tile_overlap_factor",
-}
-
-
 def require_vae_support(vae, feature: str, flag: str) -> None:
     """Raise unless the installed diffusers really implements `feature` for this VAE"""
     # Diffusers hands every autoencoder the enable_tiling and enable_slicing methods through a
@@ -63,23 +54,6 @@ def is_tile_padding_error(error: BaseException) -> bool:
     # there is to key on, and a rewording upstream only costs the hint, since anything unmatched
     # reaches the caller as the decoder wrote it.
     return "padding size should be less than" in str(error).lower()
-
-
-def tile_window(vae) -> Optional[int]:
-    """The VAE's pixel-space tile edge, None if one number cannot describe it"""
-    windows = [
-        value
-        for attr in PIXEL_ATTRS
-        if isinstance(value := getattr(vae, attr, None), int) and value > 0
-    ]
-    if not windows:
-        return None
-    # A VAE that sizes height and width apart, as CogVideoX does at 240x360, has no single edge to
-    # set: moving both to one number would leave the latent window on one axis describing a
-    # different region than the pixel window above it.
-    if len(set(windows)) > 1:
-        return None
-    return windows[0]
 
 
 def tile_shape(vae) -> Optional[Tuple[int, int]]:
@@ -125,42 +99,6 @@ def spatial_ratio(vae) -> Optional[int]:
 def _is_whole(value: float) -> bool:
     """Whole within float error, so 30 x (1 - 1/3) counts as 20 and not 20.000000000000004"""
     return abs(value - round(value)) < 1e-9
-
-
-def tile_plan(vae, pixels: int) -> Optional[dict]:
-    """Every tiling attribute rescaled to a `pixels` window, or None if it can't land whole"""
-    # One knob, applied by scaling the whole set by the same factor, which keeps the pixel and
-    # latent windows describing the same region and keeps each VAE's own tile overlap.
-    window = tile_window(vae)
-    if window is None:
-        return None
-    defaults = _tile_defaults(vae)
-    plan = {attr: pixels for attr in PIXEL_ATTRS if attr in defaults}
-    for attr in SCALED_ATTRS:
-        if attr not in defaults:
-            continue
-        scaled = pixels * defaults[attr] / window
-        if scaled < 1 or not _is_whole(scaled):
-            return None
-        plan[attr] = round(scaled)
-    # Decoders that store an overlap fraction rather than a stride derive the stride by truncating
-    # latent x (1 - overlap) while cropping tiles on a separately truncated pixel width. Unless
-    # that product lands whole the two disagree and the assembled image comes out the wrong size,
-    # with nothing downstream to catch it.
-    for latent_attr, factor_attr in OVERLAP_AXES.items():
-        latent = plan.get(latent_attr)
-        factor = defaults.get(factor_attr, defaults.get("tile_overlap_factor"))
-        if latent is None or not isinstance(factor, float) or factor >= 1.0:
-            continue
-        if not _is_whole(latent * (1.0 - factor)):
-            return None
-    # A stride below one latent pixel divides down to a zero step, which raises out of range()
-    # inside diffusers rather than producing anything.
-    ratio = spatial_ratio(vae)
-    strides = [plan[attr] for attr in STRIDE_ATTRS if attr in plan]
-    if ratio is not None and min([pixels] + strides) < ratio:
-        return None
-    return plan
 
 
 def tile_shape_plan(vae, height: int, width: int) -> Optional[dict]:
@@ -281,47 +219,6 @@ def latent_rows(vae, plan: Optional[dict] = None) -> Optional[int]:
     return min(pixels) // ratio
 
 
-def snap_tile_window(vae, pixels: int) -> Tuple[Optional[int], Optional[dict]]:
-    """The largest workable window at or below `pixels`, and the attributes that set it"""
-    for candidate in range(pixels, 0, -1):
-        plan = tile_plan(vae, candidate)
-        if plan is not None:
-            return candidate, plan
-    return None, None
-
-
-def smallest_tile_window(
-    vae, floor: int, ceiling: int, min_latent_rows: int = 1
-) -> Optional[int]:
-    """The first window from `floor` up that works and holds `min_latent_rows` latent rows, so a
-    refusal can name a size that would be accepted
-    """
-    for pixels in range(floor, ceiling + 1):
-        plan = tile_plan(vae, pixels)
-        if plan is None:
-            continue
-        rows = latent_rows(vae, plan)
-        if rows is None or rows >= min_latent_rows:
-            return pixels
-    return None
-
-
-NARROWEST_USEFUL_FRACTION = 2
-"""Conservative floor for narrowing a VAE's native tile window.
-
-Below half the native window, smaller tiles typically increase seams and scheduling overhead while
-offering diminishing memory savings. Integrations can impose a stricter policy when needed.
-"""
-
-
-def narrowest_useful_window(vae) -> Optional[int]:
-    """The narrowest window worth setting on this VAE, None where it has no single window"""
-    window = tile_window(vae)
-    if window is None:
-        return None
-    return max(1, window // NARROWEST_USEFUL_FRACTION)
-
-
 def overlap_windows(vae) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
     """The latent and pixel tile windows as (down, across) pairs, None where the VAE has neither
 
@@ -351,6 +248,29 @@ def overlap_windows(vae) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
     return None
 
 
+def _overlap_factors(vae) -> Optional[Tuple[float, float]]:
+    """Configured overlap factors by axis, preferring keyed values."""
+    keyed = (
+        getattr(vae, "tile_overlap_factor_height", None),
+        getattr(vae, "tile_overlap_factor_width", None),
+    )
+    if all(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and 0.0 <= value < 1.0
+        for value in keyed
+    ):
+        return keyed
+    scalar = getattr(vae, "tile_overlap_factor", None)
+    if (
+        isinstance(scalar, (int, float))
+        and not isinstance(scalar, bool)
+        and 0.0 <= scalar < 1.0
+    ):
+        return scalar, scalar
+    return None
+
+
 def tiles_by_overlap_factor(vae) -> bool:
     """Whether this VAE tiles with the loop `overlap_tiled_decode` reimplements"""
     # AutoencoderKL, AutoencoderKLFlux2 and HunyuanVideo 1.5 walk a latent window at a stride
@@ -360,11 +280,13 @@ def tiles_by_overlap_factor(vae) -> bool:
         return False
     if overlap_windows(vae) is None:
         return False
-    # The ONE unkeyed fraction is what separates this loop from CogVideoX's, which keys the
-    # fraction by axis as well as the window and tiles its frames inside this loop rather than
-    # above it. Both blends are named because the loop calls them rather than blending itself.
+    # The scalar attribute identifies this family rather than CogVideoX, whose keyed-factor loop
+    # also tiles frames inside the spatial loop. DistVAE adds keyed values to this family when a
+    # caller requests rectangular overlap, but leaves the scalar marker in place.
     return (
-        isinstance(getattr(vae, "tile_overlap_factor", None), float)
+        isinstance(getattr(vae, "tile_overlap_factor", None), (int, float))
+        and not isinstance(getattr(vae, "tile_overlap_factor", None), bool)
+        and _overlap_factors(vae) is not None
         and callable(getattr(vae, "blend_v", None))
         and callable(getattr(vae, "blend_h", None))
     )
@@ -374,25 +296,23 @@ WINDOW_ATTRS_FOR_STRIDE = ("tile_sample_min_height", "tile_sample_min_width")
 """The window each stride in STRIDE_ATTRS steps across, in the same order"""
 
 
-def tile_overlap(vae) -> Optional[Tuple[float, float]]:
-    """How much of each tile repeats its neighbour, as (down, across) fractions of the window
-
-    The two families spell the step between tiles differently: one stores the overlap as a
-    fraction and derives the stride, the other stores the stride in pixels and derives the
-    overlap. This reads whichever the VAE carries and answers in fractions either way, so a
-    caller can ask what a VAE is set to without knowing which family it belongs to. None where
-    it carries neither.
-    """
+def tile_overlap(vae) -> Optional[Tuple[int, int]]:
+    """Absolute output-pixel overlap as (height, width), regardless of storage spelling."""
     strides = [getattr(vae, attr, None) for attr in STRIDE_ATTRS]
     windows = [getattr(vae, attr, None) for attr in WINDOW_ATTRS_FOR_STRIDE]
     if all(isinstance(value, int) and value > 0 for value in strides + windows):
-        down, across = (
-            1.0 - stride / window for stride, window in zip(strides, windows)
+        overlap = tuple(window - stride for stride, window in zip(strides, windows))
+        return (
+            overlap
+            if all(
+                0 <= value < window for value, window in zip(overlap, windows)
+            )
+            else None
         )
-        return (down, across)
-    factor = getattr(vae, "tile_overlap_factor", None)
-    if isinstance(factor, float):
-        return (factor, factor)
+    factors = _overlap_factors(vae)
+    shape = tile_shape(vae)
+    if factors is not None and shape is not None:
+        return tuple(int(window * factor) for window, factor in zip(shape, factors))
     return None
 
 
@@ -434,34 +354,20 @@ def _overlap_lands(latent: int, pixel: int, factor: float) -> bool:
 
 
 def tile_overlap_plan(
-    vae, overlap: float, sample_shape: Optional[Tuple[int, int]] = None
+    vae,
+    overlap_height: int,
+    overlap_width: int,
+    sample_shape: Optional[Tuple[int, int]] = None,
 ) -> Optional[dict]:
-    """Every attribute setting the step between tiles, at `overlap`, or None if it cannot land
-
-    The window says how large a tile is; this says how far apart their origins sit. They are two
-    levers and not one. At a fixed window a tiled decode covers (window/stride)^2 times the
-    latent it was cut from, so the stride is what decides how much of the decode is redundant,
-    while the window is what decides how much memory one tile costs. Widening the stride is
-    therefore the lever that buys back the time tiling spends, and it costs seams rather than
-    memory - the opposite trade to narrowing the window.
-
-    Never steps wider than asked. Where the exact stride would leave one of the loop's integer
-    divisions truncating, the step narrows until it lands whole, so what results overlaps by at
-    least what was requested.
-
-    Returns attributes rather than setting them, so `apply_tile_plan` stays the one place a
-    window or a stride is written, and so a caller can find out whether an overlap is reachable
-    without half-applying it.
-
-    When `sample_shape` is supplied in output pixels, only axes spanning multiple tiles constrain
-    the plan. This permits full-height column strips and full-width row strips even where the
-    inactive axis cannot represent the requested overlap exactly.
-    """
-    if (
-        not isinstance(overlap, (int, float))
-        or isinstance(overlap, bool)
-        or not 0.0 <= overlap < 1.0
+    """Plan an exact absolute output-pixel overlap, or None when it is not representable."""
+    requested = (overlap_height, overlap_width)
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in requested
     ):
+        return None
+    shape = tile_shape(vae)
+    if shape is None:
         return None
     active_axes = (True, True)
     if sample_shape is not None:
@@ -474,28 +380,24 @@ def tile_overlap_plan(
             )
         ):
             return None
-        shape = tile_shape(vae)
-        if shape is None:
-            return None
         active_axes = tuple(sample > window for sample, window in zip(sample_shape, shape))
-        if not any(active_axes):
-            return {}
+    if any(
+        (active and overlap >= window) or (not active and overlap != 0)
+        for active, overlap, window in zip(active_axes, requested, shape)
+    ):
+        return None
 
     if tiles_by_stored_stride(vae):
         step = _stride_granularity(vae)
         if step is None:
             return None
-        plan = {}
-        for active, stride_attr, window_attr in zip(
-            active_axes, STRIDE_ATTRS, WINDOW_ATTRS_FOR_STRIDE
-        ):
-            if not active:
-                continue
-            window = getattr(vae, window_attr)
-            stride = int(window * (1.0 - overlap)) // step * step
-            if stride < step:
+        strides = (
+            window - overlap for window, overlap in zip(shape, requested)
+        )
+        plan = dict(zip(STRIDE_ATTRS, strides))
+        for stride in plan.values():
+            if stride <= 0 or stride % step:
                 return None
-            plan[stride_attr] = min(stride, window)
         return plan
 
     if not tiles_by_overlap_factor(vae):
@@ -505,43 +407,19 @@ def tile_overlap_plan(
         return None
     (latent_down, latent_across), (pixel_down, pixel_across) = windows
     axes = ((latent_down, pixel_down), (latent_across, pixel_across))
-    # One fraction governs both axes, so a step that lands whole down the rows still has to land
-    # whole across the columns; a VAE windowing the two differently rules out fractions that
-    # either axis alone would accept. Walked from the requested step downward, which narrows the
-    # step and so widens the overlap - the direction that keeps a wrong guess conservative.
-    basis, _ = next(axis for active, axis in zip(active_axes, axes) if active)
-    for stride in range(min(int(basis * (1.0 - overlap)), basis), 0, -1):
-        factor = 1.0 - stride / basis
-        if not 0.0 <= factor < 1.0:
-            continue
-        if all(
-            not active or _overlap_lands(latent, pixel, factor)
-            for active, (latent, pixel) in zip(active_axes, axes)
-        ):
-            return {
-                attr: factor
-                for axis, attr in (
-                    (None, "tile_overlap_factor"),
-                    (0, "tile_overlap_factor_height"),
-                    (1, "tile_overlap_factor_width"),
-                )
-                if isinstance(getattr(vae, attr, None), float)
-                and (axis is None or active_axes[axis])
-            }
-    return None
-
-
-def widest_tile_overlap(vae) -> Optional[float]:
-    """The most overlap this VAE can step by, so a refusal can name one that would be accepted
-
-    Less overlap creates a wider step, so candidates are checked in descending hundredths until
-    one is accepted. Hundredths are finer than the manual setting precision.
-    """
-    for hundredths in range(99, -1, -1):
-        overlap = hundredths / 100
-        if tile_overlap_plan(vae, overlap) is not None:
-            return overlap
-    return None
+    factors = tuple(overlap / pixel for overlap, (_, pixel) in zip(requested, axes))
+    if not all(
+        _overlap_lands(latent, pixel, factor)
+        for (latent, pixel), factor in zip(axes, factors)
+    ):
+        return None
+    plan = {
+        "tile_overlap_factor_height": factors[0],
+        "tile_overlap_factor_width": factors[1],
+    }
+    if hasattr(vae, "tile_overlap_factor") and factors[0] == factors[1]:
+        plan["tile_overlap_factor"] = factors[0]
+    return plan
 
 
 def _returns_decoder_output(vae) -> bool:
@@ -679,29 +557,6 @@ def tiled_decode_for(
     return strided_tiled_decode(vae, dispatch, assemble)
 
 
-def local_tiled_decode_for(vae) -> Optional[Callable]:
-    """A local replacement only when a legacy scalar VAE holds a rectangular plan."""
-    keyed = [
-        getattr(vae, attr, None)
-        for attr in (
-            "tile_latent_min_height",
-            "tile_latent_min_width",
-            "tile_sample_min_height",
-            "tile_sample_min_width",
-        )
-    ]
-    if not all(isinstance(value, int) and value > 0 for value in keyed):
-        return None
-    if not all(
-        isinstance(getattr(vae, attr, None), int)
-        for attr in ("tile_latent_min_size", "tile_sample_min_size")
-    ):
-        return None
-    if keyed[2] == keyed[3]:
-        return None
-    return overlap_tiled_decode(vae)
-
-
 def _latent_areas(down, across, window, bounds) -> List[int]:
     """The latent area each tile of the grid covers, in the order the loop walks
 
@@ -758,11 +613,11 @@ def overlap_tiled_decode(
 
     def decode_tiles(z):
         (latent_down, latent_across), (pixel_down, pixel_across) = overlap_windows(vae)
-        factor = vae.tile_overlap_factor
-        stride_down = int(latent_down * (1 - factor))
-        stride_across = int(latent_across * (1 - factor))
-        blend_down = int(pixel_down * factor)
-        blend_across = int(pixel_across * factor)
+        factor_down, factor_across = _overlap_factors(vae)
+        stride_down = int(latent_down * (1 - factor_down))
+        stride_across = int(latent_across * (1 - factor_across))
+        blend_down = int(pixel_down * factor_down)
+        blend_across = int(pixel_across * factor_across)
         limit_down = pixel_down - blend_down
         limit_across = pixel_across - blend_across
 

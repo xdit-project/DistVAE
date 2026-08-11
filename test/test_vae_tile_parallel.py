@@ -251,7 +251,7 @@ def _blend(deep_down: int, deep_across: int):
     )
 
 
-def _tiled_vae(name: str, device=None, overlap: Optional[float] = None):
+def _tiled_vae(name: str, device=None, overlap: Optional[Tuple[int, int]] = None):
     """The same small VAE and latents on every rank, at a window several tiles across"""
     import diffusers
 
@@ -267,10 +267,13 @@ def _tiled_vae(name: str, device=None, overlap: Optional[float] = None):
         )
     vae = cls(**kwargs).eval()
     vae.enable_tiling()
-    _, plan = vae_tiling.snap_tile_window(vae, vae_tiling.tile_window(vae) // 4)
+    native = vae_tiling.tile_shape(vae)
+    shape = tuple(axis // 4 for axis in native)
+    plan = vae_tiling.tile_shape_plan(vae, *shape)
+    assert plan is not None, f"{name} cannot use exact tile shape {shape}"
     vae_tiling.apply_tile_plan(vae, plan)
     if overlap is not None:
-        step = vae_tiling.tile_overlap_plan(vae, overlap)
+        step = vae_tiling.tile_overlap_plan(vae, *overlap)
         assert step is not None, f"{name} cannot step its tiles at {overlap}"
         vae_tiling.apply_tile_plan(vae, step)
 
@@ -285,7 +288,11 @@ def _tiled_vae(name: str, device=None, overlap: Optional[float] = None):
 
 
 def _runs_in_a_group(
-    rank: int, world_size: int, port: int, name: str, overlap: Optional[float] = None
+    rank: int,
+    world_size: int,
+    port: int,
+    name: str,
+    overlap: Optional[Tuple[int, int]] = None,
 ) -> None:
     """One rank blending its own run, checked against the whole grid blended by one rank"""
     from distvae.vae import tile_parallel as vae_tile_parallel
@@ -521,7 +528,7 @@ class TestRuns(unittest.TestCase):
                 _require_run_vae(self, name)
                 mp.spawn(
                     _runs_in_a_group,
-                    args=(4, _free_port(), name, 0.0),
+                    args=(4, _free_port(), name, (0, 0)),
                     nprocs=4,
                     join=True,
                 )

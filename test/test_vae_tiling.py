@@ -168,32 +168,30 @@ class TestTilePaddingError(unittest.TestCase):
                 )
 
 
-class TestTileWindow(unittest.TestCase):
+class TestTileShape(unittest.TestCase):
 
-    def test_reads_the_pixel_window_of_each_family(self):
-        self.assertEqual(vae_tiling.tile_window(legacy_pair_vae()), 256)
-        self.assertEqual(vae_tiling.tile_window(stride_vae()), 256)
-        self.assertEqual(vae_tiling.tile_window(overlap_hw_vae()), 256)
+    def test_reads_the_pixel_shape_of_each_family(self):
+        self.assertEqual(vae_tiling.tile_shape(legacy_pair_vae()), (256, 256))
+        self.assertEqual(vae_tiling.tile_shape(stride_vae()), (256, 256))
+        self.assertEqual(vae_tiling.tile_shape(overlap_hw_vae()), (256, 256))
 
-    def test_a_vae_without_a_window_reports_none(self):
-        self.assertIsNone(vae_tiling.tile_window(StubVAE(tile_overlap_h=0.25)))
-        self.assertIsNone(vae_tiling.tile_plan(StubVAE(tile_overlap_h=0.25), 128))
+    def test_a_vae_without_a_shape_reports_none(self):
+        vae = StubVAE(tile_overlap_h=0.25)
+        self.assertIsNone(vae_tiling.tile_shape(vae))
+        self.assertIsNone(vae_tiling.tile_shape_plan(vae, 128, 128))
 
-    def test_a_window_that_is_not_square_reports_none(self):
-        # One edge cannot set a 240x360 window: moving both to one number would leave the latent
-        # window on one axis describing a different region than the pixel window above it.
-        self.assertIsNone(vae_tiling.tile_window(asymmetric_vae()))
-        self.assertIsNone(vae_tiling.tile_plan(asymmetric_vae(), 240))
+    def test_a_native_rectangle_is_preserved(self):
+        self.assertEqual(vae_tiling.tile_shape(asymmetric_vae()), (240, 360))
 
     def test_spatial_ratio_falls_back_from_config_to_the_module(self):
         self.assertEqual(vae_tiling.spatial_ratio(stride_vae()), 8)
         self.assertIsNone(vae_tiling.spatial_ratio(legacy_pair_vae()))
 
 
-class TestTilePlan(unittest.TestCase):
+class TestSquareTileShapePlan(unittest.TestCase):
 
     def test_every_attribute_is_rescaled_by_the_same_factor(self):
-        plan = vae_tiling.tile_plan(stride_vae(), 128)
+        plan = vae_tiling.tile_shape_plan(stride_vae(), 128, 128)
         self.assertEqual(
             plan,
             {
@@ -206,22 +204,24 @@ class TestTilePlan(unittest.TestCase):
 
     def test_a_window_that_does_not_divide_whole_is_refused(self):
         # 100px would put the latent window at 12.5, which no VAE can hold.
-        self.assertIsNone(vae_tiling.tile_plan(legacy_pair_vae(), 100))
+        self.assertIsNone(vae_tiling.tile_shape_plan(legacy_pair_vae(), 100, 100))
 
     def test_an_overlap_that_does_not_land_whole_is_refused(self):
         # 200px gives a latent window of 25, and 25 x 0.75 truncates to a stride the pixel crop
         # does not agree with, which assembles an image of the wrong size.
-        self.assertIsNone(vae_tiling.tile_plan(legacy_pair_vae(), 200))
-        self.assertIsNone(vae_tiling.tile_plan(overlap_hw_vae(), 200))
-        self.assertIsNotNone(vae_tiling.tile_plan(legacy_pair_vae(), 192))
+        self.assertIsNone(vae_tiling.tile_shape_plan(legacy_pair_vae(), 200, 200))
+        self.assertIsNone(vae_tiling.tile_shape_plan(overlap_hw_vae(), 200, 200))
+        self.assertIsNotNone(vae_tiling.tile_shape_plan(legacy_pair_vae(), 192, 192))
 
-    def test_each_overlap_fraction_is_checked_against_its_own_axis(self):
-        # 32 x 0.75 and 40 x 0.8 both land whole, so the window stands. Checking every fraction
-        # against every latent window instead would fail it on 32 x 0.8 = 25.6.
-        self.assertIsNotNone(vae_tiling.tile_plan(per_axis_overlap_vae(), 256))
-        # 224px puts the width latent at 35, and 35 x 0.8 = 28 is whole, but the height latent
-        # lands at 28 and 28 x 0.75 = 21 is whole too, so this one stands on both axes.
-        self.assertIsNotNone(vae_tiling.tile_plan(per_axis_overlap_vae(), 224))
+    def test_each_axis_must_keep_its_latent_step_and_pixel_crop_consistent(self):
+        # The width maps 256 pixels to 40 latents, a non-integral 6.4x ratio. Its latent stride
+        # and pixel crop cannot describe the same distance, even though 40 x 0.8 is whole.
+        self.assertIsNone(
+            vae_tiling.tile_shape_plan(per_axis_overlap_vae(), 256, 256)
+        )
+        self.assertIsNone(
+            vae_tiling.tile_shape_plan(per_axis_overlap_vae(), 224, 224)
+        )
 
     def test_an_unkeyed_overlap_fraction_covers_both_axes(self):
         vae = StubVAE(
@@ -231,18 +231,18 @@ class TestTilePlan(unittest.TestCase):
             tile_latent_min_width=16,
             tile_overlap_factor=0.25,
         )
-        self.assertIsNotNone(vae_tiling.tile_plan(vae, 64))
+        self.assertIsNotNone(vae_tiling.tile_shape_plan(vae, 64, 64))
         # 32px puts each latent window at 2, and 2 x 0.75 truncates to a stride of 1.
-        self.assertIsNone(vae_tiling.tile_plan(vae, 32))
+        self.assertIsNone(vae_tiling.tile_shape_plan(vae, 32, 32))
 
     def test_a_stride_below_one_latent_pixel_is_refused(self):
         # 8px would leave a 6px stride, under this VAE's 8px latent pixel, and diffusers steps
         # through the latents in a range() that would then be empty.
-        self.assertIsNone(vae_tiling.tile_plan(stride_vae(), 8))
+        self.assertIsNone(vae_tiling.tile_shape_plan(stride_vae(), 8, 8))
 
     def test_a_window_above_the_default_still_plans(self):
         # _apply_vae_tile_size declines these itself, having the config to say why.
-        plan = vae_tiling.tile_plan(stride_vae(), 512)
+        plan = vae_tiling.tile_shape_plan(stride_vae(), 512, 512)
         self.assertEqual(plan["tile_sample_stride_height"], 384)
 
 
@@ -292,15 +292,18 @@ class TestTileShapePlan(unittest.TestCase):
         self.assertEqual(vae_tiling.tile_shape(legacy_pair_vae()), (256, 256))
         self.assertEqual(vae_tiling.tile_shape(asymmetric_vae()), (240, 360))
 
-    def test_scalar_planning_is_unchanged(self):
+    def test_square_planning_uses_the_rectangular_mechanics(self):
         self.assertEqual(
-            vae_tiling.tile_plan(legacy_pair_vae(), 128),
+            vae_tiling.tile_shape_plan(legacy_pair_vae(), 128, 128),
             {
                 "tile_sample_min_size": 128,
+                "tile_sample_min_height": 128,
+                "tile_sample_min_width": 128,
                 "tile_latent_min_size": 16,
+                "tile_latent_min_height": 16,
+                "tile_latent_min_width": 16,
             },
         )
-        self.assertIsNone(vae_tiling.tile_plan(asymmetric_vae(), 128))
 
     def test_rectangular_legacy_windows_install_a_local_replacement(self):
         import torch
@@ -313,7 +316,7 @@ class TestTileShapePlan(unittest.TestCase):
         plan = vae_tiling.tile_shape_plan(vae, 128, 192)
         vae_tiling.apply_tile_plan(vae, plan)
 
-        decode = vae_tiling.local_tiled_decode_for(vae)
+        decode = vae_tiling.tiled_decode_for(vae)
 
         self.assertIsNotNone(decode)
         sample = decode(torch.randn(1, 4, 24, 32)).sample
@@ -342,7 +345,6 @@ class TestTileShapePlan(unittest.TestCase):
         plan = vae_tiling.tile_shape_plan(vae, 128, 384)
         vae_tiling.apply_tile_plan(vae, plan)
 
-        self.assertIsNone(vae_tiling.local_tiled_decode_for(vae))
         self.assertIsNotNone(vae_tiling.tiled_decode_for(vae))
 
 
@@ -352,18 +354,28 @@ class TestLatentRows(unittest.TestCase):
     def test_rows_come_from_the_latent_window_where_the_vae_carries_one(self):
         vae = legacy_pair_vae()
         self.assertEqual(
-            vae_tiling.latent_rows(vae, vae_tiling.tile_plan(vae, 128)), 16
+            vae_tiling.latent_rows(
+                vae, vae_tiling.tile_shape_plan(vae, 128, 128)
+            ),
+            16,
         )
 
     def test_rows_come_from_the_compression_ratio_otherwise(self):
         vae = stride_vae()
         self.assertEqual(
-            vae_tiling.latent_rows(vae, vae_tiling.tile_plan(vae, 128)), 16
+            vae_tiling.latent_rows(
+                vae, vae_tiling.tile_shape_plan(vae, 128, 128)
+            ),
+            16,
         )
 
     def test_a_vae_that_says_neither_reports_none(self):
         vae = StubVAE(tile_sample_min_height=256, tile_sample_min_width=256)
-        self.assertIsNone(vae_tiling.latent_rows(vae, vae_tiling.tile_plan(vae, 128)))
+        self.assertIsNone(
+            vae_tiling.latent_rows(
+                vae, vae_tiling.tile_shape_plan(vae, 128, 128)
+            )
+        )
 
     def test_with_no_plan_the_vae_s_own_window_is_the_plan(self):
         # DistVAE must validate the VAE's default window when tiling was enabled before the
@@ -377,52 +389,12 @@ class TestLatentRows(unittest.TestCase):
         # has to be answered about the plan and not about the window it is replacing.
         vae = legacy_pair_vae()
         self.assertEqual(
-            vae_tiling.latent_rows(vae, vae_tiling.tile_plan(vae, 128)), 16
+            vae_tiling.latent_rows(
+                vae, vae_tiling.tile_shape_plan(vae, 128, 128)
+            ),
+            16,
         )
         self.assertEqual(vae_tiling.latent_rows(vae), 32)
-
-    def test_the_smallest_window_can_be_asked_to_hold_a_row_per_rank(self):
-        vae = legacy_pair_vae()
-        # This VAE tiles at multiples of 32px, so 32 is the smallest that works at all, but eight
-        # ranks each need a latent row of their own and 32px only comes to four.
-        self.assertEqual(vae_tiling.smallest_tile_window(vae, 8, 256), 32)
-        self.assertEqual(
-            vae_tiling.smallest_tile_window(vae, 8, 256, min_latent_rows=8), 64
-        )
-
-
-class TestSnapping(unittest.TestCase):
-
-    def test_snapping_lands_on_the_next_workable_window_down(self):
-        pixels, plan = vae_tiling.snap_tile_window(legacy_pair_vae(), 200)
-        self.assertEqual(pixels, 192)
-        self.assertEqual(plan["tile_latent_min_size"], 24)
-
-    def test_snapping_keeps_a_window_that_already_works(self):
-        pixels, _ = vae_tiling.snap_tile_window(stride_vae(), 128)
-        self.assertEqual(pixels, 128)
-
-    def test_snapping_never_returns_a_larger_window(self):
-        for requested in range(1, 257):
-            pixels, _ = vae_tiling.snap_tile_window(overlap_hw_vae(), requested)
-            if pixels is not None:
-                self.assertLessEqual(pixels, requested)
-
-    def test_a_request_under_the_smallest_window_snaps_to_nothing(self):
-        pixels, plan = vae_tiling.snap_tile_window(stride_vae(), 8)
-        self.assertIsNone(pixels)
-        self.assertIsNone(plan)
-
-    def test_the_smallest_workable_window_is_reported_for_the_error_path(self):
-        self.assertEqual(vae_tiling.smallest_tile_window(stride_vae(), 8, 256), 12)
-        self.assertIsNone(vae_tiling.smallest_tile_window(StubVAE(), 8, 256))
-
-    def test_a_vae_with_unequal_height_and_width_windows_takes_no_size(self):
-        # One edge cannot describe a 240x360 window, so every size is refused and the caller is
-        # told that rather than being sent looking for a smaller one.
-        vae = asymmetric_vae()
-        self.assertIsNone(vae_tiling.smallest_tile_window(vae, 1, 240))
-        self.assertIsNone(vae_tiling.snap_tile_window(vae, 240)[0])
 
 
 class TestEverySupportedVAE(unittest.TestCase):
@@ -518,80 +490,38 @@ class TestEverySupportedVAE(unittest.TestCase):
 
                 # Same order as the caller: turn tiling on, then size its window.
                 vae.enable_tiling()
-                window = vae_tiling.tile_window(vae)
+                window = vae_tiling.tile_shape(vae)
                 self.assertIsNotNone(
                     window, f"{name} tiles but exposes no window this can read"
                 )
-                pixels, plan = vae_tiling.snap_tile_window(vae, window // 2)
+                shape = tuple(axis // 2 for axis in window)
+                plan = vae_tiling.tile_shape_plan(vae, *shape)
                 self.assertIsNotNone(
-                    plan, f"{name} refused every window at or below {window // 2}"
+                    plan, f"{name} refused exact tile shape {shape}"
                 )
                 for attr, value in plan.items():
                     setattr(vae, attr, value)
                 with torch.no_grad():
                     got = vae.decode(latents).sample.shape[-2:]
                 self.assertEqual(
-                    got, expected, f"{name} decoded at a {pixels}px tile window"
+                    got, expected, f"{name} decoded at tile shape {shape}"
                 )
 
 
-class TestTheNarrowestUsefulWindow(unittest.TestCase):
-    """How far a window may be narrowed before it stops buying the memory it costs output for"""
-
-    def test_it_is_half_of_the_vae_s_own_window(self):
-        # A fraction rather than a pixel count, because the window a VAE ships is the tile size it
-        # was built around: 512px is one halving down from flux2's 1024 and no narrowing at all
-        # for a VAE that ships 512.
-        for window in (1024, 512, 256, 64):
-            with self.subTest(window=window):
-                vae = overlap_factor_vae(sample=window)
-                self.assertEqual(vae_tiling.tile_window(vae), window)
-                self.assertEqual(vae_tiling.narrowest_useful_window(vae), window // 2)
-
-    def test_a_vae_with_no_single_window_has_no_floor_to_give(self):
-        # A window taller than it is wide has no one edge to halve, and the caller refuses
-        # a single tile size for these anyway. A VAE keyed by height and width that happens to hold
-        # the same number in both still has a window, and so still has a floor.
-        self.assertIsNone(vae_tiling.narrowest_useful_window(asymmetric_vae()))
-        self.assertEqual(vae_tiling.narrowest_useful_window(overlap_hw_vae()), 128)
-
-    def test_the_floor_is_never_zero(self):
-        # A VAE whose window is smaller than the fraction would floor at nothing, and a window of
-        # zero pixels is not a window.
-        self.assertEqual(
-            vae_tiling.narrowest_useful_window(overlap_factor_vae(sample=1)), 1
-        )
-
-
 class TestTileOverlap(unittest.TestCase):
-    """The step between tiles, which is the other lever the window is not
+    """The exact output-pixel overlap between neighbouring tiles."""
 
-    The window decides what one tile costs to hold. The overlap decides how much of the decode is
-    spent twice, since tiles overlapping by f cover 1/(1-f)^2 times the latent they were cut
-    from. Two knobs on two different costs, and a VAE ships whichever pair its own training
-    resolution wanted.
-    """
-
-    ASKED = (0.0, 0.0625, 0.125, 0.25, 0.4)
-
-    def test_both_spellings_read_as_a_fraction(self):
-        # One family stores the fraction and derives the stride, the other stores the stride and
-        # implies the fraction. Whoever sets it should not have to know which.
-        self.assertEqual(vae_tiling.tile_overlap(legacy_pair_vae()), (0.25, 0.25))
-        self.assertEqual(vae_tiling.tile_overlap(stride_vae()), (0.25, 0.25))
+    def test_both_storage_spellings_report_absolute_pixels(self):
+        self.assertEqual(vae_tiling.tile_overlap(legacy_pair_vae()), (64, 64))
+        self.assertEqual(vae_tiling.tile_overlap(stride_vae()), (64, 64))
         self.assertIsNone(vae_tiling.tile_overlap(StubVAE(tile_sample_min_size=256)))
 
     def test_reporting_a_step_is_not_knowing_what_moving_it_does(self):
-        # `stride_vae` carries the stride spelling exactly as the video VAEs do and is still not
-        # one of the families whose loop the caller walks; CogVideoX keys its fraction by axis. Both
-        # can say what they step by, and neither can be asked to step differently, because what
-        # a stride has to divide into is a property of the loop reading it.
         self.assertIsNotNone(vae_tiling.tile_overlap(stride_vae()))
-        self.assertIsNone(vae_tiling.tile_overlap_plan(stride_vae(), 0.125))
-        self.assertIsNone(vae_tiling.tile_overlap_plan(overlap_hw_vae(), 0.125))
-        self.assertIsNone(vae_tiling.widest_tile_overlap(stride_vae()))
+        self.assertIsNone(vae_tiling.tile_overlap_plan(stride_vae(), 32, 32))
+        self.assertIsNone(vae_tiling.tile_overlap_plan(overlap_hw_vae(), 32, 32))
 
-    def test_a_column_strip_only_constrains_the_axis_with_multiple_tiles(self):
+    def test_a_column_strip_requires_zero_overlap_on_its_inactive_axis(self):
         vae = StubVAE(
             tile_sample_min_height=120,
             tile_sample_min_width=128,
@@ -602,13 +532,17 @@ class TestTileOverlap(unittest.TestCase):
             blend_h=lambda left, tile, extent: tile,
         )
         self.assertEqual(
-            vae_tiling.tile_overlap_plan(
-                vae, 0.125, sample_shape=(120, 512)
-            ),
-            {"tile_overlap_factor": 0.125},
+            vae_tiling.tile_overlap_plan(vae, 0, 16, sample_shape=(120, 512)),
+            {
+                "tile_overlap_factor_height": 0.0,
+                "tile_overlap_factor_width": 0.125,
+            },
+        )
+        self.assertIsNone(
+            vae_tiling.tile_overlap_plan(vae, 8, 16, sample_shape=(120, 512))
         )
 
-    def test_a_row_strip_only_constrains_the_axis_with_multiple_tiles(self):
+    def test_a_row_strip_accepts_a_distinct_height_overlap(self):
         vae = StubVAE(
             tile_sample_min_height=120,
             tile_sample_min_width=128,
@@ -618,20 +552,15 @@ class TestTileOverlap(unittest.TestCase):
             blend_v=lambda above, tile, extent: tile,
             blend_h=lambda left, tile, extent: tile,
         )
-        overlap = 2 / 15
-        plan = vae_tiling.tile_overlap_plan(
-            vae, overlap, sample_shape=(480, 128)
-        )
-        factor = plan["tile_overlap_factor"]
-        self.assertGreaterEqual(factor, overlap)
-        latent_stride = int(vae.tile_latent_min_height * (1.0 - factor))
         self.assertEqual(
-            vae.tile_sample_min_height - int(vae.tile_sample_min_height * factor),
-            latent_stride
-            * (vae.tile_sample_min_height // vae.tile_latent_min_height),
+            vae_tiling.tile_overlap_plan(vae, 16, 0, sample_shape=(480, 128)),
+            {
+                "tile_overlap_factor_height": 2 / 15,
+                "tile_overlap_factor_width": 0.0,
+            },
         )
 
-    def test_a_stride_walked_strip_only_sets_its_active_stride(self):
+    def test_a_stride_walked_strip_sets_both_strides(self):
         cls = type("AutoencoderKLQwenImage", (StubVAE,), {})
         vae = cls(
             tile_sample_min_height=120,
@@ -646,74 +575,61 @@ class TestTileOverlap(unittest.TestCase):
             clear_cache=lambda: None,
         )
         self.assertEqual(
-            vae_tiling.tile_overlap_plan(
-                vae, 0.125, sample_shape=(120, 512)
-            ),
-            {"tile_sample_stride_width": 112},
+            vae_tiling.tile_overlap_plan(vae, 0, 16, sample_shape=(120, 512)),
+            {
+                "tile_sample_stride_height": 120,
+                "tile_sample_stride_width": 112,
+            },
         )
 
-    def test_a_single_tile_needs_no_overlap_attributes(self):
+    def test_a_single_tile_sets_zero_on_both_axes(self):
         self.assertEqual(
             vae_tiling.tile_overlap_plan(
-                overlap_factor_vae(), 0.125, sample_shape=(256, 256)
+                overlap_factor_vae(), 0, 0, sample_shape=(256, 256)
             ),
-            {},
+            {
+                "tile_overlap_factor": 0.0,
+                "tile_overlap_factor_height": 0.0,
+                "tile_overlap_factor_width": 0.0,
+            },
         )
 
-    def test_the_fraction_keeps_the_loop_s_two_truncations_agreeing(self):
-        # The loop steps the latent grid by int(latent x (1 - f)) and crops each decoded tile to
-        # pixel - int(pixel x f). Unless those are the same distance, the tiles step by one amount
-        # and are kept by another, and the image assembles to a size nobody asked for - which
-        # nothing downstream checks. f is a float and the two truncations need not fall the same
-        # way, so this is checked by recomputing them rather than by trusting the algebra.
+    def test_exact_pixel_requests_keep_both_loop_truncations_agreeing(self):
         for build in (overlap_factor_vae, overlap_keyed_vae):
-            for asked in self.ASKED:
-                with self.subTest(vae=build.__name__, asked=asked):
+            for asked in (0, 16, 32, 64):
+                with self.subTest(vae=build.__name__, overlap=asked):
                     vae = build()
-                    plan = vae_tiling.tile_overlap_plan(vae, asked)
+                    plan = vae_tiling.tile_overlap_plan(vae, asked, asked)
                     self.assertIsNotNone(plan)
                     vae_tiling.apply_tile_plan(vae, plan)
-                    factor = vae.tile_overlap_factor
+                    factors = (
+                        vae.tile_overlap_factor_height,
+                        vae.tile_overlap_factor_width,
+                    )
                     (down, across), (deep, wide) = vae_tiling.overlap_windows(vae)
-                    for latent, pixel in ((down, deep), (across, wide)):
+                    for latent, pixel, factor in zip(
+                        (down, across), (deep, wide), factors
+                    ):
                         stride = int(latent * (1.0 - factor))
                         self.assertGreaterEqual(stride, 1)
                         self.assertEqual(
                             pixel - int(pixel * factor), stride * (pixel // latent)
                         )
 
-    def test_it_never_steps_wider_than_asked(self):
-        # Where an overlap cannot be taken exactly the step narrows until it lands, never widens,
-        # so a wrong guess errs towards the seams the VAE already had rather than past them.
-        for build in (overlap_factor_vae, overlap_keyed_vae):
-            for asked in self.ASKED:
-                with self.subTest(vae=build.__name__, asked=asked):
-                    vae = build()
-                    vae_tiling.apply_tile_plan(
-                        vae, vae_tiling.tile_overlap_plan(vae, asked)
-                    )
-                    for landed in vae_tiling.tile_overlap(vae):
-                        self.assertGreaterEqual(landed + 1e-9, asked)
+    def test_unrepresentable_overlap_is_refused_without_rounding(self):
+        self.assertIsNone(
+            vae_tiling.tile_overlap_plan(overlap_factor_vae(), 1, 64)
+        )
 
-    def test_an_overlap_of_nothing_is_a_step_of_the_whole_window(self):
-        # The end of the range, where the tiles touch rather than overlap and there is no blend
-        # left. Allowed, because the seams it costs are the caller's to weigh, and worth a case
-        # of its own because a blend no rows deep is a zero that several slices read as "all".
+    def test_zero_overlap_is_a_step_of_the_whole_window(self):
         vae = overlap_factor_vae()
-        vae_tiling.apply_tile_plan(vae, vae_tiling.tile_overlap_plan(vae, 0.0))
+        vae_tiling.apply_tile_plan(vae, vae_tiling.tile_overlap_plan(vae, 0, 0))
         self.assertEqual(vae.tile_overlap_factor, 0.0)
-        self.assertEqual(vae_tiling.tile_overlap(vae), (0.0, 0.0))
+        self.assertEqual(vae_tiling.tile_overlap(vae), (0, 0))
 
-    def test_an_overlap_leaving_no_step_at_all_is_refused_by_name(self):
-        # A fraction close enough to one leaves under a latent pixel to step by, which diffusers
-        # walks with a range() of nothing. Refused rather than clamped, and the refusal names the
-        # most this VAE could take, so it can say something the next attempt can use.
+    def test_an_overlap_as_wide_as_the_window_is_refused(self):
         vae = overlap_factor_vae()
-        self.assertIsNone(vae_tiling.tile_overlap_plan(vae, 0.99))
-        widest = vae_tiling.widest_tile_overlap(vae)
-        self.assertIsNotNone(widest)
-        self.assertIsNotNone(vae_tiling.tile_overlap_plan(vae, widest))
-        self.assertIsNone(vae_tiling.tile_overlap_plan(vae, widest + 0.01))
+        self.assertIsNone(vae_tiling.tile_overlap_plan(vae, 256, 64))
 
 
 class TestTiledDecode(unittest.TestCase):
@@ -763,10 +679,11 @@ class TestTiledDecode(unittest.TestCase):
         vae = _diffusers_vae(self, name, kwargs, require_tiling=True)
         vae.enable_tiling()
 
-        window = vae_tiling.tile_window(vae)
-        pixels, plan = vae_tiling.snap_tile_window(vae, window // 4)
+        window = vae_tiling.tile_shape(vae)
+        shape = tuple(axis // 4 for axis in window)
+        plan = vae_tiling.tile_shape_plan(vae, *shape)
         self.assertIsNotNone(
-            plan, f"{name} refused every window at or below {window // 4}"
+            plan, f"{name} refused exact tile shape {shape}"
         )
         vae_tiling.apply_tile_plan(vae, plan)
         self.assertTrue(
@@ -839,7 +756,7 @@ class TestTiledDecode(unittest.TestCase):
                     before = self._sample(vae.tiled_decode(latents))
                 at_own = len(counted.shapes)
 
-                plan = vae_tiling.tile_overlap_plan(vae, 0.0)
+                plan = vae_tiling.tile_overlap_plan(vae, 0, 0)
                 self.assertIsNotNone(plan, f"{name} refused a step of its whole window")
                 vae_tiling.apply_tile_plan(vae, plan)
                 counted.shapes.clear()
@@ -978,10 +895,11 @@ class TestStrideTiledDecode(unittest.TestCase):
         vae = _diffusers_vae(self, name, {**kwargs, **extra}, require_tiling=True)
         vae.enable_tiling()
 
-        window = vae_tiling.tile_window(vae)
-        pixels, plan = vae_tiling.snap_tile_window(vae, window // 2)
+        window = vae_tiling.tile_shape(vae)
+        shape = tuple(axis // 2 for axis in window)
+        plan = vae_tiling.tile_shape_plan(vae, *shape)
         self.assertIsNotNone(
-            plan, f"{name} refused every window at or below {window // 2}"
+            plan, f"{name} refused exact tile shape {shape}"
         )
         vae_tiling.apply_tile_plan(vae, plan)
         self.assertTrue(
@@ -1079,7 +997,7 @@ class TestStrideTiledDecode(unittest.TestCase):
                     before = vae.tiled_decode(latents, *args).sample
                 at_own = self._tiles_across(vae, latents)
 
-                plan = vae_tiling.tile_overlap_plan(vae, 0.0)
+                plan = vae_tiling.tile_overlap_plan(vae, 0, 0)
                 self.assertIsNotNone(plan, f"{name} refused a step of its whole window")
                 vae_tiling.apply_tile_plan(vae, plan)
                 self.assertLess(self._tiles_across(vae, latents), at_own)
