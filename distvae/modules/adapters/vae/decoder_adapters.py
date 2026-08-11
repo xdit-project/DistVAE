@@ -92,6 +92,7 @@ class DecoderAdapter(nn.Module):
         # immutable context, then discard every one of those layers below.
         self.decoder = PatchDecoder.__new__(PatchDecoder)
         nn.Module.__init__(self.decoder)
+        self.decoder.gradient_checkpointing = decoder.gradient_checkpointing
         self.decoder.layers_per_block = decoder.layers_per_block
         self.decoder.conv_in = decoder.conv_in
         self.decoder.mid_block = decoder.mid_block
@@ -108,6 +109,7 @@ class DecoderAdapter(nn.Module):
         self.decoder.patch = Patchify(**options)
         self.decoder.depatch = DePatchify(**options)
         self.vae_group = vae_group
+        self.train(decoder.training)
 
     def forward(
         self,

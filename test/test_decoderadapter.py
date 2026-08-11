@@ -56,7 +56,13 @@ def worker(rank, world_size, height, width, conv_block_size, seed, master_port):
 
             adapter = DecoderAdapter(
                 decoder, vae_group=None, conv_block_size=conv_block_size
-            ).eval()
+            )
+            assert adapter.training is decoder.training
+            assert adapter.decoder.training is decoder.training
+            assert (
+                adapter.decoder.gradient_checkpointing
+                is decoder.gradient_checkpointing
+            )
             actual = adapter(latents)
 
         # The sharded GroupNorm sums its statistics across ranks in float32 before dividing, so
