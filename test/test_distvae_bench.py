@@ -249,6 +249,35 @@ def test_vae_normalizer_rejects_windows_with_too_few_latent_rows(monkeypatch):
     assert normalize((256, 256), (32, 32)) is None
 
 
+def test_vae_normalizer_rejects_windows_that_band(monkeypatch):
+    """A tile large enough to shard can still be too small to normalize over.
+
+    Sharding needs one latent row per rank; representative statistics need considerably more.
+    Searching overlap made small windows reachable for the first time, so this bound is what
+    stops the memory profile choosing a tile that decodes at a visibly different tone from its
+    neighbours - a difference the blend smooths into a ramp, which no seam metric detects.
+    """
+    vae = object()
+    extent = cases.MIN_TILE_LATENT_EXTENT - 1
+    assert extent > 4, "the bound must bind harder than the world sizes we run"
+    monkeypatch.setattr(cases.vae_api, "tile_shape", lambda value: (64, 64))
+    monkeypatch.setattr(
+        cases.vae_api,
+        "tile_shape_plan",
+        lambda value, height, width: {"window": (height, width)},
+    )
+    monkeypatch.setattr(cases, "latent_rows", lambda value, plan: extent)
+    monkeypatch.setattr(
+        cases.vae_api,
+        "tile_overlap_plan",
+        lambda *args, **kwargs: pytest.fail("a banding window reached overlap planning"),
+    )
+
+    normalize = cases.normalizer_for_vae(vae, (512, 512), world_size=4)
+
+    assert normalize((256, 256), (32, 32)) is None
+
+
 def test_default_suite_is_bounded_to_nine_cases():
     plans = cases.select_plans(
         sample_shape=(1024, 2048),

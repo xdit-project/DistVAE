@@ -10,6 +10,27 @@ from distvae.vae.tiling import latent_rows
 PROFILES = ("throughput", "balanced", "memory")
 MODES = ("unsharded", "row", "local", "tile-runs", "row-tiled")
 
+# The smallest latent extent a tile may have on its narrower axis. Below roughly this, a tile
+# normalizes over content too unrepresentative of the image and comes out at a different tone
+# from its neighbours. The blend then ramps that difference across the overlap rather than
+# stepping at the join, so it reads as banding and no seam metric detects it: the join is smooth,
+# the tone is wrong.
+#
+# In latent units rather than pixels, deliberately, because that is what carries across families
+# - a scale-16 VAE reaches the same bound at twice the pixel height a scale-8 one does. A
+# fraction of the VAE's native window would NOT carry: FLUX.2's native tile is 128 latent and
+# Wan's is 16, so one percentage would mean an eight-fold difference in strictness between them.
+# A fraction of the sample would be wrong in a different way, making an identical tile legal at
+# one canvas size and illegal at another when the tile's own statistics do not depend on the
+# canvas it was cut from.
+#
+# 16 is where two unrelated families agree. Measured on FLUX.2 at 1024x1024 on four ranks, a
+# 96px window is 12 latent and bands visibly while a 128px window is 16 and does not, which
+# brackets the threshold at (12, 16]; and Wan's own native tile is exactly 16 latent, so raising
+# this bound would reject a vendor default. The bracket has not been narrowed further - 13, 14
+# and 15 are untested - so treat 16 as the conservative end of a measurement, not a precise edge.
+MIN_TILE_LATENT_EXTENT = 16
+
 
 def parse_pair(value, label):
     """Parse an exact HEIGHTxWIDTH integer pair."""
@@ -302,8 +323,14 @@ def normalizer_for_vae(vae, sample_shape, world_size):
                 shape_plan = vae_api.tile_shape_plan(vae, height, width)
                 if shape_plan is None:
                     continue
-                rows = latent_rows(vae, shape_plan)
-                if rows is not None and rows < world_size:
+                # `latent_rows` reports the SMALLER of the tile's two latent extents, so this
+                # bounds the narrow axis whichever one it is. A tile needs enough of it both to
+                # shard across the ranks and to normalize over something representative; the
+                # second is the binding constraint at every world size we run. Without it the
+                # widened overlap search reaches genuinely small windows for the first time and
+                # the memory profile selects them - it picked 9 latent rows on FLUX.2 at 1024.
+                extent = latent_rows(vae, shape_plan)
+                if extent is not None and extent < max(world_size, MIN_TILE_LATENT_EXTENT):
                     continue
                 original = {}
                 missing = []
