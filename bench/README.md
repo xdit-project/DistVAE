@@ -32,18 +32,24 @@ torchrun --nproc_per_node=4 bench/distvae_bench.py \
   --out flux2-decoder-2048.json
 ```
 
-The suite has nine cases:
+The suite carries only the compositions a caller can select:
 
 1. unsharded, untiled
 2. row sharded, untiled
-3. local tiling at the throughput, balanced, and memory plans
-4. whole-tile distribution at the same three plans
-5. row sharding plus the lightest plan
+3. whole-tile distribution at each selected plan
 
-Seven where the sample offers no distinct memory plan, which happens when the lightest plan on
-the frontier is also the fastest. A memory profile has to be strictly lighter than the
-throughput one to be worth two cases; on a square sample the runner-up is otherwise throughput's
-own transpose, scoring identically and measuring materially heavier.
+Five cases where the sample supports three plans, four where it supports two. A memory profile
+has to be strictly lighter than the throughput one to be worth its own cases; on a square sample
+the runner-up is otherwise throughput's own transpose, scoring identically on every objective
+and measuring materially heavier.
+
+`--diagnostics` adds local tiling at each plan and row sharding beneath the lightest plan. An
+orchestrator reaches neither - xFuser branches straight between marking a VAE for tile
+parallelism and parallelizing its decoder, with nothing in between - and together they are about
+60% of the suite's compute. They are worth their cost when characterising a new geometry rather
+than comparing plans: `local` is the only case with no collectives at all, so it separates what
+tiling does to the decode from what the collectives cost, and its peak is the true floor for a
+window.
 
 Tiling is decode-only. `--half encoder` runs the two untiled baselines.
 

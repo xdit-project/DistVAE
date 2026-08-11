@@ -419,14 +419,25 @@ def plans_for_vae(vae, height, width, world_size):
     )
 
 
-def default_suite(plans, height, width, frames):
+def default_suite(plans, height, width, frames, diagnostics=False):
     """Build the bounded suite from the selected tile plans.
 
-    Nine cases where the sample supports three distinct plans, seven where the lightest plan is
-    also the fastest and there is no honest third - see select_plans.
+    By default only the compositions an orchestrator can actually select: the two untiled
+    baselines and whole-tile distribution at each plan. `local` tiles without distributing and
+    `row-tiled` shards rows beneath the tiling, and callers reach neither - xFuser, for one,
+    branches straight between marking a VAE for tile parallelism and parallelizing its decoder,
+    with nothing in between. They are also the slow ones, together about 60% of the suite's
+    compute at 1024x1024 on four ranks, which is a poor trade for a number nobody can act on.
+
+    `diagnostics` puts them back. They earn it when characterising a new geometry rather than
+    comparing plans: `local` is the only case with no collectives at all, so it separates what
+    tiling does to the decode from what the collectives cost, and its peak is the true floor for
+    a window - 651 MB against tile-runs' 806 MB on that sample, the difference being assembly
+    rather than tile.
     """
     suite = baseline_suite(height, width, frames)
-    for mode in ("local", "tile-runs"):
+    modes = ("local", "tile-runs") if diagnostics else ("tile-runs",)
+    for mode in modes:
         for plan in plans:
             window, overlap, profile = (
                 plan["window"],
@@ -446,23 +457,25 @@ def default_suite(plans, height, width, frames):
                     plan_selection=plan,
                 )
             )
-    # Row sharding on top of tiling is only worth a case at the lightest plan, which is the
-    # memory one where the sample offers a distinct memory plan and the throughput one where it
-    # does not.
-    lightest = min(plans, key=lambda plan: plan["objectives"]["window_area"])
-    suite.append(
-        _cell(
-            f"row-tiled-{lightest['profile']}",
-            "row-tiled",
-            height,
-            width,
-            frames,
-            lightest["window"],
-            lightest["overlap"],
-            profile=lightest["profile"],
-            plan_selection=lightest,
+    if diagnostics:
+        # Row sharding beneath the tiling, at the plan the objectives call lightest - the memory
+        # one where the sample offers a distinct memory plan, the throughput one where it does
+        # not. Lightest by predicted window area, which is a model's opinion rather than a
+        # measurement, and one more reason this belongs with the diagnostics.
+        lightest = min(plans, key=lambda plan: plan["objectives"]["window_area"])
+        suite.append(
+            _cell(
+                f"row-tiled-{lightest['profile']}",
+                "row-tiled",
+                height,
+                width,
+                frames,
+                lightest["window"],
+                lightest["overlap"],
+                profile=lightest["profile"],
+                plan_selection=lightest,
+            )
         )
-    )
     return suite
 
 

@@ -348,24 +348,46 @@ def test_vae_normalizer_rejects_windows_that_band(monkeypatch):
     assert normalize((256, 256), (32, 32)) is None
 
 
-def test_default_suite_is_bounded_to_nine_cases():
-    plans = cases.select_plans(
+def _bounded_plans():
+    return cases.select_plans(
         sample_shape=(1024, 2048),
         native_overlap=(64, 64),
         world_size=4,
         normalize=lambda window, overlap: (window, overlap),
     )
 
+
+def test_default_suite_carries_only_selectable_compositions():
+    """Local tiling and row-beneath-tiling are not reachable, so they are not the default.
+
+    An orchestrator branches between marking a VAE for tile parallelism and parallelizing its
+    decoder, and never lands between the two. Those cases are also about 60% of the suite's
+    compute, which is a poor trade for a number nobody can act on.
+    """
+    plans = _bounded_plans()
+
     suite = cases.default_suite(plans, 1024, 2048, 1)
 
-    assert len(suite) == 9
     assert [cell["name"] for cell in suite[:2]] == ["unsharded", "row"]
-    assert sum(cell["tile_distribution"] == "runs" for cell in suite) == 3
+    assert len(suite) == 2 + len(plans)
+    assert sum(cell["tile_distribution"] == "runs" for cell in suite) == len(plans)
+    assert not [cell for cell in suite if cell["mode"] in ("local", "row-tiled")]
+
+
+def test_diagnostics_restore_the_unreachable_compositions():
+    plans = _bounded_plans()
+
+    suite = cases.default_suite(plans, 1024, 2048, 1, diagnostics=True)
+
+    assert len(suite) == 2 + 2 * len(plans) + 1
+    assert [cell["name"] for cell in suite[:2]] == ["unsharded", "row"]
+    assert sum(cell["mode"] == "local" for cell in suite) == len(plans)
+    lightest = min(plans, key=lambda plan: plan["objectives"]["window_area"])
     assert [
         cell["profile"]
         for cell in suite
         if cell["sharding"] == "row" and cell["window"] is not None
-    ] == ["memory"]
+    ] == [lightest["profile"]]
 
 
 def test_encoder_baseline_suite_has_no_decode_only_tiling():

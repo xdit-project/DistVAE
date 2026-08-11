@@ -44,6 +44,14 @@ def parser():
         ),
     )
     value.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help=(
+            "add the local and row-tiled compositions, which no orchestrator selects "
+            "but which isolate tiling from its collectives"
+        ),
+    )
+    value.add_argument(
         "--phase-timing",
         action="store_true",
         help="measure decoder calls separately from tiled decode overhead",
@@ -190,7 +198,11 @@ def _measure(args, cells, runtime, provenance_data=None):
                 plans = cases.plans_for_vae(
                     selector, height, width, runtime.world_size
                 )
-                cells.extend(cases.default_suite(plans, height, width, frames))
+                cells.extend(
+                    cases.default_suite(
+                        plans, height, width, frames, diagnostics=args.diagnostics
+                    )
+                )
 
     references = {}
     records = []
