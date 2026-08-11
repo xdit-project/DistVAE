@@ -213,8 +213,10 @@ def test_overlap_ladder_scales_with_pitch_and_keeps_the_native_value():
     assert 256 in options, "the native overlap must stay reachable for comparability"
     assert options == tuple(sorted(options, reverse=True)), "widest first"
     assert all(option > 0 for option in options)
-    # Pitch is 256 here, so the ladder is halves, quarters and eighths of it.
-    assert {128, 64, 32} <= set(options)
+    # Pitch is 256 here. The ladder stops at a third of the pitch, which is a quarter of the
+    # window it blends, so halves and thirds survive and the thinner rungs that band are gone.
+    assert {128, 86} <= set(options)
+    assert min(options) * 3 >= 256
 
 
 def test_selector_keeps_every_blend_above_a_quarter_of_its_window():
