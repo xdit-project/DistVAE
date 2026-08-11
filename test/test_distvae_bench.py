@@ -118,6 +118,53 @@ def test_additional_shapes_are_explicit_and_do_not_mix_with_exact_cases():
         cases.cells_from_args(mixed)
 
 
+def test_matrix_runs_the_family_shapes_and_yields_to_an_explicit_one():
+    """The matrix is a default, not an override: asking for a shape by hand still wins.
+
+    Appending instead would make `--shape` mean "and also", so a one-off check of a single size
+    would quietly drag the whole family's matrix along with it.
+    """
+    matrix = cli.parser().parse_args(["--family", "wan", "--matrix"])
+    assert cases.shapes_from_args(matrix) == [(832, 480, 81), (1280, 720, 81)]
+
+    overridden = cli.parser().parse_args(
+        ["--family", "wan", "--matrix", "--shape", "512x512x5"]
+    )
+    assert cases.shapes_from_args(overridden) == [(512, 512, 5)]
+
+    single = cli.parser().parse_args(["--family", "wan", "--height", "256"])
+    assert cases.shapes_from_args(single) == [(256, 2048, 17)]
+
+
+@pytest.mark.parametrize("family", sorted(catalog.FAMILIES))
+def test_every_catalogued_shape_is_legal_for_its_own_family(family):
+    """A matrix runs unattended, so an illegal shape has to fail before anything is measured.
+
+    Both bounds come from the family rather than from the shape: an axis has to divide by the
+    spatial ratio, and a temporal family needs one frame plus a multiple of its ratio. Left to
+    `sample_for` these surface partway through the third shape, after the first two have been
+    paid for.
+    """
+    spec = catalog.FAMILIES[family]
+    if not spec.get("shapes"):
+        pytest.skip(f"{family} has no canonical shapes")
+
+    for height, width, frames in catalog.matrix_for(family):
+        assert height % spec["spatial"] == 0
+        assert width % spec["spatial"] == 0
+        if spec["temporal"]:
+            assert (frames - 1) % spec["temporal"] == 0
+        catalog.sample_for(
+            spec, "decoder", height, width, "bfloat16", "meta", frames=frames
+        )
+
+
+def test_matrix_refuses_a_family_it_has_no_shapes_for():
+    assert not catalog.FAMILIES["ltx2"].get("shapes")
+    with pytest.raises(ValueError, match="no canonical shapes"):
+        catalog.matrix_for("ltx2")
+
+
 @pytest.mark.parametrize(
     "value",
     ["none", "row:256x256@32x32", "local:256@32x32", "local:256x256"],
@@ -497,6 +544,42 @@ def test_provenance_records_explicit_hardware_family(monkeypatch):
     monkeypatch.setenv("HW_FAMILY", "mi355")
 
     assert report.provenance()["provenance"]["hardware_family"] == "mi355"
+
+
+def test_provenance_measures_the_device_rather_than_trusting_the_label(monkeypatch):
+    """HW_FAMILY is whatever the caller typed; the device is what the run actually used.
+
+    For a long time the label was the only hardware field there was, and since nothing set it
+    every report said null - so two machines' numbers were separable only by hostname. gcnArchName
+    is the part that distinguishes AMD generations, where the marketing name repeats across them.
+    """
+    monkeypatch.delenv("HW_FAMILY", raising=False)
+    monkeypatch.setattr(report.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(report.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(report.torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(
+        report.torch.cuda,
+        "get_device_properties",
+        lambda index: SimpleNamespace(
+            name="AMD Radeon Graphics", gcnArchName="gfx1201", total_memory=34342961152
+        ),
+    )
+
+    recorded = report.provenance()["provenance"]
+
+    assert recorded["hardware_family"] is None
+    assert recorded["device"] == {
+        "name": "AMD Radeon Graphics",
+        "arch": "gfx1201",
+        "total_memory": 34342961152,
+        "count": 4,
+    }
+
+
+def test_provenance_survives_a_run_with_no_accelerator(monkeypatch):
+    monkeypatch.setattr(report.torch.cuda, "is_available", lambda: False)
+
+    assert report.provenance()["provenance"]["device"] is None
 
 
 def test_rank_error_helpers_preserve_original_rank_and_type(monkeypatch):

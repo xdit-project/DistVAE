@@ -30,6 +30,14 @@ def parser():
         action="append",
         help="explicit HxW or HxWxFRAMES input shape; repeat to request more",
     )
+    value.add_argument(
+        "--matrix",
+        action="store_true",
+        help=(
+            "run the family's canonical shapes, so a pinned commit fixes what was "
+            "measured; overridden by --shape"
+        ),
+    )
     value.add_argument("--dtype", default="bfloat16", choices=sorted(measure.MAX_REL))
     value.add_argument("--warmup", type=int, default=2)
     value.add_argument("--iters", type=int, default=5)

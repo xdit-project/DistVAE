@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def _version(distribution, module=None):
@@ -99,6 +99,29 @@ def _benchmark_identity():
         return None
 
 
+def _device_identity():
+    """Describe the accelerator this run measured, or None where there is not one.
+
+    A latency and a peak in megabytes mean nothing without the part they were measured on, and
+    until this existed the only field that could have said was `hardware_family`, read from an
+    environment variable nothing sets - so every report claimed null and two machines' results
+    were distinguishable only by hostname. `gcnArchName` is the field that separates one AMD
+    generation from another; `name` alone reports marketing names that repeat across them.
+    """
+    try:
+        if not torch.cuda.is_available():
+            return None
+        properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    except (AssertionError, RuntimeError):
+        return None
+    return {
+        "name": properties.name,
+        "arch": getattr(properties, "gcnArchName", None),
+        "total_memory": getattr(properties, "total_memory", None),
+        "count": torch.cuda.device_count(),
+    }
+
+
 def provenance():
     """Return library versions and the DistVAE source revision when available."""
     import diffusers
@@ -113,7 +136,10 @@ def provenance():
         "provenance": {
             "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "host": socket.gethostname(),
+            # A label the caller can set to name a fleet or a node type. The measured identity
+            # below is the one to compare on.
             "hardware_family": os.environ.get("HW_FAMILY"),
+            "device": _device_identity(),
             "python": platform.python_version(),
             "argv": list(sys.argv),
             "benchmark": _benchmark_identity(),

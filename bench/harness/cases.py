@@ -100,8 +100,19 @@ def cells_from_args(args):
 
 
 def shapes_from_args(args):
-    """Return explicitly requested sample shapes or the single global shape."""
+    """Return the requested sample shapes, most explicit request first.
+
+    `--shape` beats `--matrix` beats the single `--height/--width/--frames`, so asking for one
+    shape by hand always overrides the family's matrix rather than being appended to it.
+    """
     if not args.shape:
+        if getattr(args, "matrix", False):
+            # Imported here rather than at module scope because catalog builds VAEs and so pulls
+            # in diffusers; nothing else in this module needs it, and the planner is exercised
+            # without a model.
+            from . import catalog
+
+            return list(catalog.matrix_for(args.family))
         return [(args.height, args.width, args.frames)]
     shapes = []
     for value in args.shape:

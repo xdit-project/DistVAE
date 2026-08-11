@@ -13,14 +13,44 @@ with `torchrun`.
 - `diffusers`
 - DistVAE installed from the revision being measured
 
-The report records package versions, the DistVAE checkout revision when available, and a digest
-of the benchmark sources. Set `HW_FAMILY` to add your own hardware label:
+The report records package versions, the DistVAE checkout revision when available, a digest of
+the benchmark sources, and the accelerator it measured on - name, `gcnArchName`, total memory and
+device count, under `provenance.device`. Compare on that: a latency and a peak in megabytes mean
+nothing without the part they came from.
+
+`HW_FAMILY` adds your own label alongside it, for naming a fleet or a node type:
 
 ```bash
 HW_FAMILY=mi355 torchrun --nproc_per_node=8 bench/distvae_bench.py ...
 ```
 
-No hardware label is inferred when the variable is absent.
+The label is null when the variable is absent; the measured device is recorded either way.
+
+## Reproducing a run elsewhere
+
+`--matrix` runs the family's canonical shapes rather than one:
+
+```bash
+torchrun --nproc_per_node=4 bench/distvae_bench.py \
+  --family wan --half decoder --matrix --out wan-decoder.json
+```
+
+| family | shapes (height x width x frames) |
+| --- | --- |
+| `flux2` | 1024x1024, 2048x2048 |
+| `kl` | 1024x1024, 2048x2048 |
+| `qwen_image` | 1024x1024x1, 2048x2048x1 |
+| `wan` | 832x480x81, 1280x720x81 |
+
+The shapes live in `FAMILIES` in `harness/catalog.py`, beside the architecture they belong to,
+so a commit fixes them: quoting the revision is enough to say what was measured, and two runs of
+it measured the same thing. `--shape` still overrides `--matrix` for a one-off. Frames are
+carried even where a family has no temporal axis and discards them, so every entry reads alike;
+Qwen-Image is a 3D VAE that ships as a single-image model, hence one frame rather than a
+video-shaped default.
+
+Wan at 1280x720x81 is 21 latent frames, and the unsharded case may not fit. That is recorded per
+cell and the tiled arms still run - it is also the plainest statement of why tiling exists.
 
 ## The bounded suite
 
