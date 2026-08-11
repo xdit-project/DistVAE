@@ -38,15 +38,33 @@ The suite has nine cases:
 2. row sharded, untiled
 3. local tiling at the throughput, balanced, and memory plans
 4. whole-tile distribution at the same three plans
-5. row sharding plus the memory plan
+5. row sharding plus the lightest plan
+
+Seven where the sample offers no distinct memory plan, which happens when the lightest plan on
+the frontier is also the fastest. A memory profile has to be strictly lighter than the
+throughput one to be worth two cases; on a square sample the runner-up is otherwise throughput's
+own transpose, scoring identically and measuring materially heavier.
 
 Tiling is decode-only. `--half encoder` runs the two untiled baselines.
 
-The planner enumerates tile grids up to four tiles per rank, validates each rectangular window
-and absolute overlap through DistVAE, and removes candidates dominated on window area, decoded
-area, and rank imbalance. It then chooses the least-work plan, a frontier knee, and the
-smallest-window plan. An inactive strip axis receives zero overlap. The JSON records every
-objective, the frontier size, and the candidate limit.
+The planner enumerates tile grids up to four tiles per rank and, at each grid, a ladder of
+overlaps down to a quarter of the window. It validates every rectangular window and absolute
+overlap through DistVAE and removes candidates dominated on window area, decoded area, rank
+imbalance, and tile columns. It then chooses the least-work plan, a frontier knee, and the
+smallest-window plan, each with a distinct window. An inactive strip axis receives zero overlap.
+The JSON records every objective, the frontier size, and the candidate limit.
+
+Three bounds shape which plans are reachable, and each is a measurement rather than a margin:
+
+- **Overlap is searched, not pinned.** A tile is a memory win over row sharding only when its
+  window area is under the `(height / ranks) * width` a rank already holds. Since window is
+  pitch plus overlap, pinning overlap at the VAE native value floors every window at that value
+  and, on a 1024x1024 sample at four ranks, made the whole suite memory-neutral by construction.
+- **A blend is at least a quarter of its window.** Overlap decides whether a tile's tone drift
+  from its neighbours reads as a gradient or a band. At 128x1024 on FLUX.2, a 32px blend is
+  clean and a 16px blend bands.
+- **A tile is at least sixteen latent on its narrow axis.** Below that a tile normalizes over
+  content too unrepresentative of the image, and no blend repairs it.
 
 Selection uses topology only. Hardware timings never feed back into the plans, so machines run
 the same suite when family, shape, and world size match.

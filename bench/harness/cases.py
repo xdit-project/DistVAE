@@ -194,18 +194,26 @@ def topology_objectives(window, overlap, sample_shape, world_size):
         "tile_grid": tuple(len(sizes) for sizes in axis_sizes),
         "row_shard_area": row_shard_area,
         "beats_row_sharding": window_area < row_shard_area,
+        # How many tile columns the grid has, which is the one thing separating a plan from its
+        # transpose. Area, work and imbalance are all symmetric under transpose, so without this
+        # the model cannot tell a full-WIDTH strip from a full-HEIGHT one - and the hardware very
+        # much can. Measured on FLUX.2 at 1024x1024 on four ranks, at identical window area and
+        # tile count: 128x1024 costs 966 MB against 1024x128's 1126 MB under tile-runs, and
+        # 651 MB against 812 MB under local. A wide tile is a few long contiguous spans and a
+        # tall one is a row of short ones, so fewer columns is cheaper at the same area.
+        "tile_columns": len(axis_sizes[1]),
     }
 
 
 def _dominates(left, right):
-    keys = ("window_area", "decoded_area", "rank_imbalance")
+    keys = ("window_area", "decoded_area", "rank_imbalance", "tile_columns")
     return all(left[key] <= right[key] for key in keys) and any(
         left[key] < right[key] for key in keys
     )
 
 
 def pareto_frontier(candidates):
-    """Return candidates not dominated on memory, work, and rank imbalance."""
+    """Return candidates not dominated on memory, work, imbalance, and tile columns."""
     return [
         candidate
         for candidate in candidates
@@ -282,7 +290,7 @@ def select_plans(sample_shape, native_overlap, world_size, normalize):
                         "objectives": objectives,
                     }
     frontier = pareto_frontier(list(candidates.values()))
-    if len(frontier) < 3:
+    if len(frontier) < 2:
         raise ValueError(
             f"sample {sample_shape} produces only {len(frontier)} useful tile plans"
         )
@@ -301,14 +309,33 @@ def select_plans(sample_shape, native_overlap, world_size, normalize):
             item["objectives"]["window_area"],
             item["objectives"]["decoded_area"],
             item["objectives"]["rank_imbalance"],
+            item["objectives"]["tile_columns"],
             item["window"],
         ),
     )
-    balanced = min(
-        (item for item in frontier if item not in (throughput, memory)),
-        key=lambda item: _balanced_key(item, frontier),
+    # A memory profile has to be lighter than the throughput one or it is not a memory profile.
+    # It used to be merely DIFFERENT, which on a square sample hands back throughput's transpose:
+    # area, work and imbalance are symmetric under transpose, so 1024x128 scored identically to
+    # the 128x1024 already chosen while measuring 17% heavier on the hardware. Where the lightest
+    # plan is also the fastest, the honest answer is two profiles rather than a third that is
+    # only nominally distinct.
+    if memory["objectives"]["window_area"] >= throughput["objectives"]["window_area"]:
+        memory = None
+    # Distinct by WINDOW, not by identity. Two frontier points can share a window and differ only
+    # in blend, and 832x128 blended 36px against the same window blended 34px is not two profiles
+    # worth two cases each.
+    taken = {plan["window"] for plan in (throughput, memory) if plan is not None}
+    remaining = [item for item in frontier if item["window"] not in taken]
+    balanced = (
+        min(remaining, key=lambda item: _balanced_key(item, frontier))
+        if remaining
+        else None
     )
-    selected = (throughput, balanced, memory)
+    selected = [
+        (profile, plan)
+        for profile, plan in zip(PROFILES, (throughput, balanced, memory))
+        if plan is not None
+    ]
     return [
         {
             **plan,
@@ -319,7 +346,7 @@ def select_plans(sample_shape, native_overlap, world_size, normalize):
                 "candidate_limit": max_tiles,
             },
         }
-        for profile, plan in zip(PROFILES, selected)
+        for profile, plan in selected
     ]
 
 
@@ -393,7 +420,11 @@ def plans_for_vae(vae, height, width, world_size):
 
 
 def default_suite(plans, height, width, frames):
-    """Build the bounded nine-case suite from three selected tile plans."""
+    """Build the bounded suite from the selected tile plans.
+
+    Nine cases where the sample supports three distinct plans, seven where the lightest plan is
+    also the fastest and there is no honest third - see select_plans.
+    """
     suite = baseline_suite(height, width, frames)
     for mode in ("local", "tile-runs"):
         for plan in plans:
@@ -415,18 +446,21 @@ def default_suite(plans, height, width, frames):
                     plan_selection=plan,
                 )
             )
-    memory = next(plan for plan in plans if plan["profile"] == "memory")
+    # Row sharding on top of tiling is only worth a case at the lightest plan, which is the
+    # memory one where the sample offers a distinct memory plan and the throughput one where it
+    # does not.
+    lightest = min(plans, key=lambda plan: plan["objectives"]["window_area"])
     suite.append(
         _cell(
-            "row-tiled-memory",
+            f"row-tiled-{lightest['profile']}",
             "row-tiled",
             height,
             width,
             frames,
-            memory["window"],
-            memory["overlap"],
-            profile="memory",
-            plan_selection=memory,
+            lightest["window"],
+            lightest["overlap"],
+            profile=lightest["profile"],
+            plan_selection=lightest,
         )
     )
     return suite

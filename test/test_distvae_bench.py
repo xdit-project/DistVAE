@@ -250,6 +250,43 @@ def test_selector_keeps_every_blend_above_a_quarter_of_its_window():
         assert blend * 4 >= size, f"{blend}px blends a {size}px window"
 
 
+def test_selector_declines_a_memory_profile_that_is_only_a_transpose():
+    """A memory profile has to be lighter, not merely different.
+
+    Window area, decoded area and rank imbalance are all symmetric under transpose, so on a
+    square sample the runner-up to throughput used to be throughput's own mirror - scoring
+    identically while measuring 17% heavier on the hardware, because a full-width strip is a few
+    long contiguous spans and a full-height one is a row of short ones.
+    """
+    plans = cases.select_plans(
+        sample_shape=(1024, 1024),
+        native_overlap=(256, 256),
+        world_size=4,
+        normalize=lambda window, overlap: (window, overlap),
+    )
+
+    by_profile = {plan["profile"]: plan for plan in plans}
+    throughput = by_profile["throughput"]
+    memory = by_profile.get("memory")
+    if memory is not None:
+        assert (memory["objectives"]["window_area"]
+                < throughput["objectives"]["window_area"])
+        assert tuple(reversed(memory["window"])) != throughput["window"]
+    assert len({plan["window"] for plan in plans}) == len(plans)
+
+
+def test_tile_columns_separate_a_plan_from_its_transpose():
+    wide = cases.topology_objectives((128, 1024), (32, 0), (1024, 1024), 4)
+    tall = cases.topology_objectives((1024, 128), (0, 32), (1024, 1024), 4)
+
+    assert wide["window_area"] == tall["window_area"], "the transpose is the point"
+    assert wide["tile_columns"] == 1
+    assert tall["tile_columns"] > 1
+    # Equal on every symmetric objective, so only tile_columns can prefer the cheaper one.
+    assert cases._dominates(wide, tall)
+    assert not cases._dominates(tall, wide)
+
+
 def test_row_shard_area_is_recorded_against_every_plan():
     objectives = cases.topology_objectives(
         window=(72, 72),
