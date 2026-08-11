@@ -237,7 +237,14 @@ def _balanced_key(candidate, frontier):
 
 
 def select_plans(sample_shape, native_overlap, world_size, normalize):
-    """Select throughput, knee, and memory representatives from a bounded frontier."""
+    """Select throughput, knee, and memory representatives from a bounded frontier.
+
+    Throughput is the lowest critical path and, since that is usually level across plans, in
+    practice the smallest window. Memory is the smallest window outright and balanced the knee
+    between them, so throughput and memory now coincide on most samples and two plans come back
+    rather than three - which is the honest answer where lighter and faster are the same
+    direction, as measurement says they are.
+    """
     if world_size < 1:
         raise ValueError("world size must be positive")
     max_tiles = max(4, 4 * world_size)
@@ -294,12 +301,28 @@ def select_plans(sample_shape, native_overlap, world_size, normalize):
         raise ValueError(
             f"sample {sample_shape} produces only {len(frontier)} useful tile plans"
         )
+    # Price the critical path first, then the window. A decode finishes when its slowest rank
+    # does, so the area the busiest rank holds is what becomes wall clock - but the scheduler
+    # levels that by construction, and in practice it comes out equal across every plan on a
+    # sample: 786432 for all three at 1024x1024 on two ranks, 1572864 for all three at 2048x2048
+    # on four. It almost never decides anything, so what follows it does.
+    #
+    # What follows it is window area, because that is what measurement supports. Across eight
+    # tiled arms on FLUX.2 the smaller window was faster every time, monotonically - at 2048x2048
+    # on four ranks 768x2048 ran 0.441 s, 384x2048 0.396 s and 192x2048 0.374 s. Selecting on
+    # decoded_area instead ordered them exactly backwards, because a wide tile overlaps its
+    # neighbours fewer times and so does least total work while being slowest. Redundant overlap
+    # is evidently cheap next to whatever a large window costs, so do not price the work.
+    #
+    # The minimum is always on the frontier, so this needs no new domination key: max_rank_area
+    # is decoded_area over the ranks times one plus rank_imbalance, and window area is a key
+    # already.
     throughput = min(
         frontier,
         key=lambda item: (
-            item["objectives"]["decoded_area"],
-            item["objectives"]["rank_imbalance"],
-            -item["objectives"]["window_area"],
+            item["objectives"]["max_rank_area"],
+            item["objectives"]["window_area"],
+            item["objectives"]["tile_columns"],
             item["window"],
         ),
     )

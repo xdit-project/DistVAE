@@ -275,6 +275,26 @@ def test_selector_declines_a_memory_profile_that_is_only_a_transpose():
     assert len({plan["window"] for plan in plans}) == len(plans)
 
 
+def test_throughput_plan_minimises_the_critical_path_not_the_total_work():
+    """A decode finishes when its slowest rank does, so the busiest rank's area is the clock.
+
+    Selecting on decoded_area instead picked the widest windows, since a wide tile overlaps its
+    neighbours fewer times - and those measured as the slowest tiled arms. On FLUX.2 at 1024x1024
+    on two ranks, 768x1024 ran 0.199 s against 192x1024's 0.175 s.
+    """
+    plans = cases.select_plans(
+        sample_shape=(1024, 1024),
+        native_overlap=(256, 256),
+        world_size=2,
+        normalize=lambda window, overlap: (window, overlap),
+    )
+    throughput = next(plan for plan in plans if plan["profile"] == "throughput")
+
+    assert throughput["objectives"]["max_rank_area"] == min(
+        plan["objectives"]["max_rank_area"] for plan in plans
+    ), "the throughput plan must not be beaten on critical path by its own siblings"
+
+
 def test_tile_columns_separate_a_plan_from_its_transpose():
     wide = cases.topology_objectives((128, 1024), (32, 0), (1024, 1024), 4)
     tall = cases.topology_objectives((1024, 128), (0, 32), (1024, 1024), 4)
