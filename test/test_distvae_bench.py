@@ -217,6 +217,37 @@ def test_overlap_ladder_scales_with_pitch_and_keeps_the_native_value():
     assert {128, 64, 32} <= set(options)
 
 
+def test_selector_keeps_every_blend_above_a_quarter_of_its_window():
+    """Tile size sets how far a tile's tone drifts; overlap sets whether that reads as a band.
+
+    Measured on FLUX.2 at 1024x1024 on four ranks: a 128px window blended 32px is clean, the
+    same window blended 16px bands, and differencing the two decodes leaves the residual
+    concentrated at the thin arm's own stride. The bound therefore has to hold against the
+    window actually used - a normalizer that grows the window to reach a VAE-valid shape while
+    the overlap stays put would otherwise thin the blend back under it.
+    """
+
+    def grow(window, overlap):
+        return tuple(-(-axis // 64) * 64 for axis in window), overlap
+
+    plans = cases.select_plans(
+        sample_shape=(1024, 1024),
+        native_overlap=(256, 256),
+        world_size=4,
+        normalize=grow,
+    )
+
+    blends = [
+        (blend, size)
+        for plan in plans
+        for blend, size in zip(plan["overlap"], plan["window"])
+        if blend
+    ]
+    assert blends, "an all-strip selection would not exercise the bound"
+    for blend, size in blends:
+        assert blend * 4 >= size, f"{blend}px blends a {size}px window"
+
+
 def test_row_shard_area_is_recorded_against_every_plan():
     objectives = cases.topology_objectives(
         window=(72, 72),

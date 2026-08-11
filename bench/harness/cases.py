@@ -141,13 +141,25 @@ def _overlap_options(length, count, native):
     therefore at best memory-neutral, which read as "tiling does not help" when it was really
     "the search could not get there". Letting overlap shrink reaches 272x272 on the same sample.
 
-    `native` stays in the set so the previous behaviour remains reachable and comparable.
+    The ladder stops at a quarter of the window, which is a measured bound and not a margin.
+    Tile size decides how far a tile's tone drifts from its neighbours'; overlap decides how far
+    that drift is ramped out, and so whether the eye reads a gradient or a band. On FLUX.2 at
+    1024x1024 on four ranks, a 128px window blended 32px - a quarter - is clean, while the same
+    window blended 16px bands, and differencing the two decodes leaves the residual concentrated
+    at the thin arm's own 112px stride. Since window is pitch + overlap, a quarter of the window
+    is a third of the pitch.
+
+    `native` stays in the set so the previous behaviour remains reachable and comparable, but it
+    is dropped where it would fall under that quarter.
     """
     if count == 1:
         return (0,)
     pitch = math.ceil(length / count)
-    options = {native} | {pitch // share for share in (2, 4, 8)}
-    return tuple(sorted((option for option in options if option > 0), reverse=True))
+    options = {native, pitch // 2, math.ceil(pitch / 3)}
+    return tuple(sorted(
+        (option for option in options if option > 0 and option * 3 >= pitch),
+        reverse=True,
+    ))
 
 
 def topology_objectives(window, overlap, sample_shape, world_size):
@@ -248,6 +260,16 @@ def select_plans(sample_shape, native_overlap, world_size, normalize):
                         continue
                     window, overlap = normalized
                     if any(blend >= size for blend, size in zip(overlap, window)):
+                        continue
+                    # Re-check the quarter-of-window bound against the window actually used.
+                    # The ladder applies it to the enumerated window, but normalize() may have
+                    # grown that window to reach a VAE-valid shape while the overlap stayed put,
+                    # which silently thins the blend - a 22px overlap enumerated against an 86px
+                    # window is a quarter of it, and 17% of the 128px window it snapped to. An
+                    # inactive axis blends nothing and is exempt.
+                    if any(
+                        0 < blend * 4 < size for blend, size in zip(overlap, window)
+                    ):
                         continue
                     objectives = topology_objectives(
                         window, overlap, sample_shape, world_size
