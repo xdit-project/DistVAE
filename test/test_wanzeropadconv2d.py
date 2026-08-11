@@ -1,9 +1,9 @@
 """
-Multi-rank integration tests for WanZeroPadConv2d (GLOO / CPU).
+Multi-rank integration tests for AsymmetricZeroPadConv2d (GLOO / CPU).
 
-Compares merged distributed output (Patchify -> WanZeroPadConv2d -> DePatchify)
+Compares merged distributed output (Patchify -> AsymmetricZeroPadConv2d -> DePatchify)
 to the single-rank reference math (must stay in sync with
-distvae.models.layers.wan.zeropadconv2d WanZeroPadConv2d._conv_forward group_world_size==1 branch).
+AsymmetricZeroPadConv2d._conv_forward's group_world_size==1 branch).
 
 Run from repo root:
   pytest test/test_wan_zeropadconv2d_distributed_gloo.py -v -m gloo
@@ -23,12 +23,14 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.multiprocessing import spawn
 
-from distvae.models.layers.wan.zeropadconv2d import WanZeroPadConv2d
+from distvae.models.layers.asymmetric_zero_pad_conv2d import AsymmetricZeroPadConv2d
 from distvae.modules.patch_utils import DePatchify, Patchify
 from distributed_harness import make_parallel_context
 
 
-def reference_wan_zeropad_conv2d(x: torch.Tensor, module: WanZeroPadConv2d) -> torch.Tensor:
+def reference_asymmetric_zero_pad_conv2d(
+    x: torch.Tensor, module: AsymmetricZeroPadConv2d
+) -> torch.Tensor:
     pad = tuple(module.reversed_zero_padding)
     x = F.pad(x, pad, mode="constant", value=0)
     y = F.conv2d(
@@ -68,7 +70,7 @@ def worker(
     context = make_parallel_context(patch_dim)
 
     x_full = torch.randn(n, in_ch, h, w, device=device, dtype=torch.float32)
-    layer = WanZeroPadConv2d(
+    layer = AsymmetricZeroPadConv2d(
         in_channels=in_ch,
         out_channels=out_ch,
         kernel_size=3,
@@ -88,13 +90,13 @@ def worker(
 
     try:
         with torch.no_grad():
-            y_ref = reference_wan_zeropad_conv2d(x_full, layer)
+            y_ref = reference_asymmetric_zero_pad_conv2d(x_full, layer)
             x_local = patchify(x_full)
             y_local = layer(x_local)
             y_merged = depatchify(y_local)
         if not torch.allclose(y_ref, y_merged, atol=1e-5, rtol=1e-5):
             raise AssertionError(
-                f"WanZeroPadConv2d distributed output mismatch "
+                f"AsymmetricZeroPadConv2d distributed output mismatch "
                 f"(max diff {(y_ref - y_merged).abs().max().item():.6g})"
             )
         # Leave together. A rank that tears its Gloo context down while another is still holding
@@ -144,7 +146,7 @@ def master_port(request):
 
 @pytest.mark.gloo
 @pytest.mark.parametrize("world_size,patch_dim", [(2, -2), (4, -2), (2, -1)])
-def test_wan_zeropadconv2d_gloo_matches_single_rank_reference(
+def test_asymmetric_zero_pad_conv2d_gloo_matches_single_rank_reference(
     world_size, patch_dim, master_port, seed=42
 ):
     """Direct path (block_size=0): merged multi-rank output equals single-rank reference."""
@@ -158,7 +160,7 @@ def test_wan_zeropadconv2d_gloo_matches_single_rank_reference(
 
 
 @pytest.mark.gloo
-def test_wan_zeropadconv2d_gloo_chunked_path(master_port, seed=42):
+def test_asymmetric_zero_pad_conv2d_gloo_chunked_path(master_port, seed=42):
     """Chunked path: large H/W and block_size>0 so _use_direct_path is False inside the layer."""
     _run_one(
         world_size=2,
@@ -171,7 +173,7 @@ def test_wan_zeropadconv2d_gloo_chunked_path(master_port, seed=42):
 
 @pytest.mark.gloo
 @pytest.mark.parametrize("patch_dim,block_size", [(-2, 0), (-2, 4), (-1, 0), (-1, 4)])
-def test_wan_zeropadconv2d_matches_reference_for_unequal_patch_bands(
+def test_asymmetric_zero_pad_conv2d_matches_reference_for_unequal_patch_bands(
     patch_dim, block_size, master_port, seed=42
 ):
     height, width = (40, 16) if patch_dim == -2 else (16, 40)
@@ -188,7 +190,9 @@ def test_wan_zeropadconv2d_matches_reference_for_unequal_patch_bands(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="WanZeroPadConv2d GLOO multi-rank tests")
+    parser = argparse.ArgumentParser(
+        description="AsymmetricZeroPadConv2d GLOO multi-rank tests"
+    )
     parser.add_argument("--world_size", type=int, default=None)
     parser.add_argument("--patch_dim", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)

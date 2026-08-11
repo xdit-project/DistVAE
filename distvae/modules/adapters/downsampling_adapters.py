@@ -2,7 +2,9 @@ from typing import Tuple
 
 import torch.nn as nn
 
-from distvae.models.layers.wan.zeropadconv2d import WanZeroPadConv2d
+from distvae.models.layers.asymmetric_zero_pad_conv2d import (
+    AsymmetricZeroPadConv2d,
+)
 from distvae.modules.adapters.adapter_utils import (
     adopt_convolution_parameters,
     replace_child_convolution,
@@ -56,7 +58,7 @@ def _zero_pad_strided_conv(conv, conv_block_size, parallel_context):
         isinstance(padding, tuple) and sum(padding) != 0
     ):
         raise ValueError(f"Unsupported padding: {padding}")
-    sharded = WanZeroPadConv2d(
+    sharded = AsymmetricZeroPadConv2d(
         in_channels=conv.in_channels,
         out_channels=conv.out_channels,
         kernel_size=conv.kernel_size,

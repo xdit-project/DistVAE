@@ -28,8 +28,8 @@ def widest_halo(module: nn.Module) -> int:
     """
     widest = 0
     # Every patched convolution, by the mixin that gives them their halo rather than by the two
-    # plain subclasses: WanZeroPadConv2d exchanges a halo like the others and is neither of them,
-    # so naming the subclasses left its kernel out of the bound this guard is built from.
+    # plain subclasses: AsymmetricZeroPadConv2d exchanges a halo like the others and is neither
+    # of them, so naming the subclasses left its kernel out of the bound this guard is built from.
     for conv in module.modules():
         if not isinstance(conv, PatchConvMixin):
             continue
