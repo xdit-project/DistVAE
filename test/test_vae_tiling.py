@@ -591,6 +591,75 @@ class TestTileOverlap(unittest.TestCase):
         self.assertIsNone(vae_tiling.tile_overlap_plan(overlap_hw_vae(), 0.125))
         self.assertIsNone(vae_tiling.widest_tile_overlap(stride_vae()))
 
+    def test_a_column_strip_only_constrains_the_axis_with_multiple_tiles(self):
+        vae = StubVAE(
+            tile_sample_min_height=120,
+            tile_sample_min_width=128,
+            tile_latent_min_height=15,
+            tile_latent_min_width=16,
+            tile_overlap_factor=0.25,
+            blend_v=lambda above, tile, extent: tile,
+            blend_h=lambda left, tile, extent: tile,
+        )
+        self.assertEqual(
+            vae_tiling.tile_overlap_plan(
+                vae, 0.125, sample_shape=(120, 512)
+            ),
+            {"tile_overlap_factor": 0.125},
+        )
+
+    def test_a_row_strip_only_constrains_the_axis_with_multiple_tiles(self):
+        vae = StubVAE(
+            tile_sample_min_height=120,
+            tile_sample_min_width=128,
+            tile_latent_min_height=15,
+            tile_latent_min_width=16,
+            tile_overlap_factor=0.25,
+            blend_v=lambda above, tile, extent: tile,
+            blend_h=lambda left, tile, extent: tile,
+        )
+        overlap = 2 / 15
+        plan = vae_tiling.tile_overlap_plan(
+            vae, overlap, sample_shape=(480, 128)
+        )
+        factor = plan["tile_overlap_factor"]
+        self.assertGreaterEqual(factor, overlap)
+        latent_stride = int(vae.tile_latent_min_height * (1.0 - factor))
+        self.assertEqual(
+            vae.tile_sample_min_height - int(vae.tile_sample_min_height * factor),
+            latent_stride
+            * (vae.tile_sample_min_height // vae.tile_latent_min_height),
+        )
+
+    def test_a_stride_walked_strip_only_sets_its_active_stride(self):
+        cls = type("AutoencoderKLQwenImage", (StubVAE,), {})
+        vae = cls(
+            tile_sample_min_height=120,
+            tile_sample_min_width=128,
+            tile_sample_stride_height=96,
+            tile_sample_stride_width=96,
+            spatial_compression_ratio=8,
+            blend_v=lambda above, tile, extent: tile,
+            blend_h=lambda left, tile, extent: tile,
+            decoder=lambda tile: tile,
+            post_quant_conv=lambda tile: tile,
+            clear_cache=lambda: None,
+        )
+        self.assertEqual(
+            vae_tiling.tile_overlap_plan(
+                vae, 0.125, sample_shape=(120, 512)
+            ),
+            {"tile_sample_stride_width": 112},
+        )
+
+    def test_a_single_tile_needs_no_overlap_attributes(self):
+        self.assertEqual(
+            vae_tiling.tile_overlap_plan(
+                overlap_factor_vae(), 0.125, sample_shape=(256, 256)
+            ),
+            {},
+        )
+
     def test_the_fraction_keeps_the_loop_s_two_truncations_agreeing(self):
         # The loop steps the latent grid by int(latent x (1 - f)) and crops each decoded tile to
         # pixel - int(pixel x f). Unless those are the same distance, the tiles step by one amount
