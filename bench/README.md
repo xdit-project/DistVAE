@@ -38,10 +38,23 @@ The suite carries only the compositions a caller can select:
 2. row sharded, untiled
 3. whole-tile distribution at each selected plan
 
-Five cases where the sample supports three plans, four where it supports two. A memory profile
-has to be strictly lighter than the throughput one to be worth its own cases; on a square sample
-the runner-up is otherwise throughput's own transpose, scoring identically on every objective
-and measuring materially heavier.
+Five cases where the sample supports three plans, four where it supports two.
+
+The plans are named `coarse`, `balanced` and `fine`, for fewest tiles through most. They name
+geometry rather than an outcome, because an outcome is a claim about a device: the profiles were
+once called throughput and memory, and throughput scored plans by least total work, which always
+chose the widest window since a wide tile overlaps its neighbours fewer times. On gfx1201 those
+arms measured both the slowest and heavier than plain row sharding - 5034 MB against row's 3526
+at 2048x2048 on four ranks - so the label asserted the reverse of what the hardware did.
+
+The planner therefore brackets the axis instead of predicting a winner on it. Both ends are
+pinned by bounds that hold anywhere: the banding floor at the fine end, and nothing left to
+divide at the coarse end. Which end wins in between is what the bench is for, and it is allowed
+to differ per device. Since fewest tiles also means fewest seams, prefer `coarse` where the
+memory allows it and reach for `fine` when it does not - `beats_row_sharding` in the report says
+whether a plan is a memory win at all. The fine end has to be strictly finer than the coarse one
+to earn its cases; on a square sample the runner-up is otherwise a transpose, scoring identically
+on every objective and measuring materially heavier.
 
 `--diagnostics` adds local tiling at each plan and row sharding beneath the lightest plan. An
 orchestrator reaches neither - xFuser branches straight between marking a VAE for tile

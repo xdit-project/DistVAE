@@ -136,9 +136,9 @@ def test_selector_returns_three_distinct_rectangular_pareto_plans():
     )
 
     assert [plan["profile"] for plan in plans] == [
-        "throughput",
+        "coarse",
         "balanced",
-        "memory",
+        "fine",
     ]
     assert len({plan["window"] for plan in plans}) == 3
     assert any(height != width for height, width in (p["window"] for p in plans))
@@ -198,11 +198,11 @@ def test_selector_searches_overlap_and_can_beat_row_sharding():
     )
 
     row_shard_area = (sample_shape[0] // world_size) * sample_shape[1]
-    memory = next(plan for plan in plans if plan["profile"] == "memory")
-    assert memory["objectives"]["window_area"] < row_shard_area
-    assert memory["objectives"]["beats_row_sharding"]
+    fine = next(plan for plan in plans if plan["profile"] == "fine")
+    assert fine["objectives"]["window_area"] < row_shard_area
+    assert fine["objectives"]["beats_row_sharding"]
     # The pinned-overlap search could not get below the native value on an active axis.
-    assert min(memory["overlap"]) < min(native)
+    assert min(fine["overlap"]) < min(native)
 
 
 def test_overlap_ladder_scales_with_pitch_and_keeps_the_native_value():
@@ -250,13 +250,13 @@ def test_selector_keeps_every_blend_above_a_quarter_of_its_window():
         assert blend * 4 >= size, f"{blend}px blends a {size}px window"
 
 
-def test_selector_declines_a_memory_profile_that_is_only_a_transpose():
-    """A memory profile has to be lighter, not merely different.
+def test_selector_declines_a_fine_profile_that_is_only_a_transpose():
+    """The fine end has to be finer, not merely different.
 
     Window area, decoded area and rank imbalance are all symmetric under transpose, so on a
-    square sample the runner-up to throughput used to be throughput's own mirror - scoring
-    identically while measuring 17% heavier on the hardware, because a full-width strip is a few
-    long contiguous spans and a full-height one is a row of short ones.
+    square sample the runner-up used to be the first pick's own mirror - scoring identically
+    while measuring 17% heavier on the hardware, because a full-width strip is a few long
+    contiguous spans and a full-height one is a row of short ones.
     """
     plans = cases.select_plans(
         sample_shape=(1024, 1024),
@@ -266,33 +266,41 @@ def test_selector_declines_a_memory_profile_that_is_only_a_transpose():
     )
 
     by_profile = {plan["profile"]: plan for plan in plans}
-    throughput = by_profile["throughput"]
-    memory = by_profile.get("memory")
-    if memory is not None:
-        assert (memory["objectives"]["window_area"]
-                < throughput["objectives"]["window_area"])
-        assert tuple(reversed(memory["window"])) != throughput["window"]
+    coarse = by_profile["coarse"]
+    fine = by_profile.get("fine")
+    if fine is not None:
+        assert (fine["objectives"]["window_area"]
+                < coarse["objectives"]["window_area"])
+        assert tuple(reversed(fine["window"])) != coarse["window"]
     assert len({plan["window"] for plan in plans}) == len(plans)
 
 
-def test_throughput_plan_minimises_the_critical_path_not_the_total_work():
-    """A decode finishes when its slowest rank does, so the busiest rank's area is the clock.
+def test_profiles_bracket_the_tile_axis_rather_than_predicting_a_winner():
+    """Coarse is the fewest tiles and fine the most, so the suite spans the axis it is testing.
 
-    Selecting on decoded_area instead picked the widest windows, since a wide tile overlaps its
-    neighbours fewer times - and those measured as the slowest tiled arms. On FLUX.2 at 1024x1024
-    on two ranks, 768x1024 ran 0.199 s against 192x1024's 0.175 s.
+    The profiles used to be named for outcomes, and throughput was scored by least total work -
+    which always chose the widest window, since a wide tile overlaps its neighbours fewer times.
+    On gfx1201 those arms were both the slowest AND heavier than plain row sharding, 5034 MB
+    against row's 3526 at 2048x2048 on four ranks, so the name claimed the opposite of what the
+    hardware did. Which end wins is for the bench to measure and may differ per device; the
+    planner's job is only to put both ends in front of it.
     """
-    plans = cases.select_plans(
-        sample_shape=(1024, 1024),
-        native_overlap=(256, 256),
-        world_size=2,
-        normalize=lambda window, overlap: (window, overlap),
-    )
-    throughput = next(plan for plan in plans if plan["profile"] == "throughput")
+    for sample_shape, world_size in (((1024, 1024), 2), ((2048, 2048), 4)):
+        plans = cases.select_plans(
+            sample_shape=sample_shape,
+            native_overlap=(256, 256),
+            world_size=world_size,
+            normalize=lambda window, overlap: (window, overlap),
+        )
+        by_profile = {plan["profile"]: plan for plan in plans}
+        coarse, fine = by_profile["coarse"], by_profile["fine"]
 
-    assert throughput["objectives"]["max_rank_area"] == min(
-        plan["objectives"]["max_rank_area"] for plan in plans
-    ), "the throughput plan must not be beaten on critical path by its own siblings"
+        assert coarse["objectives"]["tile_count"] == min(
+            plan["objectives"]["tile_count"] for plan in plans
+        ), f"{sample_shape} ws={world_size}: coarse must be the fewest tiles"
+        assert fine["objectives"]["tile_count"] == max(
+            plan["objectives"]["tile_count"] for plan in plans
+        ), f"{sample_shape} ws={world_size}: fine must be the most tiles"
 
 
 def test_tile_columns_separate_a_plan_from_its_transpose():

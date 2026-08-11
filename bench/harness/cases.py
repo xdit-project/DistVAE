@@ -7,7 +7,9 @@ from distvae.vae.tile_parallel import shares
 from distvae.vae.tiling import latent_rows
 
 
-PROFILES = ("throughput", "balanced", "memory")
+# Named for tile count, which is a fact about the plan, rather than for an outcome, which is a
+# claim about a device - see select_plans.
+PROFILES = ("coarse", "balanced", "fine")
 MODES = ("unsharded", "row", "local", "tile-runs", "row-tiled")
 
 # The smallest latent extent a tile may have on its narrower axis. Below roughly this, a tile
@@ -237,13 +239,12 @@ def _balanced_key(candidate, frontier):
 
 
 def select_plans(sample_shape, native_overlap, world_size, normalize):
-    """Select throughput, knee, and memory representatives from a bounded frontier.
+    """Bracket the tile axis with a coarse, a knee, and a fine plan.
 
-    Throughput is the lowest critical path and, since that is usually level across plans, in
-    practice the smallest window. Memory is the smallest window outright and balanced the knee
-    between them, so throughput and memory now coincide on most samples and two plans come back
-    rather than three - which is the honest answer where lighter and faster are the same
-    direction, as measurement says they are.
+    Coarse is the fewest tiles, fine the most, balanced the knee between. Fewest tiles also means
+    fewest seams, so coarse is the one to prefer where the memory allows it, and fine is what you
+    reach for when it does not. Two come back rather than three where the sample has no distinct
+    third.
     """
     if world_size < 1:
         raise ValueError("world size must be positive")
@@ -301,33 +302,29 @@ def select_plans(sample_shape, native_overlap, world_size, normalize):
         raise ValueError(
             f"sample {sample_shape} produces only {len(frontier)} useful tile plans"
         )
-    # Price the critical path first, then the window. A decode finishes when its slowest rank
-    # does, so the area the busiest rank holds is what becomes wall clock - but the scheduler
-    # levels that by construction, and in practice it comes out equal across every plan on a
-    # sample: 786432 for all three at 1024x1024 on two ranks, 1572864 for all three at 2048x2048
-    # on four. It almost never decides anything, so what follows it does.
+    # Bracket the axis; do not try to pick the winner on it. The plan space is essentially one
+    # dimension - window size, equivalently tile count - and the two ends are pinned by bounds
+    # that hold on any device: the banding floor at the fine end, and nothing left to divide at
+    # the coarse end. Where the optimum sits BETWEEN those ends is a property of the hardware,
+    # and measuring it is the bench's job rather than the planner's.
     #
-    # What follows it is window area, because that is what measurement supports. Across eight
-    # tiled arms on FLUX.2 the smaller window was faster every time, monotonically - at 2048x2048
-    # on four ranks 768x2048 ran 0.441 s, 384x2048 0.396 s and 192x2048 0.374 s. Selecting on
-    # decoded_area instead ordered them exactly backwards, because a wide tile overlaps its
-    # neighbours fewer times and so does least total work while being slowest. Redundant overlap
-    # is evidently cheap next to whatever a large window costs, so do not price the work.
-    #
-    # The minimum is always on the frontier, so this needs no new domination key: max_rank_area
-    # is decoded_area over the ranks times one plus rank_imbalance, and window area is a key
-    # already.
-    throughput = min(
+    # So the profiles name geometry, not predicted outcome. An earlier pair named throughput and
+    # memory scored plans by decoded_area, least total work, which reliably chose the widest
+    # window: a wide tile overlaps its neighbours fewer times. On gfx1201 those were the slowest
+    # arms AND heavier than row sharding, 5034 MB against row's 3526 at 2048x2048 on four ranks,
+    # so the name asserted the reverse of what the hardware did. Naming the ends coarse and fine
+    # cannot go stale that way, and keeping the coarse end in the suite is what lets a different
+    # device show it winning.
+    coarse = max(
         frontier,
         key=lambda item: (
-            item["objectives"]["max_rank_area"],
             item["objectives"]["window_area"],
-            item["objectives"]["tile_columns"],
+            -item["objectives"]["tile_columns"],
             item["window"],
         ),
     )
-    memory = min(
-        (item for item in frontier if item is not throughput),
+    fine = min(
+        (item for item in frontier if item is not coarse),
         key=lambda item: (
             item["objectives"]["window_area"],
             item["objectives"]["decoded_area"],
@@ -336,18 +333,16 @@ def select_plans(sample_shape, native_overlap, world_size, normalize):
             item["window"],
         ),
     )
-    # A memory profile has to be lighter than the throughput one or it is not a memory profile.
-    # It used to be merely DIFFERENT, which on a square sample hands back throughput's transpose:
-    # area, work and imbalance are symmetric under transpose, so 1024x128 scored identically to
-    # the 128x1024 already chosen while measuring 17% heavier on the hardware. Where the lightest
-    # plan is also the fastest, the honest answer is two profiles rather than a third that is
-    # only nominally distinct.
-    if memory["objectives"]["window_area"] >= throughput["objectives"]["window_area"]:
-        memory = None
+    # The fine end has to be lighter than the coarse one or it is not the other end of anything.
+    # It used to be merely DIFFERENT, which on a square sample hands back a transpose: area, work
+    # and imbalance are symmetric under transpose, so 1024x128 scored identically to the 128x1024
+    # already chosen while measuring 17% heavier on the hardware.
+    if fine["objectives"]["window_area"] >= coarse["objectives"]["window_area"]:
+        fine = None
     # Distinct by WINDOW, not by identity. Two frontier points can share a window and differ only
     # in blend, and 832x128 blended 36px against the same window blended 34px is not two profiles
     # worth two cases each.
-    taken = {plan["window"] for plan in (throughput, memory) if plan is not None}
+    taken = {plan["window"] for plan in (coarse, fine) if plan is not None}
     remaining = [item for item in frontier if item["window"] not in taken]
     balanced = (
         min(remaining, key=lambda item: _balanced_key(item, frontier))
@@ -356,7 +351,7 @@ def select_plans(sample_shape, native_overlap, world_size, normalize):
     )
     selected = [
         (profile, plan)
-        for profile, plan in zip(PROFILES, (throughput, balanced, memory))
+        for profile, plan in zip(PROFILES, (coarse, balanced, fine))
         if plan is not None
     ]
     return [
@@ -481,10 +476,9 @@ def default_suite(plans, height, width, frames, diagnostics=False):
                 )
             )
     if diagnostics:
-        # Row sharding beneath the tiling, at the plan the objectives call lightest - the memory
-        # one where the sample offers a distinct memory plan, the throughput one where it does
-        # not. Lightest by predicted window area, which is a model's opinion rather than a
-        # measurement, and one more reason this belongs with the diagnostics.
+        # Row sharding beneath the tiling, at the finest plan the sample offers. Lightest by
+        # predicted window area, which is a model's opinion rather than a measurement, and one
+        # more reason this belongs with the diagnostics.
         lightest = min(plans, key=lambda plan: plan["objectives"]["window_area"])
         suite.append(
             _cell(
