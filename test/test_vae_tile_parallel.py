@@ -406,6 +406,47 @@ class TestRuns(unittest.TestCase):
         self.assertEqual(by_runs, 32768)
         self.assertEqual(levelled, 28672)
 
+    def test_a_swap_escapes_a_move_only_local_optimum(self):
+        weights = [3136, 2464, 2464, 1936]
+
+        owner = vae_tile_parallel.shares(weights, 2)
+
+        self.assertEqual(max(_load(weights, owner, 2)), 5072)
+        self.assertEqual(set(owner), {0, 1})
+
+    def test_levelling_can_cross_a_global_makespan_plateau(self):
+        extents = [28, 28, 28, 22]
+        weights = [height * width for height in extents for width in extents]
+
+        owner = vae_tile_parallel.shares(weights, 4)
+
+        self.assertEqual(max(_load(weights, owner, 4)), 2836)
+        self.assertEqual(set(owner), {0, 1, 2, 3})
+
+    def test_levelling_is_deterministic(self):
+        extents = [28, 28, 28, 22]
+        weights = [height * width for height in extents for width in extents]
+        expected = vae_tile_parallel.shares(weights, 4)
+
+        for _ in range(10):
+            self.assertEqual(vae_tile_parallel.shares(weights, 4), expected)
+
+    def test_equal_balance_prefers_fewer_tiles_displaced_from_the_runs(self):
+        # Moving tile 1 and swapping tiles 0 and 2 both produce loads [2, 2, 4]. The move leaves
+        # only one tile outside its original run, while the swap leaves two.
+        self.assertEqual(
+            vae_tile_parallel.shares([1, 1, 2, 4], 3),
+            [0, 0, 1, 2],
+        )
+
+    def test_equal_moves_prefer_a_tile_beside_its_receiving_rank(self):
+        # Any of rank 0's three unit tiles gives loads [3, 2, 2] on rank 1. Tile 2 touches rank
+        # 1's run already, so moving it adds fewer remote boundaries than moving tile 0 or 1.
+        self.assertEqual(
+            vae_tile_parallel.shares([1, 1, 1, 1, 3], 3),
+            [0, 0, 1, 1, 2],
+        )
+
     def test_the_edges_asked_for_are_the_edges_the_blending_reaches_for(self):
         random.seed(17)
         for rows in range(1, 6):

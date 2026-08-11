@@ -150,21 +150,20 @@ def runs(weights: Sequence[int], world_size: int) -> List[Tuple[int, int]]:
 
 
 def shares(weights: Sequence[int], world_size: int) -> List[int]:
-    """Which rank decodes each tile: contiguous runs, levelled by moving a few tiles across
+    """Which rank decodes each tile: contiguous runs, levelled by moving or swapping a few tiles
 
     A run is the cheap shape to blend, since its tiles' neighbours are mostly its own, but it is
     a coarse shape to balance. Nine tiles over four ranks split by weight as evenly as contiguity
     allows still leaves the heaviest rank a quarter above the average, because the tiles are large
     against the share and a run cannot skip one. No weighing fixes that; only a finer assignment.
 
-    So the runs are a starting point rather than the answer. A tile at a time moves from the
-    heaviest rank to the lightest wherever that lowers the heaviest, which is what the decode
-    waits for. Each move costs an exchange - the tile's neighbours are now somewhere else - and
-    that is why the runs are worth starting from, and why the moves prefer a tile already beside
-    the rank taking it.
+    So the runs are a starting point rather than the answer. Moves and pairwise swaps are searched
+    together across every rank pair. Each accepted change strictly lowers the descending load
+    vector, or keeps that vector while restoring a tile to its original run. Among equally balanced
+    choices, fewer tiles displaced from those runs win, followed by tiles already beside their new
+    owner. The total tie-break is deterministic because every rank computes this independently.
 
-    A rank down to its last tile never gives it up, because handing over everything it has cannot
-    lower the higher of the two loads.
+    A move never takes a rank's last tile. Swaps preserve every rank's tile count.
     """
     owner: List[int] = []
     for rank, (start, stop) in enumerate(runs(weights, world_size)):
@@ -176,30 +175,108 @@ def shares(weights: Sequence[int], world_size: int) -> List[int]:
     for n, weight in enumerate(weights):
         load[owner[n]] += weight
 
-    # Bounded by the tiles: every move strictly lowers the heaviest load, so the sorted loads
-    # fall each time and cannot return to where they were.
-    for _ in range(len(weights)):
-        heavy = max(range(world_size), key=lambda r: (load[r], -r))
-        light = min(range(world_size), key=lambda r: (load[r], r))
+    original = owner.copy()
+    count = [owner.count(rank) for rank in range(world_size)]
+    displaced = 0
+
+    def objective(loads, moved):
+        return tuple(sorted(loads, reverse=True)), moved
+
+    # Every accepted operation strictly lowers `objective`, so no ownership state can recur.
+    # There are world_size ** tile_count states, which is a conservative finite round bound; the
+    # search normally reaches its fixed point after only a handful.
+    for _ in range(world_size ** len(weights)):
+        current = objective(load, displaced)
         best = None
-        for n, weight in enumerate(weights):
-            if owner[n] != heavy:
+
+        for moved, weight in enumerate(weights):
+            donor = owner[moved]
+            if count[donor] == 1:
                 continue
-            after = max(load[heavy] - weight, load[light] + weight)
-            if after >= load[heavy]:
-                continue
-            beside = any(
-                0 <= m < len(weights) and owner[m] == light for m in (n - 1, n + 1)
-            )
-            key = (after, 0 if beside else 1, n)
-            if best is None or key < best[0]:
-                best = (key, n)
+            for receiver in range(world_size):
+                if receiver == donor:
+                    continue
+                loads = load.copy()
+                loads[donor] -= weight
+                loads[receiver] += weight
+                next_displaced = displaced
+                next_displaced -= int(owner[moved] != original[moved])
+                next_displaced += int(receiver != original[moved])
+                candidate = objective(loads, next_displaced)
+                if candidate >= current:
+                    continue
+                beside = any(
+                    0 <= neighbour < len(weights) and owner[neighbour] == receiver
+                    for neighbour in (moved - 1, moved + 1)
+                )
+                key = (candidate, 0 if beside else 1, 0, donor, receiver, moved)
+                if best is None or key < best[0]:
+                    best = (key, "move", moved, receiver, loads, next_displaced)
+
+        for first in range(len(weights)):
+            first_rank = owner[first]
+            for second in range(first + 1, len(weights)):
+                second_rank = owner[second]
+                if first_rank == second_rank:
+                    continue
+                loads = load.copy()
+                loads[first_rank] += weights[second] - weights[first]
+                loads[second_rank] += weights[first] - weights[second]
+                next_displaced = displaced
+                next_displaced -= int(first_rank != original[first])
+                next_displaced -= int(second_rank != original[second])
+                next_displaced += int(second_rank != original[first])
+                next_displaced += int(first_rank != original[second])
+                candidate = objective(loads, next_displaced)
+                if candidate >= current:
+                    continue
+
+                def rank_after(tile):
+                    if tile == first:
+                        return second_rank
+                    if tile == second:
+                        return first_rank
+                    return owner[tile]
+
+                beside = 0
+                for tile, receiver in (
+                    (first, second_rank),
+                    (second, first_rank),
+                ):
+                    beside += not any(
+                        0 <= neighbour < len(weights)
+                        and rank_after(neighbour) == receiver
+                        for neighbour in (tile - 1, tile + 1)
+                    )
+                key = (
+                    candidate,
+                    beside,
+                    1,
+                    first_rank,
+                    second_rank,
+                    first,
+                    second,
+                )
+                if best is None or key < best[0]:
+                    best = (
+                        key,
+                        "swap",
+                        first,
+                        second,
+                        loads,
+                        next_displaced,
+                    )
+
         if best is None:
             break
-        moved = best[1]
-        owner[moved] = light
-        load[heavy] -= weights[moved]
-        load[light] += weights[moved]
+        _, operation, first, second, load, displaced = best
+        if operation == "move":
+            donor = owner[first]
+            owner[first] = second
+            count[donor] -= 1
+            count[second] += 1
+        else:
+            owner[first], owner[second] = owner[second], owner[first]
     return owner
 
 
