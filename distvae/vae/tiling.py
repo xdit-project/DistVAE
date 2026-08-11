@@ -433,7 +433,9 @@ def _overlap_lands(latent: int, pixel: int, factor: float) -> bool:
     return remainder == 0 and pixel - int(pixel * factor) == stride * ratio
 
 
-def tile_overlap_plan(vae, overlap: float) -> Optional[dict]:
+def tile_overlap_plan(
+    vae, overlap: float, sample_shape: Optional[Tuple[int, int]] = None
+) -> Optional[dict]:
     """Every attribute setting the step between tiles, at `overlap`, or None if it cannot land
 
     The window says how large a tile is; this says how far apart their origins sit. They are two
@@ -450,13 +452,45 @@ def tile_overlap_plan(vae, overlap: float) -> Optional[dict]:
     Returns attributes rather than setting them, so `apply_tile_plan` stays the one place a
     window or a stride is written, and so a caller can find out whether an overlap is reachable
     without half-applying it.
+
+    When `sample_shape` is supplied in output pixels, only axes spanning multiple tiles constrain
+    the plan. This permits full-height column strips and full-width row strips even where the
+    inactive axis cannot represent the requested overlap exactly.
     """
+    if (
+        not isinstance(overlap, (int, float))
+        or isinstance(overlap, bool)
+        or not 0.0 <= overlap < 1.0
+    ):
+        return None
+    active_axes = (True, True)
+    if sample_shape is not None:
+        if (
+            not isinstance(sample_shape, tuple)
+            or len(sample_shape) != 2
+            or not all(
+                isinstance(value, int) and not isinstance(value, bool) and value > 0
+                for value in sample_shape
+            )
+        ):
+            return None
+        shape = tile_shape(vae)
+        if shape is None:
+            return None
+        active_axes = tuple(sample > window for sample, window in zip(sample_shape, shape))
+        if not any(active_axes):
+            return {}
+
     if tiles_by_stored_stride(vae):
         step = _stride_granularity(vae)
         if step is None:
             return None
         plan = {}
-        for stride_attr, window_attr in zip(STRIDE_ATTRS, WINDOW_ATTRS_FOR_STRIDE):
+        for active, stride_attr, window_attr in zip(
+            active_axes, STRIDE_ATTRS, WINDOW_ATTRS_FOR_STRIDE
+        ):
+            if not active:
+                continue
             window = getattr(vae, window_attr)
             stride = int(window * (1.0 - overlap)) // step * step
             if stride < step:
@@ -475,15 +509,24 @@ def tile_overlap_plan(vae, overlap: float) -> Optional[dict]:
     # whole across the columns; a VAE windowing the two differently rules out fractions that
     # either axis alone would accept. Walked from the requested step downward, which narrows the
     # step and so widens the overlap - the direction that keeps a wrong guess conservative.
-    for stride in range(min(int(latent_down * (1.0 - overlap)), latent_down), 0, -1):
-        factor = 1.0 - stride / latent_down
+    basis, _ = next(axis for active, axis in zip(active_axes, axes) if active)
+    for stride in range(min(int(basis * (1.0 - overlap)), basis), 0, -1):
+        factor = 1.0 - stride / basis
         if not 0.0 <= factor < 1.0:
             continue
-        if all(_overlap_lands(latent, pixel, factor) for latent, pixel in axes):
+        if all(
+            not active or _overlap_lands(latent, pixel, factor)
+            for active, (latent, pixel) in zip(active_axes, axes)
+        ):
             return {
                 attr: factor
-                for attr in OVERLAP_ATTRS
+                for axis, attr in (
+                    (None, "tile_overlap_factor"),
+                    (0, "tile_overlap_factor_height"),
+                    (1, "tile_overlap_factor_width"),
+                )
                 if isinstance(getattr(vae, attr, None), float)
+                and (axis is None or active_axes[axis])
             }
     return None
 
