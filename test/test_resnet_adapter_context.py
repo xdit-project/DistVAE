@@ -1,4 +1,3 @@
-import torch.nn as nn
 
 from diffusers.models.resnet import ResnetBlock2D
 

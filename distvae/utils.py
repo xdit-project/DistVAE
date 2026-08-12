@@ -5,11 +5,6 @@ import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-try:
-    import torch_musa
-except ModuleNotFoundError:
-    pass
-
 
 def cache_cursor(feat_idx: Optional[List[int]]) -> List[int]:
     """The caller's position in the feature cache, or a fresh one at the start of it

@@ -6,11 +6,9 @@ import torch
 import random
 import argparse
 import torch.distributed as dist
-from torch import nn
 from torch.cuda import set_device, device_count
 from torch.cuda import manual_seed as device_manual_seed
 try:
-    import torch_musa
     from torch_musa.core.device import set_device, device_count
     from torch_musa.core.random import manual_seed as device_manual_seed
 except ModuleNotFoundError:

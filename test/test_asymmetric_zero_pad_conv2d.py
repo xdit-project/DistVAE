@@ -6,8 +6,8 @@ to the single-rank reference math (must stay in sync with
 AsymmetricZeroPadConv2d._conv_forward's group_world_size==1 branch).
 
 Run from repo root:
-  pytest test/test_wan_zeropadconv2d_distributed_gloo.py -v -m gloo
-  python test/test_wan_zeropadconv2d_distributed_gloo.py
+  pytest test/test_asymmetric_zero_pad_conv2d.py -v -m gloo
+  python test/test_asymmetric_zero_pad_conv2d.py
 """
 
 from __future__ import annotations

@@ -1,11 +1,9 @@
 import math
-import numbers
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch import Tensor
 
-from diffusers.models.activations import get_activation
 from distvae.utils import ParallelContext, normalize_patch_dim
 
 
@@ -135,35 +133,3 @@ class PatchGroupNorm(nn.GroupNorm):
             x = x * weight + bias
 
         return x
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps: float, elementwise_affine: bool = True):
-        super().__init__()
-
-        self.eps = eps
-
-        if isinstance(dim, numbers.Integral):
-            dim = (dim,)
-
-        self.dim = torch.Size(dim)
-
-        if elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(dim))
-        else:
-            self.weight = None
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-
-        if self.weight is not None:
-            # convert into half-precision if necessary
-            if self.weight.dtype in [torch.float16, torch.bfloat16]:
-                hidden_states = hidden_states.to(self.weight.dtype)
-            hidden_states = hidden_states * self.weight
-        else:
-            hidden_states = hidden_states.to(input_dtype)
-
-        return hidden_states

@@ -1712,7 +1712,7 @@ def test_custom_overlap_installs_the_per_axis_replacement(monkeypatch):
         measure.vae_api, "tiled_decode_for", lambda value: replacement
     )
 
-    facts = measure.configure_tiling(
+    measure.configure_tiling(
         vae,
         {
             "sharding": "unsharded",

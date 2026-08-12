@@ -371,7 +371,6 @@ def exchange_halo(
     if not isinstance(parallel_context, ParallelContext):
         raise TypeError("exchange_halo requires a ParallelContext")
     vae_group = parallel_context.group
-    group_world_size = parallel_context.world_size
     rank_in_group = parallel_context.rank
     ops = []
     top_halo_recv = None

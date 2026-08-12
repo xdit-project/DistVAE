@@ -5,7 +5,6 @@ import torch.nn as nn
 
 from distvae.modules.adapters.adapter_utils import replace_child_convolution
 from distvae.utils import ParallelContext, cache_cursor
-from distvae.models.upsampling import PatchUpsample2D
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
     HUNYUAN_VIDEO_15,
@@ -60,25 +59,15 @@ class Upsample2DAdapter(nn.Module):
             assert not isinstance(upsample2d.conv, nn.ConvTranspose2d), "upsample2dBlock2DAdapter does not support transpose conv"
         else:
             assert not isinstance(upsample2d.Conv2d_0, nn.ConvTranspose2d), "upsample2dBlock2DAdapter does not support transpose conv"
-        self.upsample2d = PatchUpsample2D(
-            channels=upsample2d.channels,
-            use_conv=upsample2d.use_conv,
-            use_conv_transpose=upsample2d.use_conv_transpose,
-            out_channels=upsample2d.out_channels,
-            name=upsample2d.name,
-            kernel_size=None,
-            padding=1,
-            interpolate=upsample2d.interpolate,
-            parallel_context=parallel_context,
-        )
+        self.upsample2d = upsample2d
         if upsample2d.name == "conv":
-            self.upsample2d.conv = Conv2dAdapter(
+            upsample2d.conv = Conv2dAdapter(
                 upsample2d.conv,
                 block_size=conv_block_size,
                 parallel_context=parallel_context,
             )
         else:
-            self.upsample2d.Conv2d_0 = Conv2dAdapter(
+            upsample2d.Conv2d_0 = Conv2dAdapter(
                 upsample2d.Conv2d_0,
                 block_size=conv_block_size,
                 parallel_context=parallel_context,

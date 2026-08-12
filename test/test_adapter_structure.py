@@ -13,6 +13,16 @@ from distvae.modules.adapters.vae import decoder_adapters, encoder_adapters
 ROOT = Path(__file__).parents[1]
 
 
+def test_legacy_family_specific_model_copies_are_absent():
+    stale_paths = [
+        ROOT / "distvae/models/layers/wan/__init__.py",
+        ROOT / "distvae/models/unets/unet_2d_blocks.py",
+        ROOT / "distvae/models/upsampling.py",
+    ]
+
+    assert [path.relative_to(ROOT) for path in stale_paths if path.exists()] == []
+
+
 def test_adapter_packages_do_not_import_implementations_eagerly():
     script = """
 import sys

@@ -2,6 +2,8 @@ import pytest
 import torch
 import torch.nn as nn
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
+from diffusers.models.unets.unet_2d_blocks import UpDecoderBlock2D
+from diffusers.models.upsampling import Upsample2D
 
 from distvae.modules.adapters.downsampling_adapters import _zero_pad_strided_conv
 from distvae.modules.adapters.layers.conv_adapters import (
@@ -9,6 +11,10 @@ from distvae.modules.adapters.layers.conv_adapters import (
     Conv3dAdapter,
     WanCausalConv3dAdapter,
 )
+from distvae.modules.adapters.unets.unet_2d_blocks_adapters import (
+    UpDecoderBlock2DAdapter,
+)
+from distvae.modules.adapters.upsampling_adapters import Upsample2DAdapter
 from distributed_harness import make_parallel_context
 
 
@@ -81,3 +87,27 @@ def test_zero_pad_strided_conv_reuses_original_parameters(bias):
     _assert_reuses_parameters_and_gradients(
         conv, adapted, optimizer, (1, 2, 6, 6)
     )
+
+
+def test_upsample_adapter_wraps_the_original_module_in_place():
+    upsample = Upsample2D(channels=2, use_conv=True)
+    adapted = Upsample2DAdapter(
+        upsample, parallel_context=make_parallel_context()
+    )
+
+    assert adapted.upsample2d is upsample
+
+
+def test_up_decoder_adapter_wraps_the_original_block_in_place():
+    up_block = UpDecoderBlock2D(
+        in_channels=2,
+        out_channels=2,
+        num_layers=1,
+        resnet_groups=1,
+        add_upsample=True,
+    )
+    adapted = UpDecoderBlock2DAdapter(
+        up_block, parallel_context=make_parallel_context()
+    )
+
+    assert adapted.up_block is up_block
