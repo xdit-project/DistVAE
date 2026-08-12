@@ -17,14 +17,10 @@ def _patch_axis(conv) -> int:
 
 
 def widest_halo(module: nn.Module) -> int:
-    """The most rows any convolution in here will ask a neighbour for
+    """Return the maximum halo width required by any convolution in ``module``.
 
-    Neither halo width ever exceeds half the kernel, whatever the stride and the padding: the
-    step count either side of a boundary is a ceiling of the same quantity the width is then
-    measured back from, and what survives that algebra is `kernel_size // 2` with the stride and
-    the padding cancelled out. So the widest kernel over the stack bounds every exchange the run
-    will make, and being a property of the weights rather than of the image, it can be read once
-    and reread never.
+    For the split axis, neither halo exceeds ``kernel_size // 2``; stride and padding cancel from
+    the bound. Therefore the largest kernel in the module determines the maximum required halo.
     """
     widest = 0
     # Every patched convolution, by the mixin that gives them their halo rather than by the two
@@ -62,9 +58,9 @@ def gather_patches(
     group = parallel_context.group
     world_size = parallel_context.world_size
 
-    # One rank already holds the whole thing, so there is nothing to collect and no other size to
-    # discover. Both gathers below would be round trips whose answer is the argument. Callers
-    # concatenate what comes back, and cat copies, so handing back the input itself aliases nothing.
+    # With one rank, no collection or size discovery is required. The gather operations would
+    # return the input unchanged. Callers concatenate the returned list, and cat copies the input,
+    # so returning the original tensor does not introduce aliasing.
     if world_size == 1:
         return [patch], [patch.shape[patch_dim]]
 
@@ -95,20 +91,17 @@ def gather_patches(
 
 
 class Patchify(nn.Module):
-    """Hands each rank one contiguous band of rows along the patch dimension
+    """Assign each rank one contiguous band along the patch dimension.
 
     Bands are cut in whole multiples of scale_factor, the amount the VAE narrows or widens this
-    axis by, so that every band begins on the grid the strided convolutions downstream step
-    along and the rows a rank produces are its own. Bands therefore differ in size when they do
-    not divide evenly, which is why the gathers pad for transport.
+    axis by, so every band begins on the downstream strided-convolution grid. Bands may differ
+    in size when the axis does not divide evenly, so gathers pad them during transport.
 
     Padding to an even split changes the computation: convolution and attention propagate the
     network's response to padded values into retained rows before any final crop.
 
-    This is also where a band too thin to lend its neighbour a halo is caught, because it is the
-    one place every rank works the same sum from the same numbers. The convolutions cannot do it:
-    each holds only its own band, bands differ by a unit, and a rank that stopped on its own
-    would leave its neighbours waiting on rows from a rank that is no longer sending them.
+    Validate that every band can supply the required halo before any rank enters convolution
+    communication. This prevents one rank from exiting while other ranks wait for its rows.
     """
 
     def __init__(
@@ -136,8 +129,8 @@ class Patchify(nn.Module):
         if size % factor:
             raise ValueError(
                 f"Cannot split {size} rows into multiples of {factor}: the VAE narrows this "
-                f"axis by {factor}, so a band that is not a whole multiple of it would land "
-                f"between output rows."
+                f"axis by {factor}, so every band must contain a whole multiple of {factor} "
+                f"rows."
             )
         units = size // factor
         if units < self.group_world_size:

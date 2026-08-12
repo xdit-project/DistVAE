@@ -73,9 +73,9 @@ def test_it_matches_conv2d_when_it_halves(world_size, size, master_port, seed=42
     """Stride 2, which is where the crop has to know where its band starts
 
     At unit stride every output row is an input row and the halo alone lines the bands up. A
-    strided convolution steps a grid the whole image shares, so a band starting at a row that is
-    not on that grid has to be cropped from where the grid next lands rather than from its own
-    first row - which is the arithmetic an even split never exercises.
+    A strided convolution uses a global output grid. If a band begins between grid positions,
+    cropping must start at the first global grid position inside the band rather than at the
+    band's first row. An even split does not exercise this arithmetic.
     """
     run_distributed(worker, world_size, (size, 3, 2, 1, -2, seed), master_port)
 

@@ -12,7 +12,7 @@ from typing import Callable, List, NamedTuple, Optional, Tuple
 import diffusers
 import torch
 
-# The tiling window as diffusers spells it, across the shapes its VAEs use: a latent/pixel pair
+# Diffusers represents tiling windows with several attribute layouts: a latent/pixel pair
 # (AutoencoderKL and friends), a pixel window plus a stride (Wan, Qwen-Image, the video VAEs), and
 # either of those keyed by height and width. Frame tiling is left out on purpose, being unrelated
 # to a spatial tile edge.
@@ -37,8 +37,8 @@ def require_vae_support(vae, feature: str, flag: str) -> None:
     """Raise unless the installed diffusers really implements `feature` for this VAE"""
     # Diffusers hands every autoencoder the enable_tiling and enable_slicing methods through a
     # shared mixin, implemented or not, so their presence proves nothing. The state flag the mixin
-    # itself checks does. Both features also arrived class by class over several releases, Wan's in
-    # 0.34, one past the floor setup.py asks for.
+    # itself checks does. Wan added support in Diffusers 0.34, later than the minimum supported
+    # Diffusers version.
     if not hasattr(vae, f"use_{feature}"):
         raise ValueError(
             f"{flag} is not supported by this VAE ({type(vae).__name__}) in the installed "
@@ -105,7 +105,7 @@ def tile_shape_plan(vae, height: int, width: int) -> Optional[dict]:
     """Tiling attributes rescaled independently to an exact (height, width) window.
 
     Scalar-window VAEs receive complete per-axis attributes for DistVAE's replacement overlap
-    loop. VAEs that already carry per-axis windows retain their native attribute spelling.
+    loop. VAEs that already define per-axis windows retain their native attribute layout.
     """
     if not all(
         isinstance(value, int) and not isinstance(value, bool) and value > 0
@@ -222,9 +222,8 @@ def latent_rows(vae, plan: Optional[dict] = None) -> Optional[int]:
 def overlap_windows(vae) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
     """The latent and pixel tile windows as (down, across) pairs, None where the VAE has neither
 
-    Two spellings for the same thing. AutoencoderKL and FLUX.2 carry one square edge; HunyuanVideo
-    1.5 carries an edge per axis. A square edge is the same number on both axes, so reading both
-    into a pair lets one loop walk either.
+    AutoencoderKL and FLUX.2 store one square edge; HunyuanVideo 1.5 stores one edge per axis.
+    Normalize both attribute layouts to a pair so one loop can support all three classes.
     """
     keyed = [
         getattr(vae, attr, None)
@@ -297,7 +296,7 @@ WINDOW_ATTRS_FOR_STRIDE = ("tile_sample_min_height", "tile_sample_min_width")
 
 
 def tile_overlap(vae) -> Optional[Tuple[int, int]]:
-    """Absolute output-pixel overlap as (height, width), regardless of storage spelling."""
+    """Return absolute output-pixel overlap as (height, width) for any supported attribute layout."""
     strides = [getattr(vae, attr, None) for attr in STRIDE_ATTRS]
     windows = [getattr(vae, attr, None) for attr in WINDOW_ATTRS_FOR_STRIDE]
     if all(isinstance(value, int) and value > 0 for value in strides + windows):
@@ -317,7 +316,7 @@ def tile_overlap(vae) -> Optional[Tuple[int, int]]:
 
 
 def _stride_granularity(vae) -> Optional[int]:
-    """The multiple a pixel stride must land on for the stride-walked loop to stay self-consistent
+    """Return the required pixel-stride multiple for a consistent stored-stride tiling loop.
 
     That loop divides the stride it stores twice: by the compression ratio, to step the latent
     grid, and - where the family decodes into a pixel unshuffle - by the patch size, to place the
@@ -423,12 +422,11 @@ def tile_overlap_plan(
 
 
 def _returns_decoder_output(vae) -> bool:
-    """Whether this class's own tiled_decode hands back a DecoderOutput rather than a tensor
+    """Return whether this class's tiled_decode returns DecoderOutput rather than a tensor.
 
-    The replacement is installed over `tiled_decode` and called by the VAE's own `_decode`, so it
-    has to hand back what that caller already expects. Most classes take a `return_dict` and wrap;
-    HunyuanVideo 1.5 takes no such argument, returns the tensor, and its `_decode` passes that
-    straight to `decode` - which would wrap a DecoderOutput inside another one.
+    The replacement must preserve the return type expected by `_decode`. Most classes accept
+    `return_dict` and return DecoderOutput; HunyuanVideo 1.5 accepts no such argument and returns
+    a tensor directly.
 
     Read off the class rather than the instance, so that installing twice cannot end up reading
     the first install's signature instead of the original.
@@ -463,15 +461,13 @@ class _StrideLoop(NamedTuple):
 # which loop body a class has. All four walk the same grid and blend it the same way, and differ
 # only in what a tile costs to turn into a decoder call.
 #
-# HunyuanVideo and LTX-2 keep no feature cache, so a tile is one decoder call over all of its
-# frames rather than a loop over them. Both also tile their frames a level up, in a temporal loop
-# that calls this one per chunk of them, so what is handed round here is the tiles of one chunk;
-# LTX-2 ships with that loop off, and HunyuanVideo with it on.
+# HunyuanVideo and LTX-2 keep no feature cache, so one decoder call handles all frames in a
+# spatial tile. Their temporal loops call this spatial loop once per frame chunk. LTX-2 disables
+# temporal tiling by default; HunyuanVideo enables it.
 #
-# Still out: CogVideoX tiles over frames inside this loop rather than above it, so its tiles are
-# not independent of one another the way every family here is. HunyuanVideo 1.5 was listed here
-# too until it turned out to belong to the other family - it walks an overlap fraction, not a
-# stride, and `overlap_tiled_decode` now covers it.
+# CogVideoX is excluded because its spatial loop also tiles frames, so its tiles are not
+# independent. HunyuanVideo 1.5 uses overlap-fraction tiling and is handled by
+# overlap_tiled_decode.
 _STRIDE_LOOPS = {
     "AutoencoderKLWan": _StrideLoop(
         patches=True,
@@ -582,19 +578,17 @@ def overlap_tiled_decode(
     One tile per decoder call, as upstream does. This preserves exact decoder-call semantics while
     allowing independent tiles to be dispatched in any order.
 
-    `dispatch` decides who makes those calls, and defaults to this rank making all of them in
-    order. `distvae.vae.tile_parallel` supplies one that deals them out to a group instead.
+    `dispatch` decides which rank makes each call and defaults to this rank making all calls in
+    order. `distvae.vae.tile_parallel` supplies a dispatcher for distributing calls to a group.
 
     `assemble` goes further and divides the blending too, by giving each rank a run of
     neighbouring tiles to decode and stitch by itself. Where it declines - too few tiles to give
     every rank one, or tiles too small to blend against a neighbour's edge alone - the decode
     falls back to `dispatch`, which divides the decoder calls and leaves the blending everywhere.
 
-    Three classes share this loop and spell it differently. HunyuanVideo 1.5 sizes its window per
-    axis rather than as one square edge, carries a frame axis, and hands back a bare tensor where
-    the others hand back a DecoderOutput. None of that reaches the loop: the window is read as a
-    pair either way, height and width are always the last two dimensions so `...` indexes them
-    whatever sits in front, and the return shape is matched to the method being replaced.
+    AutoencoderKL, Flux.2, and HunyuanVideo 1.5 share this loop but use different window
+    attributes and return types. Normalize every window to ``(height, width)`` and preserve the
+    original method's return type. Height and width are always the final two dimensions.
     """
     if not tiles_by_overlap_factor(vae):
         return None
@@ -603,8 +597,8 @@ def overlap_tiled_decode(
 
     from distvae.vae import tile_parallel as vae_tile_parallel
 
-    # Some classes hold the flag and a None conv, others only the conv; both spellings mean the
-    # same thing, and a class carrying neither has no post-quant step.
+    # Treat either config.use_post_quant_conv or a non-null post_quant_conv as enabling
+    # post-quantization convolution.
     use_post_quant_conv = getattr(
         getattr(vae, "config", None), "use_post_quant_conv", None
     )
@@ -705,8 +699,8 @@ def strided_tiled_decode(
     patch_size = getattr(vae.config, "patch_size", None) if loop.patches else None
 
     # `temb` and `causal` are LTX-2's, which conditions its decoder on them and passes them
-    # through its own tiled_decode to reach it. The families that do not take them never send
-    # them, so they sit at the default and this stays one signature for all four loops.
+    # through tiled_decode. Other families omit those arguments, so their defaults allow one
+    # replacement signature to support all four loops.
     def tiled_decode(z, temb=None, causal=None, return_dict: bool = True):
         _, _, num_frames, height, width = z.shape
         ratio = vae.spatial_compression_ratio

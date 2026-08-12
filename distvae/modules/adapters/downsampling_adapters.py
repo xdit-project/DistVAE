@@ -78,17 +78,12 @@ def _zero_pad_strided_conv(conv, conv_block_size, parallel_context):
 
 
 class Downsample2DAdapter(nn.Module):
-    """Shards the 2D downsampler AutoencoderKL and Flux.2 use, of which the convolution is the
-    only part that reaches across the split
+    """Shard the convolution in the 2D downsampler used by AutoencoderKL and Flux.2.
 
-    Told to pad by hand, as the encoders here tell it, it pads (0, 1, 0, 1) and then strides over
-    the result with no padding of its own, which is the pair replaced above. Because the pad is
-    written into the downsampler's own forward rather than the convolution, that case runs the
-    pieces here instead of delegating, so the pad is not applied twice. Told to pad inside the
-    convolution it is an ordinary strided one. Told not to convolve at all it averages each 2x2,
-    which reads one input position per output one so long as a rank holds whole pairs of rows, and
-    the bands Patchify cuts do. Its norm, where it has one, reduces over channels, so it is left
-    alone either way.
+    When ``padding == 0``, preserve the module's explicit ``(0, 1, 0, 1)`` padding and replace
+    only the convolution. Otherwise, adapt the existing strided convolution directly.
+    Average-pooling configurations need no cross-rank data because Patchify assigns complete row
+    pairs. Any normalization reduces over channels and therefore remains unsharded.
     """
 
     def __init__(

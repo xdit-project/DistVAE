@@ -57,19 +57,19 @@ def worker(rank, world_size, shape, num_groups, patch_dim, seed, affine, master_
 
 @pytest.mark.gloo
 @pytest.mark.parametrize("world_size", [1, 2, 4])
-def test_it_matches_group_norm_on_a_feature_map(world_size, master_port, seed=42):
+def test_patch_group_norm_matches_group_norm_on_a_feature_map(world_size, master_port, seed=42):
     run_distributed(worker, world_size, ((1, 16, 16, 16), 8, -2, seed, True), master_port)
 
 
 @pytest.mark.gloo
-def test_it_matches_group_norm_when_an_odd_height_is_split(master_port, seed=42):
-    """The height case that catches a norm summing across the wrong axis
+def test_patch_group_norm_matches_group_norm_when_an_odd_height_is_split(
+    master_port, seed=42
+):
+    """An uneven, non-square height split detects reduction over the wrong spatial axis.
 
-    The square even split above cannot: the axis only reaches the arithmetic through the element
-    count, and counting columns where the split is on rows over-counts by exactly the factor it
-    under-counts by. At 16x16 over two ranks both readings come to 512, so a norm reducing along
-    W passes a test named for H. Fifteen rows over two ranks gives one rank 8 and the other 7,
-    which is what stops the two cancelling.
+    An even 16x16 split gives the same element count for height and width, so it cannot detect
+    use of the wrong axis. Splitting a 15x4 tensor across height produces unequal rank sizes and
+    exposes that error.
     """
     run_distributed(
         worker, 2, ((1, 16, 15, 4), 8, -2, seed, True), master_port
@@ -78,13 +78,17 @@ def test_it_matches_group_norm_when_an_odd_height_is_split(master_port, seed=42)
 
 @pytest.mark.gloo
 @pytest.mark.parametrize("world_size", [1, 2])
-def test_it_matches_group_norm_on_a_video_feature_map(world_size, master_port, seed=42):
+def test_patch_group_norm_matches_group_norm_on_a_video_feature_map(
+    world_size, master_port, seed=42
+):
     # Video GroupNorm reduces over all of (F, H, W), including the axes around the split axis.
     run_distributed(worker, world_size, ((1, 16, 3, 8, 8), 4, -2, seed, True), master_port)
 
 
 @pytest.mark.gloo
-def test_it_matches_group_norm_on_a_video_map_of_three_different_extents(master_port, seed=42):
+def test_patch_group_norm_matches_group_norm_on_a_video_map_of_three_different_extents(
+    master_port, seed=42
+):
     # F, H and W all different and the split uneven, so confusing the split axis for either of
     # the two it is reduced alongside changes the count rather than cancelling against it.
     run_distributed(
@@ -93,7 +97,9 @@ def test_it_matches_group_norm_on_a_video_map_of_three_different_extents(master_
 
 
 @pytest.mark.gloo
-def test_it_matches_group_norm_when_the_width_is_split(master_port, seed=42):
+def test_patch_group_norm_matches_group_norm_when_the_width_is_split(
+    master_port, seed=42
+):
     run_distributed(worker, 2, ((1, 16, 16, 16), 8, -1, seed, True), master_port)
 
 
@@ -105,7 +111,7 @@ def test_it_matches_group_norm_when_the_width_is_split(master_port, seed=42):
         pytest.param((1, 16, 8, 10), -1, id="uneven-width"),
     ],
 )
-def test_it_matches_group_norm_on_uneven_spatial_bands_without_affine(
+def test_patch_group_norm_matches_group_norm_on_uneven_spatial_bands_without_affine(
     shape, patch_dim, master_port, seed=42
 ):
     run_distributed(
@@ -113,7 +119,7 @@ def test_it_matches_group_norm_on_uneven_spatial_bands_without_affine(
     )
 
 
-def test_video_frame_axis_is_rejected_in_its_positive_spelling():
+def test_positive_video_frame_axis_index_is_rejected():
     context = ParallelContext(None, rank=0, world_size=1, patch_dim=2)
     norm = GroupNormAdapter(nn.GroupNorm(1, 2), parallel_context=context)
     with pytest.raises(ValueError, match="frame axis"):
@@ -139,14 +145,14 @@ def test_constructing_a_second_norm_adapter_does_not_reconfigure_the_first(monke
 
 
 @pytest.mark.gloo
-def test_it_matches_group_norm_when_an_odd_width_is_split(master_port, seed=42):
-    """The case that catches a norm summing across the wrong axis
+def test_patch_group_norm_matches_group_norm_when_an_odd_width_is_split(
+    master_port, seed=42
+):
+    """An uneven, non-square width split detects reduction over the wrong spatial axis.
 
-    A width of 15 over two ranks gives one rank 8 columns and the other 7. That unevenness is
-    what makes the axis matter: split evenly, counting rows where the split is on columns
-    happens to arrive at the same element count anyway - the row count is over-counted by
-    exactly the factor the column count is under-counted by, and the two cancel. The square
-    width-split case above therefore passed while the norm was reducing along height.
+    Splitting a width of 15 across two ranks assigns 8 columns to one rank and 7 to the other.
+    An even square split gives the same element count for height and width and cannot expose this
+    error.
     """
     run_distributed(
         worker, 2, ((1, 16, 4, 15), 8, -1, seed, True), master_port

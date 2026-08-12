@@ -127,8 +127,8 @@ class TestCalcHaloWidth:
         """
         # k=5, p=1, s=2 over even patches: one row above, two below.
         assert calc_halo_width(1, [0, 8, 16, 24], 5, 1, 2) == (1, 2)
-        # k=3, p=0, s=2 over the uneven split: the output grid lands on the lower
-        # boundary, so a middle rank needs nothing below it at all.
+        # k=3, p=0, s=2 over the uneven split: the lower boundary is an output-grid position, so
+        # a middle rank needs no rows below it.
         assert calc_halo_width(1, [0, 9, 17, 24], 3, 0, 2) == (1, 0)
 
 

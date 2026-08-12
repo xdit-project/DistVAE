@@ -57,8 +57,8 @@ class UpDecoderBlock2DAdapter(nn.Module):
 class DownEncoderBlock2DAdapter(nn.Module):
     """Shards the 2D down block AutoencoderKL and Flux.2 encode with: its resnets and downsampler
 
-    Unlike the up block this is wrapped where it stands rather than rebuilt, because its forward
-    runs the two in order and needs nothing said about patches to do so.
+    Unlike the up block, this block is wrapped in place rather than rebuilt. Its forward method
+    runs both components in order without additional patch metadata.
     """
 
     def __init__(

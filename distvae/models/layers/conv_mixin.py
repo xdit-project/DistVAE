@@ -46,10 +46,9 @@ class PatchConvMixin:
     def _check_padding_mode(self, group_world_size: int) -> None:
         """Refuse a padding mode whose values a halo exchange cannot supply.
 
-        Zeros, replicate and reflect all read from within the patch or from nothing, so a rank
-        can produce them once its neighbours' rows have arrived. Circular reads from the far
-        edge of the image, which belongs to a rank this one does not border, and would
-        otherwise wrap silently within the patch and give an answer no one checked.
+        Zero, replicate, and reflect padding need only local values or rows from neighboring
+        ranks. Circular padding reads the opposite image edge, which may belong to a
+        non-neighboring rank and cannot be supplied by the halo exchange.
         """
         if group_world_size > 1 and self.padding_mode == "circular":
             raise NotImplementedError(

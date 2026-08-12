@@ -1,18 +1,16 @@
-"""Dealing a tiled VAE's tiles out to the ranks of a group, a whole tile at a time.
+"""Distribute complete VAE tiles among the ranks of a process group.
 
 Tiling and sharding both split a VAE decode, and composing them splits it twice. DistVAE shards
-the rows of whatever it is handed, and a tiled decode hands it one tile at a time, so every tile
-pays its own Patchify, a halo exchange per convolution, a reduction per norm and a gather to put
-the rows back. That bill is per tile and not per pixel, so narrowing the window multiplies it
-while the arithmetic each rank does shrinks, and past a certain tile count more ranks stop
-buying anything at all.
+the rows of each tile independently, so every tile requires Patchify, a halo exchange per
+convolution, a reduction per norm, and a gather. This communication cost is per tile rather than
+per pixel, so it increases as the window narrows and the tile count grows.
 
-Tiles are independent, which the rows inside a tile are not. Dealing whole tiles out costs two
-exchanges for the whole decode however many tiles there are, and leaves each rank decoding a
-tile the way one GPU would.
+Tiles are independent, although rows within a tile are not. Distributing complete tiles requires
+two exchanges for the full decode regardless of tile count, and each rank decodes its assigned
+tiles without row sharding.
 
-Nothing here knows what a tile is: a caller builds one thunk per decoder call its own loop would
-have made, and gets back what all of those calls returned, on every rank, in order.
+The caller supplies one callable per decoder invocation and receives every result on every rank
+in call order.
 """
 
 import functools
@@ -41,7 +39,7 @@ DOWN, ACROSS = -2, -1
 
 
 class Blend(NamedTuple):
-    """How a tiling loop stitches its tiles together, as both diffusers loops spell it"""
+    """Functions and dimensions used by Diffusers tiling loops to combine adjacent tiles."""
 
     down: Callable  # blend_v: mixes a tile's first `deep_down` rows with the tile above's last
     across: Callable  # blend_h: mixes its first `deep_across` columns with the left tile's last
@@ -87,12 +85,12 @@ def _distributed(context_or_group):
 
 
 def in_order(calls: Sequence[Call]) -> List[torch.Tensor]:
-    """Every call, here, in order: what a decode that is not parallel at all does"""
+    """Execute all calls sequentially in input order."""
     return [call() for call in calls]
 
 
 def dispatch_over(group) -> Dispatch:
-    """A dispatcher giving each rank of `group` its share of the calls and every rank the results"""
+    """Distribute calls across `group` and return all results on every rank."""
     group, rank, world_size = _distributed(group)
     if world_size < 2:
         return in_order
@@ -112,31 +110,26 @@ def dispatch_over(group) -> Dispatch:
 
 
 def sharing(group) -> Tuple[Dispatch, Callable]:
-    """The two ways a group divides a tiled decode: by run where it can, by call where it can't
+    """Return contiguous-run assembly and per-call dispatch for a process group.
 
-    Runs divide the blending as well as the decoding and send back the image once rather than
-    every overlapping tile, so they are what a tiled decode should use. They need a tile per rank
-    and tiles wider and deeper than two blends, and those are why the other one is still here.
+    Use contiguous-run assembly when every rank can receive a tile and each tile is large enough
+    to blend locally. Otherwise, distribute individual decoder calls and assemble the results on
+    every rank.
     """
     return dispatch_over(group), functools.partial(assemble_in_runs, group)
 
 
 def runs(weights: Sequence[int], world_size: int) -> List[Tuple[int, int]]:
-    """Tiles split into one contiguous run per rank, as evenly by `weights` as they divide
+    """Split tiles into one contiguous, weight-balanced run per rank.
 
-    Contiguous in the order the tiling loop walks, which is what makes a run cheap to blend: its
-    tiles' neighbours are mostly its own. Split by tile rather than by row, because a row is too
-    coarse a unit to balance with - three rows over two ranks is a two-to-one split, and the rank
-    left waiting costs more than dividing the blending saves.
+    Contiguous runs preserve tiling-loop order and keep most adjacent tiles on the same rank.
+    Tiles provide finer load balancing than complete grid rows.
 
-    Weighed by area rather than counted, because the two disagree in exactly the way a contiguous
-    run is worst placed to survive. The latent bounds clip the last row and the last column, so
-    the cheap tiles are not spread through the grid but gathered at the end of it, and an equal
-    count of them hands the last rank the lightest work every time.
+    Balance by tile area rather than tile count. Boundary clipping makes tiles in the last grid
+    row and column smaller, so equal tile counts can assign less work to the last rank.
 
-    The split minimises the heaviest run, since the decode waits for that one. Found by asking
-    whether a given ceiling can be met, which is a greedy walk, and halving the interval of
-    ceilings around it.
+    Minimize the maximum run weight using binary search over feasible weight limits and a greedy
+    feasibility check.
     """
     if world_size < 2:
         return [(0, len(weights))]
@@ -441,16 +434,13 @@ def assemble_here(
 
 
 def _wanted(owner: Sequence[int], columns: int, blend: Blend) -> Set[int]:
-    """The tiles whose raw edges a rank other than their own will read
+    """Return tiles whose unblended edges are needed by another rank.
 
-    Read off what the blending below asks for, tile by tile, rather than reasoned about from the
-    shape of a rank's share: a rank blending a tile reaches for the one above and the one to its
-    left, and only where one of those is somewhere else does anything have to travel. Where the
-    shares are runs that is about a row of tiles per rank however large the grid, and where a
-    tile has been moved across to level the load it is that tile's neighbours as well.
+    A tile blends with its upper and left neighbors. An edge must be transferred only when that
+    neighbor belongs to another rank. Contiguous assignments usually require one boundary row per
+    rank; load-balancing moves may add boundaries around the moved tile.
 
-    A blend no rows deep asks for nothing, so a stride wide enough to leave the tiles touching
-    rather than overlapping sends no edges at all on that axis.
+    An axis with zero overlap requires no edge transfer.
     """
     wanted: Set[int] = set()
     for n, rank in enumerate(owner):

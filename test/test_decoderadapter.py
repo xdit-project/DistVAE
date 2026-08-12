@@ -93,7 +93,7 @@ def worker(
             actual = adapter(latents)
 
         # The sharded GroupNorm sums its statistics across ranks in float32 before dividing, so
-        # it lands a little away from a single-rank reduction over the same values.
+        # its result differs slightly from a single-rank reduction over the same values.
         assert_matches_reference(rank, actual, expected, "DecoderAdapter", atol=1e-4)
     finally:
         dist.destroy_process_group()
@@ -101,7 +101,7 @@ def worker(
 
 @pytest.mark.gloo
 @pytest.mark.parametrize("world_size", [1, 2, 4])
-def test_a_sharded_decode_matches_a_single_rank_one(world_size, master_port, seed=42):
+def test_sharded_decode_matches_unsharded_decode(world_size, master_port, seed=42):
     run_distributed(worker, world_size, (16, 16, 0, False, False, seed), master_port)
 
 

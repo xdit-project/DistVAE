@@ -195,17 +195,17 @@ def test_a_halo_the_thinnest_band_can_just_lend_is_allowed(master_port, seed=42)
 
 
 @pytest.mark.parametrize("patch_dim", [-2, 3])
-def test_video_height_spellings_normalize_to_the_same_axis(patch_dim):
+def test_video_height_axis_indices_normalize_to_the_same_axis(patch_dim):
     assert normalize_patch_dim(patch_dim, ndim=5, spatial_only=True) == -2
 
 
 @pytest.mark.parametrize("patch_dim", [-1, 4])
-def test_video_width_spellings_normalize_to_the_same_axis(patch_dim):
+def test_video_width_axis_indices_normalize_to_the_same_axis(patch_dim):
     assert normalize_patch_dim(patch_dim, ndim=5, spatial_only=True) == -1
 
 
 @pytest.mark.parametrize("patch_dim", [-3, 2])
-def test_video_frame_axis_spellings_are_rejected(patch_dim):
+def test_video_frame_axis_indices_are_rejected(patch_dim):
     with pytest.raises(ValueError, match="frame axis"):
         normalize_patch_dim(patch_dim, ndim=5, spatial_only=True)
 

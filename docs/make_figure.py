@@ -1,16 +1,12 @@
 """Draw the README's figure: row sharding, then tile distribution at two windows.
 
-Three rows, one comparison. The first is row sharding. The second is tiling cut on the row
-axis alone, which lands on four full-width strips, one per rank: the same shape as the bands
-above it, so the only thing that changes between the two is the mechanism. The third cuts
-both axes. Reading down, one variable moves at a time.
+The first row shows row sharding. The second uses four full-width tiles, matching the
+row-sharding geometry while changing only the execution method. The third splits both spatial
+axes.
 
-Every row ends in the same five columns: what a rank holds, what the overlap costs in
-redundant work, how many joins a blend has to cover, how far past an even split the heaviest
-rank lands, and how often the ranks sync. The first four are all worse for tiling, so
-without the fifth the readout says only that tiling is a mistake. Row sharding goes through
-the same formulas as the other two, which is what makes it a baseline rather than a special
-case.
+The five columns show per-rank data, redundant work, blend boundaries, maximum load imbalance,
+and synchronization frequency. Row sharding uses the same formulas as both tiling configurations,
+so the values are directly comparable.
 
 The right-hand panels are all the same axis, time, with one lane per rank. Each is scaled to
 its own heaviest rank, so all three rows end at the same x and the lengths mean nothing
@@ -97,8 +93,8 @@ class Axis:
 
     Both are absolute output pixels, because that is the interface: `tile_shape_plan` takes
     a window and `tile_overlap_plan` takes an overlap, never a fraction of one. An axis the
-    sample already fits is inactive and has to be asked for zero, which is how a full-width
-    strip is spelled. The stride is not a control; it is what the pair leaves.
+    sample already fits is inactive and must use zero overlap, which represents a full-width
+    strip. The stride is derived from the window and overlap rather than configured directly.
 
     Everything below is in latent units, since that is what the grid is drawn in. `at` is
     where each tile starts and `extent` how far it reaches once the bound has clipped it.
@@ -116,11 +112,10 @@ class Axis:
 
 
 class Split:
-    """A way of dividing the latent, priced in the four terms every row is closed with
+    """Metrics for one way of dividing the latent.
 
-    `load` is what each rank ends up decoding, in latent units, and everything else follows
-    from it and from the tiles behind it. Row sharding and tiling are both measured through
-    here, by the same arithmetic, which is what lets the three rows be compared at all.
+    `load` is the latent area decoded by each rank. Row sharding and tiling use the same
+    calculations for peak activation area, total decoded work, seams, and load imbalance.
     """
 
     def __init__(self, weight, owner, seams):
@@ -133,16 +128,14 @@ class Split:
         # The tiles together cover more latent than there is, and every unit over is a
         # patch of image decoded twice.
         self.work = sum(weight) / BOUND ** 2
-        # How far past an even split the heaviest rank lands, which is what the others
-        # spend waiting for it.
+        # The heaviest rank's excess over an even split determines how long other ranks wait.
         self.imbalance = max(self.load) / (sum(self.load) / RANKS) - 1
 
 
 class Grid(Split):
-    """The tiles a window and an overlap leave, and who decodes each of them"""
+    """Metrics for the tile grid produced by a window and overlap."""
 
-    # The one column tiling wins; on the other four it loses to the bands it is shaped like.
-    # Reads under the header as "syncs: twice", against sharding's "syncs: every layer".
+    # Tile distribution synchronizes once during dispatch and once during assembly.
     syncs = "twice"
 
     def __init__(self, down, across):
@@ -159,11 +152,10 @@ class Grid(Split):
 
 
 class Bands(Split):
-    """Row sharding, put through the same arithmetic so it can be the baseline
+    """Metrics for row sharding.
 
-    There is no window and no overlap, so the weights are the bands themselves, one to a
-    rank. The work comes out at exactly the latent and the seams at none, which is the
-    contrast the two rows below are read against.
+    Each rank receives one band. Total decoded work equals the latent area and there are no tile
+    seams.
     """
 
     syncs = "every layer"
@@ -179,36 +171,16 @@ class Bands(Split):
 #     tile_shape_plan(vae, 352, 1408)
 #     tile_overlap_plan(vae, 88, 0, sample_shape=(1024, 1024))
 #
-# Cutting the rows alone. 344 pixels is 43 latent rows and 88 pixels of overlap is 11, which
-# steps by 32 and leaves four strips for four ranks with the last clipped to 32. Across, the
-# window is asked for at 1408 pixels: past 1366 a window clears the latent in one step
-# whatever it overlaps, so the axis is inactive, has to be given zero, and runs full width.
-#
-# The window is 344 and not a rounder 352 because the last strip is what a reader will
-# object to, and it should be the best one available rather than the first one tried. Four
-# overlapping strips need all four starts inside 128 rows, so the stride is at least 32 and
-# the fourth still has to stop at the bottom: no such split is ever even, and the most the
-# short strip can be is 32 against the others' 32 plus the overlap. This window is at that
-# floor, which makes the shortfall exactly the overlap and nothing else. A 352 window at the
-# same 88 steps by 33 instead, drops the short strip to 29, and idles a rank a third of the
-# decode for no more blend than this one gets.
+# A 344-pixel height is 43 latent rows. With an 88-pixel overlap, the 32-row stride produces
+# four strips whose latent heights are 43, 43, 43, and 32. A 1408-pixel width exceeds the image,
+# so width is untiled and uses zero overlap. A 352-pixel height would use a 33-row stride and
+# shorten the final strip to 29 rows without increasing its blend.
 STRIPS = Grid(Axis(344, 88), Axis(1408, 0))
 
-# Cutting both, at 432 by 296 pixels overlapping 72 on each axis. The window is rectangular,
-# and deliberately so. A square latent does not imply a square tile: what a rank holds is the
-# window's area, but the overlap is paid once per axis and the bounds clip whichever axis
-# does not divide. Sweeping every window the planners will land on this latent, this one
-# beats the squarest grid on every count at once: 12.2% held against 14.1%, 1.46x the work
-# against 1.47x, 0.4% past an even split against 15.1%, and 22 seams against 24. Finer grids
-# hold less; what this one does is dominate the square a reader would guess at.
-#
-# One overlap serves both axes because a seam is a seam: what a reader sees is the thinnest
-# blend on the page, so spending more on one axis improves joins that were already the
-# better ones. Asking for the diffusers quarter instead would give 120 by 72 here, which
-# looks like a per-axis decision and is only a fraction wearing pixels. The window has to be
-# re-picked to go with it, though, since the overlap sets the stride and the stride decides
-# where the last tile lands: hold 480 by 288 and drop to 72 on both and the last row clips
-# to 26 rows instead of 38, taking the imbalance from 0.4% to 8.3%.
+# A 432 × 296-pixel window with 72-pixel overlap produces the rectangular grid. Compared with
+# the squarest planner-selected grid, it holds 12.2% instead of 14.1% of the activations, decodes
+# 1.46× instead of 1.47× the latent area, has 0.4% instead of 15.1% load imbalance, and creates
+# 22 instead of 24 seams. Both axes use the same overlap so every seam has the same blend width.
 TILED = Grid(Axis(432, 72), Axis(296, 72))
 
 SHARDED = Bands()
@@ -272,7 +244,7 @@ UNIT = PANEL / BOUND
 SPAN = 5 * (LAYER + GAP)
 # The gap the elided layers leave in the row-sharding timeline. Wide enough for a run of
 # dots in every lane with the memory bracket's open edge clear of them, since that edge
-# lands three short of the collective that closes the row.
+# ends three units before the collective that closes the row.
 ELIDED = 24
 # One monospace digit at size 9, the size the blocks are numbered, which is what decides
 # whether a block is wide enough to hold its own number.
@@ -603,8 +575,8 @@ def window(y, grid, name, tail, aside, first, *second):
     last = start + max(grid.load) * scale
 
     # Idle belongs to a lane and not to the row: three of the four strips run the whole
-    # length, so one band across every lane would say they were waiting too. Each lane gets
-    # its own tail instead, from where its work runs out to where the last rank lands.
+    # length, so one band across every lane would imply that every rank waits. Each lane gets
+    # a separate tail from the end of its work to the latest rank completion.
     for r, ly in enumerate(lanes(y)):
         note(TRACK, ly + LANE / 2 + 4, f"rank {r}")
         at = start
@@ -677,11 +649,9 @@ def tiling(y):
         f"{STRIPS.down.window_px} px tall overlapping {STRIPS.down.overlap_px} px, "
         "full width",
         f"{word(STRIPS.tiles).capitalize()} strips, one per rank, have the same shape as "
-        "the bands above, but they overlap and nothing syncs until the end.",
+        "the row-sharded bands, but they overlap and nothing syncs until the end.",
         "Cut and overlap the rows",
         "One call each, and one rank waits",
-        # Was "nothing to deal out", which only meant anything to a reader who had already
-        # read the grid row below and knew there was a scheduler to have nothing to do.
         "With one strip per rank, there is nothing for the scheduler to decide.",
         f"The last strip is {STRIPS.down.extent[-1]} latent rows where the others are "
         f"{STRIPS.down.window}.",
@@ -704,8 +674,8 @@ def tiling(y):
            else f"{TILED.down.overlap_px} × {TILED.across.overlap_px} px"),
         f"{word(TILED.tiles).capitalize()} tiles across {word(RANKS)} ranks let the load "
         "be levelled, and a rank now holds a window rather than a strip.",
-        "Deal the tiles out",
-        "Each rank decodes its own, in turn",
+        "Distribute the tiles",
+        "Each rank decodes its assigned tiles sequentially",
         # A run is the cheap shape to blend but a coarse one to balance, so the scheduler
         # moves single tiles off it, which is why two lanes hold tiles from either end.
         "Each rank starts with a contiguous run, then single tiles move to level it.",
@@ -738,22 +708,14 @@ def legend(y):
 
 def draw():
     text(COL1, 30, "DistVAE parallelism", size=17, weight="700")
-    # The example every row runs on, said once so no header has to carry it. On its own
-    # line rather than trailing the title, since a fallback font only ever sets the bold
-    # wider and there is nothing to the right of it to absorb that.
+    # State the shared input once above all comparison rows.
     text(COL1, 49, f"The two modes below each decode a {BOUND * SCALE_VAE} × "
                    f"{BOUND * SCALE_VAE} image from a {BOUND} × {BOUND} latent on "
                    f"{word(RANKS)} GPUs.", size=11, fill=MUTED)
-    # What the two numbers below are counting. A figure this tall is met one screen at a
-    # time, so the word alternatives has to appear at the top: numbered headings alone
-    # would as readily be the halves of a pipeline, and the second half is where the page
-    # ends.
-    text(COL1, 65, "They are alternatives, and both are priced in the same five columns.",
+    text(COL1, 65, "The same five metrics compare both alternatives.",
          size=11, fill=MUTED)
 
-    # Above the rows rather than under them, so the marks are named before they are met,
-    # and above the first divider, so they read as belonging to the page and not to row
-    # sharding in particular.
+    # Define figure symbols before the comparison rows.
     y = legend(88)
     y = sharding(divider(y + 20) + 26)
     y = tiling(divider(y + 32) + 26)

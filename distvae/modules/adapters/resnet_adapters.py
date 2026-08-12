@@ -35,12 +35,8 @@ LTX2VideoResnetBlock3d = block(LTX2_VIDEO, "LTX2VideoResnetBlock3d")
 class ResnetBlock2DAdapter(nn.Module):
     """Shards a 2D residual block: its two convolutions, its two group norms, and any shortcut
 
-    The block is wrapped where it stands, as every other adapter in this file does it. It used to
-    be rebuilt instead, as a PatchResnetBlock2D - a copy of diffusers' block with the paths this
-    adapter refuses removed - whose constructor allocated a fresh set of convolutions and norms
-    that were then all overwritten by adapters holding the originals. Every weight it made was
-    thrown away unread, at the size of the block being sharded, and anything about the source
-    block its argument list did not name was replaced by a default rather than carried over.
+    Wrap the existing residual block in place. Reconstructing it as ``PatchResnetBlock2D`` would
+    allocate unused parameters and replace configuration not represented in that constructor.
     """
 
     def __init__(

@@ -108,10 +108,8 @@ def _run_one(
     )
 
 
-# The port comes from conftest, which keys it on a crc32 of the test's id rather than on hash().
-# hash() over a str is salted per process, so the fixture that used to live here picked a
-# different port every run - and a run that fails on a port collision is then a run nobody can
-# reproduce. Its range overlapped conftest's as well, so the two could hand out the same port.
+# The shared fixture uses CRC32 because Python salts string hashes per process. It also keeps all
+# distributed tests in one port range, preventing separate fixtures from selecting the same port.
 
 
 @pytest.mark.gloo

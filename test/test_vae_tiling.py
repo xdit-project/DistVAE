@@ -5,7 +5,7 @@ from distvae.vae import tiling as vae_tiling
 
 
 class StubVAE:
-    """Stands in for a diffusers VAE, carrying only the tiling attributes one would set"""
+    """Minimal VAE stub that stores the supplied tiling attributes."""
 
     def __init__(self, **attrs):
         for name, value in attrs.items():
@@ -26,14 +26,14 @@ def _diffusers_vae(testcase, name, kwargs, *, require_tiling=False):
 
 
 def legacy_pair_vae():
-    """AutoencoderKL and friends: a pixel window, a latent window, an overlap fraction"""
+    """Stub with shared square sample and latent windows and one overlap factor."""
     return StubVAE(
         tile_sample_min_size=256, tile_latent_min_size=32, tile_overlap_factor=0.25
     )
 
 
 def stride_vae():
-    """Wan, Qwen-Image, the video VAEs: a pixel window and an explicit pixel stride"""
+    """Stub with per-axis sample windows and explicit pixel strides."""
     return StubVAE(
         tile_sample_min_height=256,
         tile_sample_min_width=256,
@@ -44,7 +44,7 @@ def stride_vae():
 
 
 def overlap_hw_vae():
-    """CogVideoX-style: pixel and latent windows keyed by height and width, plus fractions"""
+    """Stub with per-axis sample windows, latent windows, and overlap factors."""
     return StubVAE(
         tile_sample_min_height=256,
         tile_sample_min_width=256,
@@ -56,7 +56,7 @@ def overlap_hw_vae():
 
 
 def asymmetric_vae():
-    """CogVideoX-style: a window taller than it is wide, which one edge cannot describe"""
+    """Stub with rectangular per-axis sample and latent windows."""
     return StubVAE(
         tile_sample_min_height=240,
         tile_sample_min_width=360,
@@ -68,7 +68,7 @@ def asymmetric_vae():
 
 
 def overlap_factor_vae(sample=256):
-    """AutoencoderKL and friends again, carrying the blending the tiled decode reuses"""
+    """Stub with shared square tiling attributes and blend methods."""
     return StubVAE(
         tile_sample_min_size=sample,
         tile_latent_min_size=sample // 8,
@@ -79,11 +79,7 @@ def overlap_factor_vae(sample=256):
 
 
 def overlap_keyed_vae():
-    """HunyuanVideo 1.5-style: windows keyed by axis, but ONE overlap fraction, and blending
-
-    The spelling that separates it from CogVideoX above, which keys the fraction by axis too and
-    walks its frames inside the loop rather than above it.
-    """
+    """Stub with per-axis windows, one shared overlap factor, and blend methods."""
     return StubVAE(
         tile_sample_min_height=256,
         tile_sample_min_width=256,
@@ -96,7 +92,7 @@ def overlap_keyed_vae():
 
 
 def per_axis_overlap_vae():
-    """A square window whose two axes carry their own overlap fractions"""
+    """Stub with unequal per-axis overlap factors and latent windows."""
     return StubVAE(
         tile_sample_min_height=256,
         tile_sample_min_width=256,
@@ -128,7 +124,7 @@ class TestDiffusersCompatibility(unittest.TestCase):
 class TestSupportProbe(unittest.TestCase):
 
     def test_the_method_alone_does_not_count_as_support(self):
-        # Diffusers hands out enable_tiling from a mixin whether or not the class implements it,
+        # Diffusers provides enable_tiling through a mixin whether or not the class implements it,
         # so a VAE can carry the method and still raise NotImplementedError when called.
         unsupported = StubVAE(enable_tiling=lambda: None)
         with self.assertRaises(ValueError):
@@ -511,7 +507,7 @@ class TestEverySupportedVAE(unittest.TestCase):
 class TestTileOverlap(unittest.TestCase):
     """The exact output-pixel overlap between neighbouring tiles."""
 
-    def test_both_storage_spellings_report_absolute_pixels(self):
+    def test_stride_and_overlap_factor_layouts_report_absolute_pixels(self):
         self.assertEqual(vae_tiling.tile_overlap(legacy_pair_vae()), (64, 64))
         self.assertEqual(vae_tiling.tile_overlap(stride_vae()), (64, 64))
         self.assertIsNone(vae_tiling.tile_overlap(StubVAE(tile_sample_min_size=256)))
@@ -633,22 +629,19 @@ class TestTileOverlap(unittest.TestCase):
 
 
 class TestTiledDecode(unittest.TestCase):
-    """The overlap-fraction loop reimplemented, which has to leave the image exactly as it was"""
+    """Tests DistVAE's replacement for overlap-factor tiled-decode loops."""
 
-    # The VAE classes that tile by overlap fraction, reusing the stand-ins above. HunyuanVideo 1.5
-    # is one of them despite looking like a video VAE: it keys its window by axis and carries a
-    # frame axis, but it walks an overlap fraction rather than a stride it stores.
+    # These classes derive tile strides from overlap factors. HunyuanVideo 1.5 uses per-axis
+    # window attributes and one shared overlap factor.
     FAMILY = ("AutoencoderKL", "AutoencoderKLFlux2", "AutoencoderKLHunyuanVideo15")
-    # Three windows of latents across, so a run holds several tiles of the full shape alongside
-    # the clipped ones at the right and bottom edges.
+    # Three windows per axis exercise both full and clipped boundary tiles.
     WINDOWS_ACROSS = 3
-    # Deep enough that a frame axis is not a singleton pretending to be one.
+    # Two frames exercise the video path without treating the frame axis as a singleton.
     FRAMES = 2
 
-    def test_only_the_overlap_factor_family_has_this_loop(self):
-        # The stride family walks a stride it stores outright, over a loop with its own blending.
-        # CogVideoX keys its overlap fraction by axis as well as its window, and tiles its frames
-        # inside this loop rather than above it, so the keyed window alone does not admit it.
+    def test_overlap_factor_detection_requires_a_supported_vae_class(self):
+        # Stored-stride VAEs use a different replacement loop. CogVideoX is excluded because its
+        # spatial loop also performs temporal tiling.
         self.assertTrue(vae_tiling.tiles_by_overlap_factor(overlap_factor_vae()))
         self.assertTrue(vae_tiling.tiles_by_overlap_factor(overlap_keyed_vae()))
         self.assertFalse(vae_tiling.tiles_by_overlap_factor(stride_vae()))
@@ -657,8 +650,7 @@ class TestTiledDecode(unittest.TestCase):
         self.assertIsNotNone(vae_tiling.overlap_tiled_decode(overlap_factor_vae()))
         self.assertIsNotNone(vae_tiling.overlap_tiled_decode(overlap_keyed_vae()))
 
-    def test_both_window_spellings_read_as_one_pair(self):
-        # A square edge is the same number on both axes, which is what lets one loop walk either.
+    def test_shared_and_per_axis_window_attributes_produce_the_same_pair(self):
         self.assertEqual(
             vae_tiling.overlap_windows(overlap_factor_vae()), ((32, 32), (256, 256))
         )
@@ -668,11 +660,11 @@ class TestTiledDecode(unittest.TestCase):
         self.assertIsNone(vae_tiling.overlap_windows(stride_vae()))
 
     def _sample(self, decoded):
-        """The tensor, whichever of the two shapes this family's tiled_decode hands back"""
+        """Return the sample tensor from either supported tiled-decode return type."""
         return getattr(decoded, "sample", decoded)
 
     def _tiled_vae(self, name, batch=1):
-        """A small VAE of class `name` at a narrowed window, and latents several tiles across"""
+        """Build a small tiled VAE and an input spanning several tiles."""
         import torch
 
         kwargs, video, channels = TestEverySupportedVAE.VAES[name]
@@ -702,7 +694,7 @@ class TestTiledDecode(unittest.TestCase):
         return vae, torch.randn(*shape)
 
     def _counted(self, vae):
-        """Replace the decoder with one that records the shape of every call"""
+        """Replace the decoder with a wrapper that records each input shape."""
         import torch.nn as nn
 
         class CountingDecoder(nn.Module):
@@ -717,7 +709,7 @@ class TestTiledDecode(unittest.TestCase):
 
             @property
             def rows(self):
-                """The rows each call carried: one tile each, at a latent batch of one"""
+                """Return the leading dimension of every decoder input."""
                 return [shape[0] for shape in self.shapes]
 
         counted = CountingDecoder(vae.decoder)
@@ -744,10 +736,8 @@ class TestTiledDecode(unittest.TestCase):
     def test_a_wider_step_decodes_fewer_tiles_to_the_same_image_size(self):
         import torch
 
-        # The same window can be stepped further apart so the decode
-        # covers the latent once instead of 1/(1-f)^2 times. Checked against the VAE's own loop
-        # at the same setting rather than against this one alone, since the failure a bad step
-        # causes is an image of the wrong size that upstream would assemble just as wrongly.
+        # Zero overlap increases the stride and reduces the tile count. Compare with the
+        # upstream loop at the same settings to verify both output size and values.
         for name in self.FAMILY:
             with self.subTest(vae=name):
                 vae, latents = self._tiled_vae(name)
@@ -775,13 +765,11 @@ class TestTiledDecode(unittest.TestCase):
                 self.assertEqual(got.shape, before.shape)
                 torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
-    def test_the_replacement_hands_back_what_it_replaced(self):
+    def test_the_replacement_preserves_the_upstream_return_type(self):
         import torch
 
-        # The loop is installed over tiled_decode and called by the VAE's own _decode, so it has
-        # to return what that caller expects. Most classes take a return_dict and wrap; HunyuanVideo
-        # 1.5 takes none and returns the tensor, and its _decode passes that straight to decode,
-        # which would otherwise end up wrapping a DecoderOutput inside another one.
+        # Most tiled-decode methods return DecoderOutput when requested. HunyuanVideo 1.5 returns
+        # a tensor directly. The replacement must preserve each class's return convention.
         for name in self.FAMILY:
             with self.subTest(vae=name):
                 vae, latents = self._tiled_vae(name)
@@ -805,8 +793,7 @@ class TestTiledDecode(unittest.TestCase):
         self.assertEqual(set(counted.rows), {2})
         torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
-    def test_only_a_reimplemented_loop_can_have_its_tiles_dealt_out(self):
-        # Choosing which rank makes which decoder call means owning the loop that makes them.
+    def test_tile_parallel_support_requires_a_distvae_owned_loop(self):
         self.assertTrue(vae_tiling.supports_tile_parallel(overlap_factor_vae()))
         self.assertTrue(vae_tiling.supports_tile_parallel(overlap_keyed_vae()))
         self.assertFalse(vae_tiling.supports_tile_parallel(stride_vae()))
@@ -830,18 +817,14 @@ class TestTiledDecode(unittest.TestCase):
                     got = self._sample(
                         vae_tiling.overlap_tiled_decode(vae, dispatch)(latents)
                     )
-                # One dispatch for the decode, holding every call it would have made itself,
-                # which is what lets a group divide them and pay for one exchange rather than
-                # one per tile.
+                # The replacement submits every tile in one dispatch call.
                 self.assertEqual(seen, [len(counted.shapes)])
                 torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
     def test_the_calls_can_be_made_in_any_order(self):
         import torch
 
-        # What a rank split rests on: the tiles are independent, so which order the decoder sees
-        # them in cannot matter. Only the assembly afterwards has an order, and it works off the
-        # results rather than the calls.
+        # Independent tiles may execute in any order; assembly restores grid order.
         def backwards(calls):
             return list(reversed([call() for call in reversed(calls)]))
 
@@ -868,27 +851,24 @@ class TestTiledDecode(unittest.TestCase):
 
 
 class TestStrideTiledDecode(unittest.TestCase):
-    """The video VAEs' own tiling loop, reimplemented so that its tiles can be handed round"""
+    """Tests DistVAE's replacement for stored-stride tiled-decode loops."""
 
-    # The families whose loop walks a stride they store. Wan and Qwen-Image decode a tile as a
-    # frame loop threading a feature cache cleared where the tile starts; HunyuanVideo and LTX-2
-    # keep no cache and decode a tile in one call, tiling their frames a level up instead.
+    # Wan and Qwen-Image decode each tile frame by frame with a tile-local feature cache.
+    # HunyuanVideo and LTX-2 decode each spatial tile in one call.
     FAMILY = (
         "AutoencoderKLWan",
         "AutoencoderKLQwenImage",
         "AutoencoderKLHunyuanVideo",
         "AutoencoderKLLTX2Video",
     )
-    # LTX-2 conditions its decoder on a timestep embedding and a causality flag, and takes them
-    # through tiled_decode to reach it, the embedding positionally. Nothing else here takes either.
+    # LTX-2 passes a positional timestep embedding through tiled_decode.
     CONDITIONED = ("AutoencoderKLLTX2Video",)
-    # Wide enough to be several tiles across once the window is halved, and two frames deep so
-    # that the cache is threaded through more than the chunk the tile opens with.
+    # The grid spans several tiles after halving the window. Two frames exercise cache reuse.
     LATENT_GRID = 16
     FRAMES = 2
 
     def _tiled_vae(self, name, **extra):
-        """A small video VAE of class `name` at a halved window, and latents a few tiles across"""
+        """Build a small video VAE and an input spanning several tiles."""
         import torch
 
         kwargs, _, channels = TestEverySupportedVAE.VAES[name]
@@ -912,26 +892,24 @@ class TestStrideTiledDecode(unittest.TestCase):
         return vae, torch.randn(1, channels, self.FRAMES, grid, grid)
 
     def _conditioning(self, vae):
-        """What a tiled_decode of this family takes between the latents and `return_dict`"""
+        """Return positional conditioning arguments required by tiled_decode."""
         return (None,) if type(vae).__name__ in self.CONDITIONED else ()
 
-    def test_only_the_families_whose_loop_this_is(self):
-        # A VAE's attributes do not settle this: `stride_vae` carries exactly the stride spelling
-        # these four use and is still not one of them, because the loop body is the class.
+    def test_stored_stride_detection_requires_a_supported_vae_class(self):
+        # Matching stride attributes is insufficient; support is limited to known loop
+        # implementations.
         self.assertFalse(vae_tiling.tiles_by_stored_stride(stride_vae()))
         self.assertFalse(vae_tiling.tiles_by_stored_stride(overlap_factor_vae()))
-        # HunyuanVideo 1.5 looks like a video VAE but belongs to the other family, walking an
-        # overlap fraction rather than a stride; `overlap_keyed_vae` is how it is spelled.
+        # HunyuanVideo 1.5 derives its stride from an overlap factor.
         self.assertFalse(vae_tiling.tiles_by_stored_stride(overlap_keyed_vae()))
 
-    def test_it_decodes_what_the_vae_decodes_for_itself(self):
+    def test_reimplemented_stride_tiling_matches_native_tiled_decode(self):
         import torch
 
         for name, extra in (
             ("AutoencoderKLWan", {}),
-            # Wan 2.2 folds a pixel unshuffle into the decode, which the assembly undoes at the
-            # end and which moves every stride and blend the loop measures in. Its channels
-            # carry the patch, and its spatial ratio carries it too, so both are given here.
+            # Wan 2.2 uses pixel unshuffle during decode. The channel count and spatial
+            # compression ratio must include its patch size.
             (
                 "AutoencoderKLWan",
                 {
@@ -951,8 +929,7 @@ class TestStrideTiledDecode(unittest.TestCase):
                 with torch.no_grad():
                     expected = vae.tiled_decode(latents, *args).sample
                     got = vae_tiling.strided_tiled_decode(vae)(latents, *args).sample
-                # The same calls in the same order on the same tensors, so exactly the same
-                # sample: this loop exists to hand the calls round, not to compute differently.
+                # Local execution must match the upstream loop exactly.
                 self.assertEqual(got.shape, expected.shape)
                 torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
@@ -974,8 +951,8 @@ class TestStrideTiledDecode(unittest.TestCase):
                     got = vae_tiling.strided_tiled_decode(vae, backwards)(
                         latents, *args
                     ).sample
-                # One call per tile, and the order they are made in cannot reach the sample:
-                # whatever a tile's frames share, no two tiles share anything.
+                # State may be shared between frames within one tile, but not between tiles.
+                # Tile execution order therefore cannot affect the output.
                 stride = vae.tile_sample_stride_height // vae.spatial_compression_ratio
                 across = len(range(0, latents.shape[-1], stride))
                 self.assertEqual(seen, [across * across])
@@ -984,11 +961,9 @@ class TestStrideTiledDecode(unittest.TestCase):
     def test_a_wider_step_decodes_fewer_tiles_to_the_same_image_size(self):
         import torch
 
-        # This family stores the stride outright and divides it twice on the way to using it -
-        # by the compression ratio to step the latent grid, and, where it decodes into a pixel
-        # unshuffle, by the patch size to place the crop. A stride that truncates in either would
-        # leave the grid and the crop describing different regions, so the step is checked
-        # against the VAE's own loop reading the same number.
+        # Stored pixel strides are converted to latent-grid steps by the compression ratio and,
+        # for pixel-unshuffle decoders, to crop steps by the patch size. Compare against the
+        # upstream loop to catch inconsistent integer conversion.
         for name in self.FAMILY:
             with self.subTest(vae=name):
                 vae, latents = self._tiled_vae(name)
@@ -1009,24 +984,20 @@ class TestStrideTiledDecode(unittest.TestCase):
                 torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
     def _tiles_across(self, vae, latents):
-        """How many tiles the grid is wide, off the stride the VAE is currently set to"""
-        # Counted from the grid rather than from the decoder, because the families keeping a
-        # feature cache decode a tile frame by frame and so make many calls for one tile.
+        """Return the number of tile columns at the VAE's current stride."""
+        # Count grid positions because cached VAEs make several decoder calls per tile.
         stride = vae.tile_sample_stride_width // vae.spatial_compression_ratio
         return len(range(0, latents.shape[-1], stride))
 
-    def test_the_frames_tiled_above_this_loop_still_reach_it(self):
+    def test_temporal_chunking_reaches_the_installed_spatial_loop(self):
         import torch
 
-        # HunyuanVideo tiles its frames a level up, in a temporal loop that calls this one once
-        # per chunk of them. Installing the loop has to reach those calls or the family gains
-        # nothing, and the chunks have to be wide enough that the temporal loop tiles them at all.
+        # HunyuanVideo's temporal loop calls the installed spatial loop once per frame chunk.
         vae, _ = self._tiled_vae("AutoencoderKLHunyuanVideo")
         ratio = vae.spatial_compression_ratio
         latent_stride = vae.tile_sample_stride_width // ratio
         chunk = vae.tile_sample_stride_num_frames // vae.temporal_compression_ratio
-        # One latent pixel past the window, which is the narrowest grid the temporal loop tiles
-        # at all, and two chunks of frames, which is the shallowest that it walks more than once.
+        # Exceed the spatial window by one latent pixel and provide two temporal chunks.
         grid = vae.tile_sample_min_width // ratio + 1
         torch.manual_seed(0)
         latents = torch.randn(1, vae.config.latent_channels, 2 * chunk, grid, grid)
@@ -1051,9 +1022,7 @@ class TestStrideTiledDecode(unittest.TestCase):
         )
         torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
-    def test_the_loop_is_only_reimplemented_to_hand_it_round(self):
-        # Without a group there is nothing to gain by replacing a loop that already does this,
-        # so the VAE keeps its own and only a dispatcher brings this one in.
+    def test_the_native_stride_loop_is_kept_without_a_dispatcher(self):
         vae, _ = self._tiled_vae("AutoencoderKLWan")
         self.assertTrue(vae_tiling.supports_tile_parallel(vae))
         self.assertIsNone(vae_tiling.tiled_decode_for(vae))

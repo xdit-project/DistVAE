@@ -42,10 +42,10 @@ class TestCacheCursor(unittest.TestCase):
         # is a single list for the life of the process, and what that gives is not an error but
         # a video conditioned on the tail of the previous decode.
         #
-        # Only what we define: these modules also import the diffusers blocks they wrap, and
-        # those spell the cursor `feat_idx=[0]` themselves. That default is upstream's to keep -
-        # diffusers threads a fresh list from its own decode, and every adapter here passes one
-        # explicitly - so it is out of our hands and out of our way.
+        # Only inspect definitions in this package. These modules also import the Diffusers blocks
+        # they wrap, which define their own `feat_idx=[0]` default. Diffusers supplies a fresh list
+        # for each decode, and every adapter passes one explicitly, so that upstream default is
+        # outside this test's scope.
         seen = set()
         for name in ADAPTER_MODULES:
             module = importlib.import_module(name)

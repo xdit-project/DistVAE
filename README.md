@@ -1,6 +1,6 @@
 # DistVAE
 
-Split a diffusers VAE across GPUs. DistVAE swaps the encoder and decoder for sharded versions through a set of adapters and leaves the rest of the model untouched, so the VAE stops being the memory spike in high-resolution generation.
+DistVAE replaces supported diffusers VAE encoders and decoders with distributed adapters. The rest of the diffusion pipeline stays unchanged.
 
 ## Installation
 
@@ -60,7 +60,7 @@ Both calls raise if there is no adapter for the VAE, so an unsupported model fai
 
 ## Supported VAEs
 
-Every family below has both adapters and can be row sharded or tiled. Qwen-Image is grouped with the video VAEs because its autoencoder is Wan-derived and takes a frame axis, not because it makes video.
+Every family below supports both row sharding and tiling. Qwen-Image is listed with the video VAEs because its Wan-derived autoencoder has a frame axis.
 
 | VAE | Frame axis | Tiles by | A tile is |
 | --- | --- | --- | --- |
@@ -72,19 +72,21 @@ Every family below has both adapters and can be row sharded or tiled. Qwen-Image
 | Wan | yes | a stored stride | a call per frame, threading a causal cache |
 | Qwen-Image | yes | a stored stride | a call per frame, threading a causal cache |
 
-Read the last column before narrowing a window. Where a tile is one call, the window sets how much memory a rank needs. Where it is a call per frame, that memory is already spent elsewhere and narrowing the window does nothing. `tile_overlap_plan` takes an exact output-pixel `(height, width)` overlap for every family and maps that request to the attributes its loop stores. `supports_tile_parallel` is true for every row, because DistVAE owns the tiling loop. CogVideoX is the notable absence, since it tiles frames inside the spatial loop rather than above it and its tiles are therefore not independent.
+Tile size affects the families differently. A smaller tile reduces peak memory when one tile is one decoder call. Wan and Qwen-Image decode one frame at a time, so their peak memory is usually set elsewhere.
+
+`tile_overlap_plan` accepts exact output-pixel `(height, width)` values and maps them to each VAE's stride settings. DistVAE owns the tiling loop for every family in the table. CogVideoX is excluded because it tiles frames inside the spatial loop, so its spatial tiles are not independent.
 
 ## Row sharding or tiling
 
-Two ways to cut a decode down to size, and they cost different things. The figure prices both, and tiling at two windows, in the same five columns:
+The figure compares row sharding with two tile sizes. Each row reports peak activations, decoded work, seams, load imbalance, and synchronization:
 
-![Generating a 1024 by 1024 image from a 128 by 128 latent on four GPUs: row sharding, then tile distribution at two windows, each priced in the same five columns](docs/figure.png)
+![Row sharding and two whole-tile distributions for a 1024 by 1024 image on four GPUs, compared by peak activations, work, seams, load imbalance, and synchronization](docs/figure.png)
 
-**Row sharding** gives every rank a band of rows and syncs inside every layer, so the image matches an unsharded decode. Communication scales with the depth of the decoder. Every rank still runs that whole decoder, so per-rank memory falls with the GPU count only down to the weights.
+**Row sharding** gives each rank a band of rows and communicates inside every adapted layer. It preserves the unsharded result. Activation memory falls as ranks are added, but every rank still stores the full decoder.
 
-**Tiling** gives each rank whole windows and exchanges twice for the entire decode. Peak memory tracks the tile rather than the image or the GPU count, which is why it is the only one that helps on a single GPU. The cost is redundant work at the overlaps, and some fidelity: a group norm inside a tile sees only that tile.
+**Tiling** gives each rank complete windows and communicates when distributing and assembling them. Peak memory follows the tile size, including on one GPU. Overlap repeats work, and normalization over one tile can change the output.
 
-[Row sharding or tiling](docs/strategies.md) covers the rest: why DistVAE deals whole tiles out rather than sharding inside the loop, what that costs in granularity, why the best window on a square latent is rectangular, and where video fits.
+[Row sharding or tiling](docs/strategies.md) explains when to use each mode.
 
 ## Usage
 
@@ -126,7 +128,7 @@ There are more runnable examples in `test/`.
 
 ### Tiling
 
-Diffusers decides whether to tile. DistVAE resizes the window and deals the tiles across the group:
+Diffusers decides whether to tile. DistVAE resizes the window and distributes the tiles across the group:
 
 ``` python
 from distvae import vae as vae_api
@@ -163,25 +165,24 @@ if tiled_decode is None:
 pipe.vae.tiled_decode = tiled_decode
 ```
 
-The window and the overlap are separate controls, and both are set in absolute output pixels rather than as a fraction of anything. The window sets what one tile costs in memory. The overlap sets how much of the decode is redundant: it narrows the stride the loop walks, and tiling both axes covers `(height_window / height_stride) × (width_window / width_stride)` times the latent.
+Window and overlap are separate controls in output pixels. The window sets the memory required for one tile. The overlap reduces the stride and increases repeated work.
 
-Three things to know about the planners. Both return `None` when they cannot meet a request exactly, so check before applying. Apply `tile_shape_plan` before `tile_overlap_plan`, which reads the shape currently set on the VAE. Overlap is never rounded or widened: each requested pixel count must map exactly to the loop's stride arithmetic.
+Both planners return `None` when a request cannot be represented exactly. Apply `tile_shape_plan` first because `tile_overlap_plan` reads the current tile shape. Requested overlap values are never rounded.
 
-[Choosing a tile window](docs/tiling.md) covers what to ask them for: how the two axes differ, why clipping rather than tile count is what unbalances a grid, and where widening the overlap is free.
+[Choosing a tile window](docs/tiling.md) explains rectangular windows, clipped edge tiles, and overlap.
 
 ### xDiT integration
 
-xDiT owns tile-policy choices and calls the DistVAE planners. Its
-`vae_tile_overlap_height` and `vae_tile_overlap_width` settings are exact output pixels and must
-be supplied together. Use zero for an inactive strip axis. Custom shape or overlap settings
-install a fresh tiled-decode replacement; a later installation replaces the earlier callable
-rather than wrapping it.
+xDiT chooses the tile settings and calls the DistVAE planners. Supply
+`vae_tile_overlap_height` and `vae_tile_overlap_width` together in output pixels. Use zero on an
+axis that is not tiled. Installing new shape or overlap settings replaces the previous tiled
+decode callable.
 
 ## Performance
 
 Latency and memory depend on the VAE family, input shape, rank count, device, and interconnect.
-The benchmark chooses three bounded rectangular plans and records their work, memory proxy, and
-load imbalance before measuring them. See `bench/README.md` for the suite and its limits.
+The benchmark chooses up to three rectangular plans and records their work, memory estimate, and
+load imbalance before running them. See `bench/README.md` for the suite and its limits.
 
 ## Development
 
@@ -194,7 +195,7 @@ pytest
 
 Tests marked `gloo` spawn several ranks over gloo and need no accelerator, so `pytest -m gloo` exercises the distributed paths on a CPU-only machine.
 
-`docs/make_figure.py` redraws the figure above. It writes the SVG with the standard library alone, and the PNG too if `cairosvg` is installed.
+`docs/make_figure.py` regenerates `docs/figure.svg` and, when `cairosvg` is installed, `docs/figure.png`.
 
 ## License
 

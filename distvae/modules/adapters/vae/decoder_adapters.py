@@ -76,9 +76,13 @@ class DecoderAdapter(nn.Module):
     ):
         super().__init__()
         _reject_benchmark_options(use_profiler, verbose)
-        assert isinstance(decoder.conv_norm_out, nn.GroupNorm), "DecoderAdapter does not support normalization method except GroupNorm"
+        assert isinstance(decoder.conv_norm_out, nn.GroupNorm), (
+            "DecoderAdapter requires conv_norm_out to be nn.GroupNorm"
+        )
         for up_block in decoder.up_blocks:
-            assert isinstance(up_block, UpDecoderBlock2D), "DecoderAdapter does not support up block except UpDecoderBlock2D"
+            assert isinstance(up_block, UpDecoderBlock2D), (
+                "DecoderAdapter requires every up block to be UpDecoderBlock2D"
+            )
         patch_dim = normalize_patch_dim(patch_dim, 4, spatial_only=True)
         self.patch_dim = patch_dim
         self.parallel_context = parallel_context(vae_group, patch_dim, ndim=4)
@@ -134,9 +138,9 @@ class _CausalDecoderAdapter(nn.Module):
 
     These decoders share a skeleton: a causal convolution in, a mid block, a run of up blocks, a
     normalisation, and a causal convolution out. Where that norm is RMS it needs no sharding,
-    reducing over channels rather than over the axis being split; where it is a GroupNorm it
-    does, and gets wrapped below. What else differs between the families is which classes fill
-    the other slots, and how much of the temporal caching their forwards thread through.
+    reducing over channels rather than over the axis being split; GroupNorm requires the
+    distributed wrapper. The families also use different classes for the remaining layers and
+    pass different temporal-cache state through their forward methods.
     """
 
     _label = "Decoder"

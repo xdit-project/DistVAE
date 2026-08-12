@@ -80,8 +80,7 @@ def worker(
             actual = adapter(pixels)
 
         # The sharded GroupNorms inside the down blocks sum their statistics across ranks in
-        # float32 before dividing, which lands a little away from one rank reducing the same
-        # values in one pass.
+        # float32 before dividing, so their results differ slightly from a single-rank reduction.
         assert_matches_reference(rank, actual, expected, "EncoderAdapter", atol=1e-4)
     finally:
         dist.destroy_process_group()
@@ -89,7 +88,7 @@ def worker(
 
 @pytest.mark.gloo
 @pytest.mark.parametrize("world_size", [1, 2, 4])
-def test_a_sharded_encode_matches_a_single_rank_one(world_size, master_port, seed=42):
+def test_sharded_encode_matches_unsharded_encode(world_size, master_port, seed=42):
     run_distributed(worker, world_size, (64, 64, True, 0, seed), master_port)
 
 

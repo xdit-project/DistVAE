@@ -69,8 +69,8 @@ FAMILIES = {
         "spatial": 8,
         "temporal": 4,
         # Portrait 480p and 720p at the production length. 81 frames is 21 latent ones, which is
-        # enough that the unsharded case may not fit at 720p; that failure is recorded per cell
-        # and the tiled arms still run, and it is the clearest statement of why tiling exists.
+        # enough that the unsharded case may not fit at 720p. That failure is recorded per cell,
+        # and the tiled configurations continue.
         "shapes": ((832, 480, 81), (1280, 720, 81)),
         "note": "Wan video autoencoders",
     },

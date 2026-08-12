@@ -3,7 +3,7 @@
 <rect width="680" height="1192" fill="#ffffff"/>
 <text x="40.00" y="30.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="17" fill="#1b1f24" text-anchor="start" font-weight="700">DistVAE parallelism</text>
 <text x="40.00" y="49.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#6a737d" text-anchor="start" font-weight="400">The two modes below each decode a 1024 × 1024 image from a 128 × 128 latent on four GPUs.</text>
-<text x="40.00" y="65.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#6a737d" text-anchor="start" font-weight="400">They are alternatives, and both are priced in the same five columns.</text>
+<text x="40.00" y="65.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#6a737d" text-anchor="start" font-weight="400">The same five metrics compare both alternatives.</text>
 <rect x="40.00" y="79.00" width="5.00" height="14.00" rx="2" fill="#a7b0b8" stroke="none" stroke-width="0"/>
 <text x="54.00" y="90.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">collective: every rank waits</text>
 <line x1="231.00" y1="77.00" x2="231.00" y2="95.00" stroke="#a7b0b8" stroke-width="1.3" marker-end="url(#down)" marker-start="url(#up)"/>
@@ -109,7 +109,7 @@
 <text x="40.00" y="574.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">The image is close but not exact: a blend hides seams, but norms over too small a tile can leave the colour blocky.</text>
 <text x="40.00" y="600.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="700">Cut the rows only</text>
 <text x="190.00" y="600.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#6a737d" text-anchor="start" font-weight="400">344 px tall overlapping 88 px, full width</text>
-<text x="40.00" y="617.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">Four strips, one per rank, have the same shape as the bands above, but they overlap and nothing syncs until the end.</text>
+<text x="40.00" y="617.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">Four strips, one per rank, have the same shape as the row-sharded bands, but they overlap and nothing syncs until the end.</text>
 <rect x="40.00" y="632.00" width="120.00" height="40.31" rx="0" fill="#dce9f7" stroke="none" stroke-width="0" fill-opacity="0.55"/>
 <rect x="40.00" y="662.00" width="120.00" height="40.31" rx="0" fill="#dff0da" stroke="none" stroke-width="0" fill-opacity="0.55"/>
 <rect x="40.00" y="692.00" width="120.00" height="40.31" rx="0" fill="#fce8d0" stroke="none" stroke-width="0" fill-opacity="0.55"/>
@@ -267,8 +267,8 @@
 <text x="376.00" y="1108.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">0.4%</text>
 <text x="488.00" y="1093.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">syncs</text>
 <text x="488.00" y="1108.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">twice</text>
-<text x="40.00" y="1134.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#1b1f24" text-anchor="start" font-weight="600">Deal the tiles out</text>
-<text x="216.00" y="1134.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#1b1f24" text-anchor="start" font-weight="600">Each rank decodes its own, in turn</text>
+<text x="40.00" y="1134.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#1b1f24" text-anchor="start" font-weight="600">Distribute the tiles</text>
+<text x="216.00" y="1134.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#1b1f24" text-anchor="start" font-weight="600">Each rank decodes its assigned tiles sequentially</text>
 <text x="216.00" y="1150.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">Each rank starts with a contiguous run, then single tiles move to level it.</text>
 <text x="216.00" y="1164.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">Rank 3 decodes five tiles to rank 0's three, and they still finish together.</text>
 </svg>

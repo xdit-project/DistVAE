@@ -76,7 +76,7 @@ def worker(
 
 
 @pytest.mark.gloo
-def test_a_sharded_hunyuan_encode_matches_a_single_rank_one(master_port, seed=42):
+def test_sharded_hunyuan_encode_matches_unsharded_encode(master_port, seed=42):
     run_distributed(worker, 2, (5, 64, 64, True, 0, seed), master_port)
 
 

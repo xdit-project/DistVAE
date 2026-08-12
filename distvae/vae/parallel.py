@@ -183,10 +183,10 @@ def _injects_noise(half) -> bool:
 
 
 def _patch_size(vae) -> Optional[int]:
-    """The VAE's own patching factor, where it patches on top of its conv stack"""
-    # A single factor is Wan's spelling and the only one either adapter can act on. Flux 2 spells
-    # the pixel unshuffle at its boundary `(2, 2)`, which is not that and is not something an
-    # adapter takes, so anything other than one number reads as no patching.
+    """Return the VAE's spatial patching factor applied outside its convolution stack."""
+    # Wan stores one scalar factor, which is the only layout either adapter can use. Flux 2 stores
+    # its boundary pixel-unshuffle factor as `(2, 2)`; that tuple does not describe adapter-level
+    # patching, so anything other than one number is treated as no patching.
     patch_size = getattr(vae.config, "patch_size", None)
     return patch_size if isinstance(patch_size, int) and patch_size > 1 else None
 

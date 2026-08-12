@@ -184,7 +184,7 @@ class _StubAdapter(nn.Module):
 
 
 class TestWrappingReadsEveryVAEConfig(unittest.TestCase):
-    """Wrapping reads the VAE's config, so it has to survive how each class spells it"""
+    """Wrapping supports the configuration attribute layouts used by each VAE class."""
 
     def _parallelize(self, vae):
         with mock.patch.object(vae_parallel, "_adapter", return_value=_StubAdapter):

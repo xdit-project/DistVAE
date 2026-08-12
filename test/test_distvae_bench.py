@@ -192,7 +192,7 @@ def test_every_catalogued_family_carries_a_matrix():
     "value",
     ["none", "row:256x256@32x32", "local:256@32x32", "local:256x256"],
 )
-def test_case_parser_rejects_legacy_or_incomplete_spelling(value):
+def test_case_parser_rejects_legacy_or_incomplete_syntax(value):
     with pytest.raises(ValueError):
         cases.parse_case(value, 512, 256, 1)
 
@@ -253,11 +253,10 @@ def test_selector_zeros_overlap_on_inactive_strip_axis():
 def test_selector_searches_overlap_and_can_beat_row_sharding():
     """A plan is only a memory win when its window is smaller than a row shard.
 
-    Overlap used to be pinned at the VAE native value, and since `window = pitch + overlap`
-    that put a floor under every window: on this sample the smallest reachable was 512x512,
-    which exactly ties the 262144 a rank holds under row sharding. The suite could therefore
-    never propose a memory win, which looked like a result about tiling and was really a
-    result about the search space.
+    Since `window = pitch + overlap`, fixing overlap at the VAE native value imposes a lower
+    bound on every window. On this sample the smallest reachable window is 512x512, which equals
+    the 262144 pixels assigned to one row-sharded rank. Searching smaller overlaps is therefore
+    required to propose a configuration that reduces memory.
     """
     sample_shape, world_size, native = (1024, 1024), 4, (256, 256)
     plans = cases.select_plans(
@@ -290,13 +289,12 @@ def test_overlap_ladder_scales_with_pitch_and_keeps_the_native_value():
 
 
 def test_selector_keeps_every_blend_above_a_quarter_of_its_window():
-    """Tile size sets how far a tile's tone drifts; overlap sets whether that reads as a band.
+    """Keep overlap at least one quarter of the normalized window.
 
     Measured on FLUX.2 at 1024x1024 on four ranks: a 128px window blended 32px is clean, the
-    same window blended 16px bands, and differencing the two decodes leaves the residual
-    concentrated at the thin arm's own stride. The bound therefore has to hold against the
-    window actually used - a normalizer that grows the window to reach a VAE-valid shape while
-    the overlap stays put would otherwise thin the blend back under it.
+    same window blended 16px shows banding, and the difference is concentrated at tile
+    boundaries. Check the bound after window normalization because normalization may enlarge the
+    window without changing the overlap.
     """
 
     def grow(window, overlap):
@@ -321,12 +319,10 @@ def test_selector_keeps_every_blend_above_a_quarter_of_its_window():
 
 
 def test_selector_declines_a_fine_profile_that_is_only_a_transpose():
-    """The fine end has to be finer, not merely different.
+    """Require the fine profile to have a smaller window area than the coarse profile.
 
-    Window area, decoded area and rank imbalance are all symmetric under transpose, so on a
-    square sample the runner-up used to be the first pick's own mirror - scoring identically
-    while measuring 17% heavier on the hardware, because a full-width strip is a few long
-    contiguous spans and a full-height one is a row of short ones.
+    Transposed windows have equal modeled area, work, and imbalance. Measurements showed that a
+    full-height transpose used 17% more memory than the selected full-width strip.
     """
     plans = cases.select_plans(
         sample_shape=(1024, 1024),
@@ -348,12 +344,9 @@ def test_selector_declines_a_fine_profile_that_is_only_a_transpose():
 def test_profiles_bracket_the_tile_axis_rather_than_predicting_a_winner():
     """Coarse is the fewest tiles and fine the most, so the suite spans the axis it is testing.
 
-    The profiles used to be named for outcomes, and throughput was scored by least total work -
-    which always chose the widest window, since a wide tile overlaps its neighbours fewer times.
-    On gfx1201 those arms were both the slowest AND heavier than plain row sharding, 5034 MB
-    against row's 3526 at 2048x2048 on four ranks, so the name claimed the opposite of what the
-    hardware did. Which end wins is for the bench to measure and may differ per device; the
-    planner's job is only to put both ends in front of it.
+    On gfx1201, the configurations with the least modeled work were slower and used more memory
+    than row sharding: 5034 MB versus 3526 MB at 2048x2048 on four ranks. Performance may differ
+    by device, so profile names describe geometry rather than predicted outcomes.
     """
     for sample_shape, world_size in (((1024, 1024), 2), ((2048, 2048), 4)):
         plans = cases.select_plans(
@@ -458,9 +451,9 @@ def _bounded_plans():
 def test_default_suite_carries_only_selectable_compositions():
     """Local tiling and row-beneath-tiling are not reachable, so they are not the default.
 
-    An orchestrator branches between marking a VAE for tile parallelism and parallelizing its
-    decoder, and never lands between the two. Those cases are also about 60% of the suite's
-    compute, which is a poor trade for a number nobody can act on.
+    An orchestrator either marks a VAE for tile parallelism or parallelizes its decoder; it does
+    not combine those modes. The excluded cases also account for about 60% of the suite's
+    compute without representing a supported deployment configuration.
     """
     plans = _bounded_plans()
 
@@ -1719,7 +1712,7 @@ def test_custom_overlap_installs_the_per_axis_replacement(monkeypatch):
         measure.vae_api, "tiled_decode_for", lambda value: replacement
     )
 
-    measure.configure_tiling(
+    facts = measure.configure_tiling(
         vae,
         {
             "sharding": "unsharded",
@@ -1811,8 +1804,8 @@ def test_a_failure_on_some_ranks_only_is_reported_as_divergence():
 
 
 def test_a_crossed_gather_is_recorded_rather_than_raised():
-    # What the group hands back once the ranks stop matching up the same calls: rank 1 is still
-    # inside another all_gather_object, so its payload arrives here instead of a failure record.
+    # When ranks call different collectives, rank 1 is still inside another all_gather_object, so
+    # its payload arrives instead of a failure record.
     failures = [{"type": "OutOfMemoryError", "message": "no", "rank": 0}, [None, None]]
 
     assert distributed.ranks_diverged(failures)
@@ -1827,3 +1820,63 @@ def test_a_crossed_gather_is_recorded_rather_than_raised():
 def test_no_failure_anywhere_is_not_divergence():
     assert not distributed.ranks_diverged([None, None, None, None])
     assert distributed.aggregate_rank_errors([None, None]) is None
+
+
+def test_overlap_grows_with_a_normalized_window():
+    # A quarter of 86 is 22, but 22 is only 17% of the normalized 128px window.
+    assert cases.blend_for_window((22, 22), (128, 128)) == (32, 32)
+    # Already a quarter or wider, so left exactly as it is.
+    assert cases.blend_for_window((32, 64), (128, 128)) == (32, 64)
+    # An inactive axis blends nothing and stays that way.
+    assert cases.blend_for_window((0, 22), (128, 128)) == (0, 32)
+
+
+def test_vae_normalizer_returns_overlap_for_the_normalized_window(monkeypatch):
+    """A coarse window increment requires overlap to grow with the normalized window.
+
+    LTX-2 quantizes windows to 256px. Without overlap adjustment, every candidate at its CI shape
+    has overlap below one quarter of the normalized window and select_plans rejects all of them.
+    """
+    planned = []
+    # This mutable stub allows the normalizer to apply the planned window.
+    vae = SimpleNamespace()
+    monkeypatch.setattr(cases.vae_api, "tile_shape", lambda value: (128, 128))
+    # Only multiples of 128 are tileable, so a 200px request snaps to 256.
+    monkeypatch.setattr(
+        cases.vae_api,
+        "tile_shape_plan",
+        lambda value, height, width: (
+            {"window": (height, width)} if height % 128 == 0 and width % 128 == 0 else None
+        ),
+    )
+    monkeypatch.setattr(cases, "latent_rows", lambda value, plan: 32)
+    monkeypatch.setattr(
+        cases.vae_api,
+        "tile_overlap_plan",
+        lambda value, *overlap, **kwargs: planned.append(overlap) or {"overlap": overlap},
+    )
+
+    normalize = cases.normalizer_for_vae(vae, (1024, 1024), world_size=4)
+    window, overlap = normalize((200, 200), (50, 50))
+
+    assert window == (256, 256)
+    assert overlap == (64, 64), "overlap must follow the normalized window"
+    assert planned == [(64, 64)], "the adjusted overlap must be planned"
+
+
+def test_a_selected_plan_never_blends_thinner_than_a_quarter():
+    plans = cases.select_plans(
+        sample_shape=(1088, 1920),
+        native_overlap=(64, 64),
+        world_size=8,
+        normalize=lambda window, overlap: (
+            # A coarse quantum, as LTX-2 has: windows snap up to the next multiple of 256.
+            (-(-window[0] // 256) * 256, -(-window[1] // 256) * 256),
+            overlap,
+        ),
+    )
+
+    assert plans
+    for plan in plans:
+        for blend, size in zip(plan["overlap"], plan["window"]):
+            assert blend == 0 or blend * 4 >= size, plan
