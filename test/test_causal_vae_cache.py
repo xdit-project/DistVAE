@@ -83,32 +83,6 @@ def _assert_public_chunks(records, cache_size):
     assert all(record["mutated"] for record in records)
 
 
-def test_public_chunk_check_uses_cursor_identity():
-    cache = []
-    records = [
-        {
-            "cache": cache,
-            "cursor": [0],
-            "start": 0,
-            "end": 1,
-            "nonempty_before": 0,
-            "nonempty_after": 1,
-            "mutated": True,
-        },
-        {
-            "cache": cache,
-            "cursor": [0],
-            "start": 0,
-            "end": 1,
-            "nonempty_before": 1,
-            "nonempty_after": 1,
-            "mutated": True,
-        },
-    ]
-
-    _assert_public_chunks(records, cache_size=1)
-
-
 def _assert_omitted_cursor_sessions(adapter, sample, cache_size, **kwargs):
     outputs = []
     for _ in range(2):

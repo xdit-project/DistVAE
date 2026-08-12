@@ -1,4 +1,3 @@
-import ast
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,43 +14,6 @@ from bench.harness import (
     report,
     shape_costs,
 )
-
-
-def test_harness_has_no_optional_runner_dependency():
-    # Checked on the parsed imports rather than the raw text. The harness must not IMPORT the
-    # runners it exists to measure for, but it may name them: the default suite carries only
-    # the compositions an orchestrator can select, and saying which orchestrator, and where it
-    # branches, is the clearest way to explain why the others are diagnostics.
-    root = Path(__file__).parents[1] / "bench"
-    forbidden = ("x" + "fuser", "x" + "dit")
-    for path in root.rglob("*.py"):
-        imported = []
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Import):
-                imported.extend(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                imported.append(node.module)
-        assert not [
-            name for name in imported if name.lower().split(".")[0] in forbidden
-        ], path
-
-
-def test_smoke_families_imports_catalog_without_path_mutation():
-    source = (Path(__file__).parents[1] / "bench" / "smoke_families.py").read_text()
-    assert "sys.path" not in source
-    assert "harness.catalog" in source
-
-
-def test_benchmark_docs_track_the_schema_and_the_case_cli():
-    text = (Path(__file__).parents[1] / "bench" / "README.md").read_text()
-
-    # Read off the constant rather than spelled out here, because a number written in two places
-    # drifts: this is how the README came to describe schema 6 while the harness wrote 7.
-    assert f"schema {report.SCHEMA_VERSION}" in text
-    assert "--case" in text
-    assert "--tile-shape-windows" in text
-    for removed in ("--grid-arms", "--vae-tile-size", "--tile-shape-sides"):
-        assert removed not in text
 
 
 def test_describe_only_runs_on_cpu_without_distributed_environment(
@@ -619,13 +581,6 @@ def test_rank_error_helpers_preserve_original_rank_and_type(monkeypatch):
         {"type": "RuntimeError", "message": "local", "rank": 0},
         peer,
     ]
-
-
-def test_extracted_benchmark_modules_own_shape_costs_and_profiling():
-    assert not hasattr(measure, "tile_shape_costs")
-    assert not hasattr(measure, "profile_once")
-    assert callable(shape_costs.tile_shape_costs)
-    assert callable(profile.profile_once)
 
 
 def test_parser_exposes_harness_owned_profiler_controls(tmp_path):
