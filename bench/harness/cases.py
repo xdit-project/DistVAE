@@ -6,9 +6,11 @@ from distvae import vae as vae_api
 from distvae.vae.tile_parallel import shares
 from distvae.vae.tiling import latent_rows
 
+from . import catalog
 
-PROFILES = ("throughput", "balanced", "memory")
+PROFILES = ("coarse", "balanced", "fine")
 MODES = ("unsharded", "row", "local", "tile-runs", "row-tiled")
+MIN_TILE_LATENT_EXTENT = 16
 
 
 def parse_pair(value, label):
@@ -79,6 +81,8 @@ def cells_from_args(args):
 def shapes_from_args(args):
     """Return explicitly requested sample shapes or the single global shape."""
     if not args.shape:
+        if getattr(args, "matrix", False):
+            return list(catalog.matrix_for(args.family))
         return [(args.height, args.width, args.frames)]
     shapes = []
     for value in args.shape:
@@ -104,6 +108,17 @@ def _axis_window(length, overlap, count):
     return math.ceil(length / count) + overlap
 
 
+def _overlap_options(length, count, native_overlap):
+    """Return bounded overlap candidates, widest first."""
+    if count == 1:
+        return (0,)
+    pitch = math.ceil(length / count)
+    floor = math.ceil(pitch / 3)
+    options = {native_overlap}
+    options.update(math.ceil(pitch / divisor) for divisor in (2, 3))
+    return tuple(sorted((value for value in options if value >= floor), reverse=True))
+
+
 def topology_objectives(window, overlap, sample_shape, world_size):
     """Price actual clipped tile areas and deterministic scheduler imbalance."""
     axis_sizes = []
@@ -122,18 +137,22 @@ def topology_objectives(window, overlap, sample_shape, world_size):
         for rank in range(world_size)
     ]
     average = sum(loads) / world_size
+    row_shard_area = math.ceil(sample_shape[0] / world_size) * sample_shape[1]
     return {
         "window_area": window[0] * window[1],
         "decoded_area": sum(weights),
         "tile_count": tile_count,
+        "tile_columns": len(axis_sizes[1]),
         "max_rank_area": max(loads),
         "rank_imbalance": max(loads) / average - 1,
         "tile_grid": tuple(len(sizes) for sizes in axis_sizes),
+        "row_shard_area": row_shard_area,
+        "beats_row_sharding": window[0] * window[1] < row_shard_area,
     }
 
 
 def _dominates(left, right):
-    keys = ("window_area", "decoded_area", "rank_imbalance")
+    keys = ("window_area", "decoded_area", "rank_imbalance", "tile_columns")
     return all(left[key] <= right[key] for key in keys) and any(
         left[key] < right[key] for key in keys
     )
@@ -154,7 +173,7 @@ def pareto_frontier(candidates):
 
 def _balanced_key(candidate, frontier):
     objectives = candidate["objectives"]
-    keys = ("window_area", "decoded_area", "rank_imbalance")
+    keys = ("window_area", "decoded_area", "rank_imbalance", "tile_columns")
     distances = []
     for key in keys:
         values = [entry["objectives"][key] for entry in frontier]
@@ -164,7 +183,7 @@ def _balanced_key(candidate, frontier):
 
 
 def select_plans(sample_shape, native_overlap, world_size, normalize):
-    """Select throughput, knee, and memory representatives from a bounded frontier."""
+    """Select coarse, knee, and fine representatives from a bounded frontier."""
     if world_size < 1:
         raise ValueError("world size must be positive")
     max_tiles = max(4, 4 * world_size)
@@ -175,58 +194,96 @@ def select_plans(sample_shape, native_overlap, world_size, normalize):
             requested_tiles = down * across
             if not min_tiles <= requested_tiles <= max_tiles:
                 continue
-            overlap = (
-                0 if down == 1 else native_overlap[0],
-                0 if across == 1 else native_overlap[1],
+            down_overlaps = _overlap_options(
+                sample_shape[0], down, native_overlap[0]
             )
-            window = (
-                _axis_window(sample_shape[0], overlap[0], down),
-                _axis_window(sample_shape[1], overlap[1], across),
+            across_overlaps = _overlap_options(
+                sample_shape[1], across, native_overlap[1]
             )
-            normalized = normalize(window, overlap)
-            if normalized is None:
-                continue
-            window, overlap = normalized
-            if any(blend >= size for blend, size in zip(overlap, window)):
-                continue
-            objectives = topology_objectives(
-                window, overlap, sample_shape, world_size
-            )
-            if not min_tiles <= objectives["tile_count"] <= max_tiles:
-                continue
-            candidates[(window, overlap)] = {
-                "window": tuple(window),
-                "overlap": tuple(overlap),
-                "objectives": objectives,
-            }
+            for overlap_down in down_overlaps:
+                for overlap_across in across_overlaps:
+                    overlap = (overlap_down, overlap_across)
+                    window = (
+                        _axis_window(sample_shape[0], overlap[0], down),
+                        _axis_window(sample_shape[1], overlap[1], across),
+                    )
+                    normalized = normalize(window, overlap)
+                    if normalized is None:
+                        continue
+                    window, overlap = normalized
+                    if any(blend >= size for blend, size in zip(overlap, window)):
+                        continue
+                    if any(
+                        blend and blend * 4 < size
+                        for blend, size in zip(overlap, window)
+                    ):
+                        continue
+                    objectives = topology_objectives(
+                        window, overlap, sample_shape, world_size
+                    )
+                    if not min_tiles <= objectives["tile_count"] <= max_tiles:
+                        continue
+                    candidates[(window, overlap)] = {
+                        "window": tuple(window),
+                        "overlap": tuple(overlap),
+                        "objectives": objectives,
+                    }
     frontier = pareto_frontier(list(candidates.values()))
-    if len(frontier) < 3:
+    if len(frontier) < 2:
         raise ValueError(
             f"sample {sample_shape} produces only {len(frontier)} useful tile plans"
         )
-    throughput = min(
+    coarse = min(
         frontier,
         key=lambda item: (
-            item["objectives"]["decoded_area"],
+            item["objectives"]["tile_count"],
+            item["objectives"]["tile_columns"],
             item["objectives"]["rank_imbalance"],
+            item["objectives"]["decoded_area"],
             -item["objectives"]["window_area"],
             item["window"],
         ),
     )
-    memory = min(
-        (item for item in frontier if item is not throughput),
+    fine_candidates = [
+        item
+        for item in frontier
+        if item["window"] != coarse["window"]
+        and item["objectives"]["window_area"] < coarse["objectives"]["window_area"]
+        and item["window"] != tuple(reversed(coarse["window"]))
+    ]
+    if not fine_candidates:
+        fine_candidates = [
+            item
+            for item in frontier
+            if item["window"] != coarse["window"]
+            and item["objectives"]["window_area"] < coarse["objectives"]["window_area"]
+        ]
+    fine = min(
+        fine_candidates,
         key=lambda item: (
             item["objectives"]["window_area"],
+            -item["objectives"]["tile_count"],
+            item["objectives"]["tile_columns"],
             item["objectives"]["decoded_area"],
             item["objectives"]["rank_imbalance"],
             item["window"],
         ),
     )
-    balanced = min(
-        (item for item in frontier if item not in (throughput, memory)),
-        key=lambda item: _balanced_key(item, frontier),
+    middle = [
+        item
+        for item in frontier
+        if item not in (coarse, fine)
+        and item["window"] not in (coarse["window"], fine["window"])
+    ]
+    selected = [coarse]
+    if middle:
+        selected.append(min(middle, key=lambda item: _balanced_key(item, frontier)))
+    selected.append(fine)
+    profiles = (
+        ("coarse", "fine")
+        if len(selected) == 2
+        else PROFILES
     )
-    selected = (throughput, balanced, memory)
     return [
         {
             **plan,
@@ -237,7 +294,7 @@ def select_plans(sample_shape, native_overlap, world_size, normalize):
                 "candidate_limit": max_tiles,
             },
         }
-        for profile, plan in zip(PROFILES, selected)
+        for profile, plan in zip(profiles, selected)
     ]
 
 
@@ -264,7 +321,7 @@ def normalizer_for_vae(vae, sample_shape, world_size):
                 if shape_plan is None:
                     continue
                 rows = latent_rows(vae, shape_plan)
-                if rows is not None and rows < world_size:
+                if rows is not None and rows < max(world_size, MIN_TILE_LATENT_EXTENT):
                     continue
                 original = {}
                 missing = []
@@ -304,16 +361,13 @@ def plans_for_vae(vae, height, width, world_size):
     )
 
 
-def default_suite(plans, height, width, frames):
-    """Build the bounded nine-case suite from three selected tile plans."""
+def default_suite(plans, height, width, frames, diagnostics=False):
+    """Build the selectable suite, optionally including diagnostic compositions."""
     suite = baseline_suite(height, width, frames)
-    for mode in ("local", "tile-runs"):
+    modes = ("local", "tile-runs") if diagnostics else ("tile-runs",)
+    for mode in modes:
         for plan in plans:
-            window, overlap, profile = (
-                plan["window"],
-                plan["overlap"],
-                plan["profile"],
-            )
+            profile = plan["profile"]
             suite.append(
                 _cell(
                     f"{mode}-{profile}",
@@ -321,26 +375,27 @@ def default_suite(plans, height, width, frames):
                     height,
                     width,
                     frames,
-                    window,
-                    overlap,
+                    plan["window"],
+                    plan["overlap"],
                     profile=profile,
                     plan_selection=plan,
                 )
             )
-    memory = next(plan for plan in plans if plan["profile"] == "memory")
-    suite.append(
-        _cell(
-            "row-tiled-memory",
-            "row-tiled",
-            height,
-            width,
-            frames,
-            memory["window"],
-            memory["overlap"],
-            profile="memory",
-            plan_selection=memory,
+    if diagnostics:
+        lightest = min(plans, key=lambda plan: plan["objectives"]["window_area"])
+        suite.append(
+            _cell(
+                f"row-tiled-{lightest['profile']}",
+                "row-tiled",
+                height,
+                width,
+                frames,
+                lightest["window"],
+                lightest["overlap"],
+                profile=lightest["profile"],
+                plan_selection=lightest,
+            )
         )
-    )
     return suite
 
 

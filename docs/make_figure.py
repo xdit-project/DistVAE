@@ -21,7 +21,10 @@ edges visibly cheap, and cheap is why dealing tiles out by area beats dealing th
 Both windows are written as the pair of planner calls that would set them, a window and an
 overlap in output pixels, so the figure cannot show a configuration the API could not be
 asked for. The grids are drawn at the extents that pair leaves, so tiles overlap on the page
-as they do in the loop.
+as they do in the loop. Neither window is a recommendation, and the heading says so: they
+are the two ends of the trade, and the strips end has advantages no column here can show,
+being one contiguous span of a row-major tensor where a grid's tile is a stride through
+every row it touches.
 
 No row draws its output, because all three produce the same picture. What tiling changes is
 a seam a good window renders invisible, so a panel of the result would be either blank or an
@@ -279,7 +282,7 @@ DIGIT = 5.4
 # costs; the fifth is what it buys, and it is here because without it the readout says only
 # that tiling is worse, which is true of every column and beside the point.
 COSTS = (
-    ("activations", lambda s: f"{s.held:.0%}"),
+    ("peak activations", lambda s: f"{s.held:.0%}"),
     ("work", lambda s: f"{s.work:.2f}×"),
     # A count, except at zero, where the difference is not a small number of seams but a
     # mode that never blends anything and so has none to hide.
@@ -518,12 +521,17 @@ def sharding(y):
         # A sync rather than a collective, because the convolutions swap halos with their
         # neighbours and only the norms reduce across the group, and the legend draws those
         # as two different things.
-        "Peak memory is rank-bound; a sync inside every layer, so the interconnect can be "
-        "the bottleneck.",
+        "Peak memory is rank-bound and every layer syncs, so the interconnect can be the "
+        "bottleneck.",
         # Nothing to pick here, which is the contrast the tiling header is written against.
-        "Nothing to choose: the band is the latent divided by the GPU count.",
+        "There is nothing to choose here, since the band is the latent divided by the GPU "
+        "count.",
         # The third thing a reader is choosing between, said where the other two are said.
-        "The image is the unsharded decode, give or take the order the sums land in.",
+        # The caveat is only that a reduction adds its terms in a different order, so the
+        # last bits move. Naming that mechanism costs a clause and buys nothing: what the
+        # reader is weighing is this line against the tiling row's, and the contrast is
+        # between rounding they will never see and blocky colour they might.
+        "The image is what a single GPU would produce, apart from floating-point rounding.",
     )
     bottom = y + TALL
 
@@ -563,11 +571,12 @@ def sharding(y):
     cap = costs(bottom + 32, SHARDED) + 26
     return max(
         # The one fact the strip row below is written against: bands meet, tiles overlap.
-        caption(COL1, cap, "Split the rows", "no overlap: the bands abut"),
+        # Short because the left caption column ends where the right one starts, at TRACK.
+        caption(COL1, cap, "Split the rows", "The bands never overlap."),
         # One line, not two: how often it syncs is a column now, so this is left to say
         # only what a sync is, which the legend then splits into its two marks.
         caption(TRACK, cap, "Decode in lockstep",
-                "halos to the neighbouring bands, a reduction across all four at each norm"),
+                "Convolutions swap edge rows, and norms reduce across all four ranks."),
     )
 
 
@@ -639,12 +648,21 @@ def tiling(y):
     """Tile distribution: a window's worth per call, dealt out, gathered twice"""
     y = heading(
         y, 2, "Tile distribution", f"the same {word(RANKS)} GPUs, at two windows",
-        "Peak memory is tile-bound; two collectives for the whole decode, but more "
-        "redundant work.",
+        "Peak memory is tile-bound and the decode needs only two collectives, but it "
+        "repeats more work.",
         # Said plainly, because the row otherwise reads as a default. Named in the terms the
         # planners take, too: a window and an absolute overlap, not a fraction of a window.
-        "Window and overlap are both yours to set, in output pixels: tune them to the VAE "
-        "and the memory you have.",
+        "Window and overlap are yours to set in output pixels, so tune them to your VAE "
+        "and your GPUs.",
+        # The figure shows two windows and a reader will take the better-looking one for
+        # advice, so the disclaimer has to be here rather than left to the docs.
+        "The two windows below are worked examples, chosen to show the trade rather than "
+        "to be copied.",
+        # The honest summary of that trade, and the one thing the columns cannot show: a
+        # full-width strip is one contiguous span of a row-major tensor, where a grid's
+        # tile is a stride through every row it touches.
+        "Full-width strips overlap less and stay contiguous in row-major memory, while a "
+        "grid holds less at once.",
         # Against the sharding row's line in the same place: what the choice costs the
         # image. The seam a blend can hide; the norms it cannot, since a tile's are its own
         # contents and nothing else, which is why a window can be too small rather than
@@ -658,18 +676,19 @@ def tiling(y):
         "Cut the rows only",
         f"{STRIPS.down.window_px} px tall overlapping {STRIPS.down.overlap_px} px, "
         "full width",
-        f"{word(STRIPS.tiles).capitalize()} strips, one per rank: the same shape as the "
-        "bands above, but overlapping, and no sync until the end.",
-        "Cut, and overlap",
-        "One call each, and one rank waiting",
-        "one strip per rank, so there is nothing to deal out",
-        f"the last is {STRIPS.down.extent[-1]} rows against {STRIPS.down.window}, short by "
-        "exactly the overlap",
+        f"{word(STRIPS.tiles).capitalize()} strips, one per rank, have the same shape as "
+        "the bands above, but they overlap and nothing syncs until the end.",
+        "Cut and overlap the rows",
+        "One call each, and one rank waits",
+        # Was "nothing to deal out", which only meant anything to a reader who had already
+        # read the grid row below and knew there was a scheduler to have nothing to do.
+        "With one strip per rank, there is nothing for the scheduler to decide.",
+        f"The last strip is {STRIPS.down.extent[-1]} latent rows where the others are "
+        f"{STRIPS.down.window}.",
         # The line that answers the reader who suspects a window was picked to flatter the
         # grid below. Not that no split does better, since a thinner blend plainly does:
         # that at this depth of blend none does, because the gap is the blend.
-        f"{word(RANKS)} overlapping strips never divide evenly: a smaller gap means a "
-        "thinner blend",
+        "That shortfall is exactly the overlap, so closing it would thin the blend.",
     )
 
     heavy = max(range(RANKS), key=lambda r: len(TILED.run[r]))
@@ -683,15 +702,15 @@ def tiling(y):
         + (f"{TILED.down.overlap_px} px on both axes"
            if TILED.down.overlap_px == TILED.across.overlap_px
            else f"{TILED.down.overlap_px} × {TILED.across.overlap_px} px"),
-        f"{word(TILED.tiles).capitalize()} tiles for {word(RANKS)} ranks, so the load can "
-        "be levelled, and a rank holds a window rather than a strip.",
+        f"{word(TILED.tiles).capitalize()} tiles across {word(RANKS)} ranks let the load "
+        "be levelled, and a rank now holds a window rather than a strip.",
         "Deal the tiles out",
         "Each rank decodes its own, in turn",
         # A run is the cheap shape to blend but a coarse one to balance, so the scheduler
         # moves single tiles off it, which is why two lanes hold tiles from either end.
-        "each rank starts with a contiguous run, then single tiles move to level it",
-        f"rank {heavy} takes {word(len(TILED.run[heavy]))} tiles to rank {light}'s "
-        f"{word(len(TILED.run[light]))}, and they finish together",
+        "Each rank starts with a contiguous run, then single tiles move to level it.",
+        f"Rank {heavy} decodes {word(len(TILED.run[heavy]))} tiles to rank {light}'s "
+        f"{word(len(TILED.run[light]))}, and they still finish together.",
     )
 
 
@@ -722,13 +741,15 @@ def draw():
     # The example every row runs on, said once so no header has to carry it. On its own
     # line rather than trailing the title, since a fallback font only ever sets the bold
     # wider and there is nothing to the right of it to absorb that.
-    text(COL1, 49, f"Generating a {BOUND * SCALE_VAE} × {BOUND * SCALE_VAE} image from a "
-                   f"{BOUND} × {BOUND} latent on {word(RANKS)} GPUs", size=11, fill=MUTED)
+    text(COL1, 49, f"The two modes below each decode a {BOUND * SCALE_VAE} × "
+                   f"{BOUND * SCALE_VAE} image from a {BOUND} × {BOUND} latent on "
+                   f"{word(RANKS)} GPUs.", size=11, fill=MUTED)
     # What the two numbers below are counting. A figure this tall is met one screen at a
-    # time, so "choose one" has to be said at the top: numbered headings alone would as
-    # readily be the two halves of a pipeline, and the second half is where the page ends.
-    text(COL1, 65, "Choose one of the two modes below, both priced in the same five "
-                   "columns", size=11, fill=MUTED)
+    # time, so the word alternatives has to appear at the top: numbered headings alone
+    # would as readily be the halves of a pipeline, and the second half is where the page
+    # ends.
+    text(COL1, 65, "They are alternatives, and both are priced in the same five columns.",
+         size=11, fill=MUTED)
 
     # Above the rows rather than under them, so the marks are named before they are met,
     # and above the first divider, so they read as belonging to the page and not to row

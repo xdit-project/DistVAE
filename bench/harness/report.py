@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def _version(distribution, module=None):
@@ -99,6 +99,19 @@ def _benchmark_identity():
         return None
 
 
+def _device_identity():
+    """Return the accelerator properties that make measurements comparable."""
+    if not torch.cuda.is_available():
+        return None
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return {
+        "name": properties.name,
+        "arch": getattr(properties, "gcnArchName", None),
+        "total_memory": properties.total_memory,
+        "count": torch.cuda.device_count(),
+    }
+
+
 def provenance():
     """Return library versions and the DistVAE source revision when available."""
     import diffusers
@@ -114,6 +127,7 @@ def provenance():
             "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "host": socket.gethostname(),
             "hardware_family": os.environ.get("HW_FAMILY"),
+            "device": _device_identity(),
             "python": platform.python_version(),
             "argv": list(sys.argv),
             "benchmark": _benchmark_identity(),

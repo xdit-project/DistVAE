@@ -10,6 +10,7 @@ from .distributed import (
     aggregate_rank_errors,
     exception_record,
     gather_rank_errors,
+    ranks_diverged,
 )
 
 
@@ -30,6 +31,14 @@ def parser():
         action="append",
         help="explicit HxW or HxWxFRAMES input shape; repeat to request more",
     )
+    value.add_argument(
+        "--matrix",
+        action="store_true",
+        help=(
+            "run the family's canonical shapes, so a pinned commit fixes what was "
+            "measured; overridden by --shape"
+        ),
+    )
     value.add_argument("--dtype", default="bfloat16", choices=sorted(measure.MAX_REL))
     value.add_argument("--warmup", type=int, default=2)
     value.add_argument("--iters", type=int, default=5)
@@ -41,6 +50,14 @@ def parser():
             "exact case; repeat unsharded, row, or "
             "MODE:WINDOW_HxW@OVERLAP_HxW where MODE is local, tile-runs, "
             "or row-tiled. Omit for the bounded default suite"
+        ),
+    )
+    value.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help=(
+            "add the local and row-tiled compositions, which no orchestrator selects "
+            "but which isolate tiling from its collectives"
         ),
     )
     value.add_argument(
@@ -190,7 +207,11 @@ def _measure(args, cells, runtime, provenance_data=None):
                 plans = cases.plans_for_vae(
                     selector, height, width, runtime.world_size
                 )
-                cells.extend(cases.default_suite(plans, height, width, frames))
+                cells.extend(
+                    cases.default_suite(
+                        plans, height, width, frames, diagnostics=args.diagnostics
+                    )
+                )
 
     references = {}
     records = []
@@ -215,7 +236,8 @@ def _measure(args, cells, runtime, provenance_data=None):
             composition, measurement = dict(cell), {}
         runtime.device_api.empty_cache()
 
-        aggregate_error = aggregate_rank_errors(gather_rank_errors(error, runtime))
+        failures = gather_rank_errors(error, runtime)
+        aggregate_error = aggregate_rank_errors(failures)
         record = report.make_record(
             args.family,
             args.half,
@@ -230,6 +252,19 @@ def _measure(args, cells, runtime, provenance_data=None):
         records.append(record)
         if runtime.rank == 0:
             report.render(record, args.half)
+            # Written after every cell rather than once at the end. A sweep spends hours
+            # reaching its later cells, and a failure there used to discard every cell before
+            # it along with itself - the measurements were already paid for, and losing them
+            # means running the whole matrix again to recover what was already known.
+            out = getattr(args, "out", None)
+            if out:
+                report.write_json(out, records)
+        if ranks_diverged(failures):
+            say(
+                f"stopping after {cell['name']}: the ranks have diverged and no further "
+                "measurement from this group would mean anything"
+            )
+            break
     return records
 
 
@@ -265,8 +300,16 @@ def main(argv=None):
             report.write_json(args.out, records)
         status = report.report_status(records)
         statuses = [None] * runtime.world_size
-        dist.all_gather_object(statuses, status, group=runtime.group)
-        return max(statuses)
+        # Agreeing on an exit status is itself a collective, and a run that stopped because its
+        # ranks diverged is in no position to complete one. The records are already on disk by
+        # here, so fall back to this rank's own status rather than fail on the way out and lose
+        # the status of a run that otherwise finished.
+        try:
+            dist.all_gather_object(statuses, status, group=runtime.group)
+        except Exception:
+            return status
+        agreed = [value for value in statuses if isinstance(value, int)]
+        return max(agreed) if agreed else status
     finally:
         runtime.close()
 

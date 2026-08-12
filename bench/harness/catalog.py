@@ -4,6 +4,15 @@ from contextlib import nullcontext
 
 import torch
 
+# `shapes` is the family's canonical matrix, as (height, width, frames), and `--matrix` runs it.
+# It lives here beside the architecture rather than in a caller's script so that pinning a commit
+# pins the shapes too: two runs of the same SHA measured the same thing, on whatever machine, and
+# a result that cannot say what it measured is one nobody can reproduce.
+#
+# Frames are carried even where they are ignored, so every entry reads the same. A family with no
+# temporal axis discards them in `sample_for`; one with a temporal axis needs 1 plus a multiple of
+# it. Qwen-Image is a 3D VAE that ships as a single-image model, which is why it asks for one
+# frame rather than the video-shaped default.
 FAMILIES = {
     "flux2": {
         "cls": "AutoencoderKLFlux2",
@@ -24,6 +33,7 @@ FAMILIES = {
         "latent_channels": 32,
         "spatial": 8,
         "temporal": None,
+        "shapes": ((1024, 1024, 1), (2048, 2048, 1)),
         "note": "FLUX.2 checkpoints",
     },
     "kl": {
@@ -42,6 +52,7 @@ FAMILIES = {
         "latent_channels": 16,
         "spatial": 8,
         "temporal": None,
+        "shapes": ((1024, 1024, 1), (2048, 2048, 1)),
         "note": "plain 2D KL autoencoders",
     },
     "wan": {
@@ -57,6 +68,10 @@ FAMILIES = {
         "latent_channels": 16,
         "spatial": 8,
         "temporal": 4,
+        # Portrait 480p and 720p at the production length. 81 frames is 21 latent ones, which is
+        # enough that the unsharded case may not fit at 720p; that failure is recorded per cell
+        # and the tiled arms still run, and it is the clearest statement of why tiling exists.
+        "shapes": ((832, 480, 81), (1280, 720, 81)),
         "note": "Wan video autoencoders",
     },
     "qwen_image": {
@@ -72,6 +87,7 @@ FAMILIES = {
         "latent_channels": 16,
         "spatial": 8,
         "temporal": 4,
+        "shapes": ((1024, 1024, 1), (2048, 2048, 1)),
         "note": "Qwen Image autoencoders",
     },
     "hunyuan_video": {
@@ -90,6 +106,7 @@ FAMILIES = {
         "latent_channels": 16,
         "spatial": 8,
         "temporal": 4,
+        "shapes": ((832, 480, 129), (1280, 720, 129)),
         "note": "Hunyuan Video autoencoders",
     },
     "hunyuan_video_15": {
@@ -108,6 +125,7 @@ FAMILIES = {
         "latent_channels": 32,
         "spatial": 16,
         "temporal": 4,
+        "shapes": ((832, 480, 129), (1280, 720, 129)),
         "note": "Hunyuan Video 1.5 autoencoders",
     },
     "ltx2": {
@@ -144,6 +162,7 @@ FAMILIES = {
         "latent_channels": 128,
         "spatial": 32,
         "temporal": 8,
+        "shapes": ((1536, 1024, 121), (1920, 1280, 121)),
         "note": "LTX-2 autoencoders",
     },
 }
@@ -151,6 +170,34 @@ FAMILIES = {
 
 def _dtype(value):
     return getattr(torch, value) if isinstance(value, str) else value
+
+
+def matrix_for(family):
+    """Return a family's canonical shapes, checked against what its VAE can accept.
+
+    Checked here rather than left to `sample_for` because a matrix is meant to be run unattended
+    across machines: an axis that does not divide, or a frame count the temporal ratio rejects,
+    should fail while the pod is still starting rather than partway through the third shape.
+    """
+    spec = FAMILIES[family]
+    shapes = spec.get("shapes")
+    if not shapes:
+        raise ValueError(
+            f"--family {family} has no canonical shapes; ask for --shape explicitly"
+        )
+    ratio, temporal = spec["spatial"], spec["temporal"]
+    for height, width, frames in shapes:
+        if height % ratio or width % ratio:
+            raise ValueError(
+                f"{family} shape {height}x{width} is not divisible by "
+                f"compression ratio {ratio}"
+            )
+        if temporal and (frames - 1) % temporal:
+            raise ValueError(
+                f"{family} shape {height}x{width}x{frames} needs 1 plus a multiple "
+                f"of {temporal} frames"
+            )
+    return tuple(shapes)
 
 
 def build_vae(family, dtype, device):

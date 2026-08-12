@@ -26,11 +26,60 @@ def gather_rank_errors(local_error, runtime):
     return failures
 
 
+DESYNCHRONIZED = "DesynchronizedRanks"
+
+
+def _is_failure_record(failure):
+    return isinstance(failure, dict) and "rank" in failure
+
+
+def ranks_diverged(failures):
+    """Return whether the group can still be trusted to run collectives together.
+
+    A cell that fails on EVERY rank leaves the group in step - an out-of-memory on a decode
+    nobody can fit is the ordinary way a matrix run reports "this shape does not fit", and the
+    next cell measures normally afterwards. A cell that fails on SOME ranks does not: the ranks
+    that failed stopped issuing collectives while the others carried on, so from that point the
+    two are matching up different calls and nothing the group produces means anything.
+
+    The distinction is the whole point of the check. Stopping on the first kind would end most
+    sweeps at their first unsharded cell; continuing through the second kind produces numbers
+    that look ordinary and are not.
+    """
+    if any(
+        failure is not None and not _is_failure_record(failure) for failure in failures
+    ):
+        return True
+    reported = [failure is not None for failure in failures]
+    return any(reported) and not all(reported)
+
+
 def aggregate_rank_errors(failures):
-    """Combine rank errors while preserving each original failure record."""
+    """Combine rank errors while preserving each original failure record.
+
+    An entry that is not a failure record is reported as one rather than raising. Once the ranks
+    diverge, the gather that collects the errors pairs with whatever call the other ranks are
+    still inside, so what comes back can be another call site's payload - and reaching into it
+    for a failure record used to raise an AttributeError that both hid the failure underneath
+    and took the rest of the run down with it.
+    """
     details = []
-    for failure in failures:
+    for rank, failure in enumerate(failures):
         if failure is None:
+            continue
+        if not _is_failure_record(failure):
+            details.append(
+                {
+                    "type": DESYNCHRONIZED,
+                    "message": (
+                        "the ranks are no longer running the same sequence of "
+                        f"collectives: the failure gathered for rank {rank} came back "
+                        f"as {type(failure).__name__}, which is another call's payload "
+                        "rather than a failure record"
+                    ),
+                    "rank": rank,
+                }
+            )
             continue
         nested = failure.get("failures")
         details.extend(nested if nested is not None else [failure])

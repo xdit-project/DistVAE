@@ -32,7 +32,7 @@ if replacement is not None:
     pipe.vae.tiled_decode = replacement
 ```
 
-Strips are therefore the cheapest tiling in both work and seams, and the most expensive in memory, because the axis left alone still costs its full extent. Four full-width strips over the figure's latent hold 34% of the activations where the three-by-five grid holds 12%, and leave three seams where the grid leaves twenty-two. The figure's lower two rows are that pair.
+Strips are therefore the cheapest tiling in both work and seams, and the most expensive in memory, because the axis left alone still costs its full extent. They also suit the memory layout best: a full-width strip is one unbroken span of a row-major tensor, where a grid's tile is a stride through every row it touches. Four full-width strips over the figure's latent hold 34% of the activations where the three-by-five grid holds 12%, and leave three seams where the grid leaves twenty-two. The figure's lower two rows are that pair.
 
 Which way the strips run barely changes that: a given number of them holds about the same share whichever axis they lie along, since the latent is as long as it is wide. What changes is how thin each one gets. Cutting the long axis leaves each strip more depth in the direction it was cut, so a wide image wants columns and a tall one wants rows.
 

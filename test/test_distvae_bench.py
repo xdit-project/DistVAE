@@ -1,3 +1,4 @@
+import ast
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,11 +18,22 @@ from bench.harness import (
 
 
 def test_harness_has_no_optional_runner_dependency():
+    # Checked on the parsed imports rather than the raw text. The harness must not IMPORT the
+    # runners it exists to measure for, but it may name them: the default suite carries only
+    # the compositions an orchestrator can select, and saying which orchestrator, and where it
+    # branches, is the clearest way to explain why the others are diagnostics.
     root = Path(__file__).parents[1] / "bench"
     forbidden = ("x" + "fuser", "x" + "dit")
     for path in root.rglob("*.py"):
-        text = path.read_text().lower()
-        assert all(word not in text for word in forbidden), path
+        imported = []
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import):
+                imported.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.append(node.module)
+        assert not [
+            name for name in imported if name.lower().split(".")[0] in forbidden
+        ], path
 
 
 def test_smoke_families_imports_catalog_without_path_mutation():
@@ -30,10 +42,12 @@ def test_smoke_families_imports_catalog_without_path_mutation():
     assert "harness.catalog" in source
 
 
-def test_benchmark_docs_use_the_schema_6_case_cli():
+def test_benchmark_docs_track_the_schema_and_the_case_cli():
     text = (Path(__file__).parents[1] / "bench" / "README.md").read_text()
 
-    assert "schema 6" in text
+    # Read off the constant rather than spelled out here, because a number written in two places
+    # drifts: this is how the README came to describe schema 6 while the harness wrote 7.
+    assert f"schema {report.SCHEMA_VERSION}" in text
     assert "--case" in text
     assert "--tile-shape-windows" in text
     for removed in ("--grid-arms", "--vae-tile-size", "--tile-shape-sides"):
@@ -118,6 +132,62 @@ def test_additional_shapes_are_explicit_and_do_not_mix_with_exact_cases():
         cases.cells_from_args(mixed)
 
 
+def test_matrix_runs_the_family_shapes_and_yields_to_an_explicit_one():
+    """The matrix is a default, not an override: asking for a shape by hand still wins.
+
+    Appending instead would make `--shape` mean "and also", so a one-off check of a single size
+    would quietly drag the whole family's matrix along with it.
+    """
+    matrix = cli.parser().parse_args(["--family", "wan", "--matrix"])
+    assert cases.shapes_from_args(matrix) == [(832, 480, 81), (1280, 720, 81)]
+
+    overridden = cli.parser().parse_args(
+        ["--family", "wan", "--matrix", "--shape", "512x512x5"]
+    )
+    assert cases.shapes_from_args(overridden) == [(512, 512, 5)]
+
+    single = cli.parser().parse_args(["--family", "wan", "--height", "256"])
+    assert cases.shapes_from_args(single) == [(256, 2048, 17)]
+
+
+@pytest.mark.parametrize("family", sorted(catalog.FAMILIES))
+def test_every_catalogued_shape_is_legal_for_its_own_family(family):
+    """A matrix runs unattended, so an illegal shape has to fail before anything is measured.
+
+    Both bounds come from the family rather than from the shape: an axis has to divide by the
+    spatial ratio, and a temporal family needs one frame plus a multiple of its ratio. Left to
+    `sample_for` these surface partway through the third shape, after the first two have been
+    paid for.
+    """
+    spec = catalog.FAMILIES[family]
+    if not spec.get("shapes"):
+        pytest.skip(f"{family} has no canonical shapes")
+
+    for height, width, frames in catalog.matrix_for(family):
+        assert height % spec["spatial"] == 0
+        assert width % spec["spatial"] == 0
+        if spec["temporal"]:
+            assert (frames - 1) % spec["temporal"] == 0
+        catalog.sample_for(
+            spec, "decoder", height, width, "bfloat16", "meta", frames=frames
+        )
+
+
+def test_matrix_refuses_a_family_it_has_no_shapes_for(monkeypatch):
+    # Reached with a family the catalog does not carry shapes for, which is what a newly added
+    # one looks like before its matrix is chosen. It used to be reached with LTX-2, until LTX-2
+    # was given a matrix of its own.
+    monkeypatch.setitem(catalog.FAMILIES, "shapeless", {"cls": "AutoencoderKL"})
+    with pytest.raises(ValueError, match="no canonical shapes"):
+        catalog.matrix_for("shapeless")
+
+
+def test_every_catalogued_family_carries_a_matrix():
+    assert not [
+        family for family, spec in catalog.FAMILIES.items() if not spec.get("shapes")
+    ]
+
+
 @pytest.mark.parametrize(
     "value",
     ["none", "row:256x256@32x32", "local:256@32x32", "local:256x256"],
@@ -136,9 +206,9 @@ def test_selector_returns_three_distinct_rectangular_pareto_plans():
     )
 
     assert [plan["profile"] for plan in plans] == [
-        "throughput",
+        "coarse",
         "balanced",
-        "memory",
+        "fine",
     ]
     assert len({plan["window"] for plan in plans}) == 3
     assert any(height != width for height, width in (p["window"] for p in plans))
@@ -180,6 +250,153 @@ def test_selector_zeros_overlap_on_inactive_strip_axis():
             assert plan["overlap"][1] == 0
 
 
+def test_selector_searches_overlap_and_can_beat_row_sharding():
+    """A plan is only a memory win when its window is smaller than a row shard.
+
+    Overlap used to be pinned at the VAE native value, and since `window = pitch + overlap`
+    that put a floor under every window: on this sample the smallest reachable was 512x512,
+    which exactly ties the 262144 a rank holds under row sharding. The suite could therefore
+    never propose a memory win, which looked like a result about tiling and was really a
+    result about the search space.
+    """
+    sample_shape, world_size, native = (1024, 1024), 4, (256, 256)
+    plans = cases.select_plans(
+        sample_shape=sample_shape,
+        native_overlap=native,
+        world_size=world_size,
+        normalize=lambda window, overlap: (window, overlap),
+    )
+
+    row_shard_area = (sample_shape[0] // world_size) * sample_shape[1]
+    fine = next(plan for plan in plans if plan["profile"] == "fine")
+    assert fine["objectives"]["window_area"] < row_shard_area
+    assert fine["objectives"]["beats_row_sharding"]
+    # The pinned-overlap search could not get below the native value on an active axis.
+    assert min(fine["overlap"]) < min(native)
+
+
+def test_overlap_ladder_scales_with_pitch_and_keeps_the_native_value():
+    # An inactive axis still blends nothing, which the strip cases rely on.
+    assert cases._overlap_options(1024, 1, 256) == (0,)
+
+    options = cases._overlap_options(1024, 4, 256)
+    assert 256 in options, "the native overlap must stay reachable for comparability"
+    assert options == tuple(sorted(options, reverse=True)), "widest first"
+    assert all(option > 0 for option in options)
+    # Pitch is 256 here. The ladder stops at a third of the pitch, which is a quarter of the
+    # window it blends, so halves and thirds survive and the thinner rungs that band are gone.
+    assert {128, 86} <= set(options)
+    assert min(options) * 3 >= 256
+
+
+def test_selector_keeps_every_blend_above_a_quarter_of_its_window():
+    """Tile size sets how far a tile's tone drifts; overlap sets whether that reads as a band.
+
+    Measured on FLUX.2 at 1024x1024 on four ranks: a 128px window blended 32px is clean, the
+    same window blended 16px bands, and differencing the two decodes leaves the residual
+    concentrated at the thin arm's own stride. The bound therefore has to hold against the
+    window actually used - a normalizer that grows the window to reach a VAE-valid shape while
+    the overlap stays put would otherwise thin the blend back under it.
+    """
+
+    def grow(window, overlap):
+        return tuple(-(-axis // 64) * 64 for axis in window), overlap
+
+    plans = cases.select_plans(
+        sample_shape=(1024, 1024),
+        native_overlap=(256, 256),
+        world_size=4,
+        normalize=grow,
+    )
+
+    blends = [
+        (blend, size)
+        for plan in plans
+        for blend, size in zip(plan["overlap"], plan["window"])
+        if blend
+    ]
+    assert blends, "an all-strip selection would not exercise the bound"
+    for blend, size in blends:
+        assert blend * 4 >= size, f"{blend}px blends a {size}px window"
+
+
+def test_selector_declines_a_fine_profile_that_is_only_a_transpose():
+    """The fine end has to be finer, not merely different.
+
+    Window area, decoded area and rank imbalance are all symmetric under transpose, so on a
+    square sample the runner-up used to be the first pick's own mirror - scoring identically
+    while measuring 17% heavier on the hardware, because a full-width strip is a few long
+    contiguous spans and a full-height one is a row of short ones.
+    """
+    plans = cases.select_plans(
+        sample_shape=(1024, 1024),
+        native_overlap=(256, 256),
+        world_size=4,
+        normalize=lambda window, overlap: (window, overlap),
+    )
+
+    by_profile = {plan["profile"]: plan for plan in plans}
+    coarse = by_profile["coarse"]
+    fine = by_profile.get("fine")
+    if fine is not None:
+        assert (fine["objectives"]["window_area"]
+                < coarse["objectives"]["window_area"])
+        assert tuple(reversed(fine["window"])) != coarse["window"]
+    assert len({plan["window"] for plan in plans}) == len(plans)
+
+
+def test_profiles_bracket_the_tile_axis_rather_than_predicting_a_winner():
+    """Coarse is the fewest tiles and fine the most, so the suite spans the axis it is testing.
+
+    The profiles used to be named for outcomes, and throughput was scored by least total work -
+    which always chose the widest window, since a wide tile overlaps its neighbours fewer times.
+    On gfx1201 those arms were both the slowest AND heavier than plain row sharding, 5034 MB
+    against row's 3526 at 2048x2048 on four ranks, so the name claimed the opposite of what the
+    hardware did. Which end wins is for the bench to measure and may differ per device; the
+    planner's job is only to put both ends in front of it.
+    """
+    for sample_shape, world_size in (((1024, 1024), 2), ((2048, 2048), 4)):
+        plans = cases.select_plans(
+            sample_shape=sample_shape,
+            native_overlap=(256, 256),
+            world_size=world_size,
+            normalize=lambda window, overlap: (window, overlap),
+        )
+        by_profile = {plan["profile"]: plan for plan in plans}
+        coarse, fine = by_profile["coarse"], by_profile["fine"]
+
+        assert coarse["objectives"]["tile_count"] == min(
+            plan["objectives"]["tile_count"] for plan in plans
+        ), f"{sample_shape} ws={world_size}: coarse must be the fewest tiles"
+        assert fine["objectives"]["tile_count"] == max(
+            plan["objectives"]["tile_count"] for plan in plans
+        ), f"{sample_shape} ws={world_size}: fine must be the most tiles"
+
+
+def test_tile_columns_separate_a_plan_from_its_transpose():
+    wide = cases.topology_objectives((128, 1024), (32, 0), (1024, 1024), 4)
+    tall = cases.topology_objectives((1024, 128), (0, 32), (1024, 1024), 4)
+
+    assert wide["window_area"] == tall["window_area"], "the transpose is the point"
+    assert wide["tile_columns"] == 1
+    assert tall["tile_columns"] > 1
+    # Equal on every symmetric objective, so only tile_columns can prefer the cheaper one.
+    assert cases._dominates(wide, tall)
+    assert not cases._dominates(tall, wide)
+
+
+def test_row_shard_area_is_recorded_against_every_plan():
+    objectives = cases.topology_objectives(
+        window=(72, 72),
+        overlap=(8, 8),
+        sample_shape=(128, 128),
+        world_size=2,
+    )
+
+    assert objectives["row_shard_area"] == 64 * 128
+    assert objectives["beats_row_sharding"] is (72 * 72 < 64 * 128)
+
+
 def test_vae_normalizer_rejects_windows_with_too_few_latent_rows(monkeypatch):
     vae = object()
     monkeypatch.setattr(cases.vae_api, "tile_shape", lambda value: (64, 64))
@@ -200,24 +417,75 @@ def test_vae_normalizer_rejects_windows_with_too_few_latent_rows(monkeypatch):
     assert normalize((256, 256), (32, 32)) is None
 
 
-def test_default_suite_is_bounded_to_nine_cases():
-    plans = cases.select_plans(
+def test_vae_normalizer_rejects_windows_that_band(monkeypatch):
+    """A tile large enough to shard can still be too small to normalize over.
+
+    Sharding needs one latent row per rank; representative statistics need considerably more.
+    Searching overlap made small windows reachable for the first time, so this bound is what
+    stops the memory profile choosing a tile that decodes at a visibly different tone from its
+    neighbours - a difference the blend smooths into a ramp, which no seam metric detects.
+    """
+    vae = object()
+    extent = cases.MIN_TILE_LATENT_EXTENT - 1
+    assert extent > 4, "the bound must bind harder than the world sizes we run"
+    monkeypatch.setattr(cases.vae_api, "tile_shape", lambda value: (64, 64))
+    monkeypatch.setattr(
+        cases.vae_api,
+        "tile_shape_plan",
+        lambda value, height, width: {"window": (height, width)},
+    )
+    monkeypatch.setattr(cases, "latent_rows", lambda value, plan: extent)
+    monkeypatch.setattr(
+        cases.vae_api,
+        "tile_overlap_plan",
+        lambda *args, **kwargs: pytest.fail("a banding window reached overlap planning"),
+    )
+
+    normalize = cases.normalizer_for_vae(vae, (512, 512), world_size=4)
+
+    assert normalize((256, 256), (32, 32)) is None
+
+
+def _bounded_plans():
+    return cases.select_plans(
         sample_shape=(1024, 2048),
         native_overlap=(64, 64),
         world_size=4,
         normalize=lambda window, overlap: (window, overlap),
     )
 
+
+def test_default_suite_carries_only_selectable_compositions():
+    """Local tiling and row-beneath-tiling are not reachable, so they are not the default.
+
+    An orchestrator branches between marking a VAE for tile parallelism and parallelizing its
+    decoder, and never lands between the two. Those cases are also about 60% of the suite's
+    compute, which is a poor trade for a number nobody can act on.
+    """
+    plans = _bounded_plans()
+
     suite = cases.default_suite(plans, 1024, 2048, 1)
 
-    assert len(suite) == 9
     assert [cell["name"] for cell in suite[:2]] == ["unsharded", "row"]
-    assert sum(cell["tile_distribution"] == "runs" for cell in suite) == 3
+    assert len(suite) == 2 + len(plans)
+    assert sum(cell["tile_distribution"] == "runs" for cell in suite) == len(plans)
+    assert not [cell for cell in suite if cell["mode"] in ("local", "row-tiled")]
+
+
+def test_diagnostics_restore_the_unreachable_compositions():
+    plans = _bounded_plans()
+
+    suite = cases.default_suite(plans, 1024, 2048, 1, diagnostics=True)
+
+    assert len(suite) == 2 + 2 * len(plans) + 1
+    assert [cell["name"] for cell in suite[:2]] == ["unsharded", "row"]
+    assert sum(cell["mode"] == "local" for cell in suite) == len(plans)
+    lightest = min(plans, key=lambda plan: plan["objectives"]["window_area"])
     assert [
         cell["profile"]
         for cell in suite
         if cell["sharding"] == "row" and cell["window"] is not None
-    ] == ["memory"]
+    ] == [lightest["profile"]]
 
 
 def test_encoder_baseline_suite_has_no_decode_only_tiling():
@@ -299,6 +567,42 @@ def test_provenance_records_explicit_hardware_family(monkeypatch):
     monkeypatch.setenv("HW_FAMILY", "mi355")
 
     assert report.provenance()["provenance"]["hardware_family"] == "mi355"
+
+
+def test_provenance_measures_the_device_rather_than_trusting_the_label(monkeypatch):
+    """HW_FAMILY is whatever the caller typed; the device is what the run actually used.
+
+    For a long time the label was the only hardware field there was, and since nothing set it
+    every report said null - so two machines' numbers were separable only by hostname. gcnArchName
+    is the part that distinguishes AMD generations, where the marketing name repeats across them.
+    """
+    monkeypatch.delenv("HW_FAMILY", raising=False)
+    monkeypatch.setattr(report.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(report.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(report.torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(
+        report.torch.cuda,
+        "get_device_properties",
+        lambda index: SimpleNamespace(
+            name="AMD Radeon Graphics", gcnArchName="gfx1201", total_memory=34342961152
+        ),
+    )
+
+    recorded = report.provenance()["provenance"]
+
+    assert recorded["hardware_family"] is None
+    assert recorded["device"] == {
+        "name": "AMD Radeon Graphics",
+        "arch": "gfx1201",
+        "total_memory": 34342961152,
+        "count": 4,
+    }
+
+
+def test_provenance_survives_a_run_with_no_accelerator(monkeypatch):
+    monkeypatch.setattr(report.torch.cuda, "is_available", lambda: False)
+
+    assert report.provenance()["provenance"]["device"] is None
 
 
 def test_rank_error_helpers_preserve_original_rank_and_type(monkeypatch):
@@ -1415,7 +1719,7 @@ def test_custom_overlap_installs_the_per_axis_replacement(monkeypatch):
         measure.vae_api, "tiled_decode_for", lambda value: replacement
     )
 
-    facts = measure.configure_tiling(
+    measure.configure_tiling(
         vae,
         {
             "sharding": "unsharded",
@@ -1453,8 +1757,10 @@ def test_report_schema_contains_provenance_and_effective_composition():
         world_size=4,
     )
 
-    assert report.SCHEMA_VERSION == 6
-    assert record["schema_version"] == 6
+    # Spelled out rather than derived, so that bumping the schema is a deliberate act with a
+    # test to edit, instead of something a record can start reporting on its own.
+    assert report.SCHEMA_VERSION == 7
+    assert record["schema_version"] == 7
     assert set(record["versions"]) >= {"torch", "diffusers", "distvae"}
     assert "distvae_git_revision" in record["provenance"]
     assert record["composition"]["sharding"] == "row"
@@ -1486,3 +1792,38 @@ def test_measured_record_with_description_renders_metrics(capsys):
     output = capsys.readouterr().out
     assert "median 125.0 ms" in output
     assert '"adapter"' not in output
+
+
+def test_a_failure_on_every_rank_leaves_the_group_able_to_continue():
+    failures = [
+        {"type": "OutOfMemoryError", "message": "no", "rank": rank} for rank in range(4)
+    ]
+
+    assert not distributed.ranks_diverged(failures)
+    aggregated = distributed.aggregate_rank_errors(failures)
+    assert aggregated["failed_ranks"] == [0, 1, 2, 3]
+
+
+def test_a_failure_on_some_ranks_only_is_reported_as_divergence():
+    failures = [{"type": "OutOfMemoryError", "message": "no", "rank": 0}, None]
+
+    assert distributed.ranks_diverged(failures)
+
+
+def test_a_crossed_gather_is_recorded_rather_than_raised():
+    # What the group hands back once the ranks stop matching up the same calls: rank 1 is still
+    # inside another all_gather_object, so its payload arrives here instead of a failure record.
+    failures = [{"type": "OutOfMemoryError", "message": "no", "rank": 0}, [None, None]]
+
+    assert distributed.ranks_diverged(failures)
+    aggregated = distributed.aggregate_rank_errors(failures)
+    assert aggregated["failed_ranks"] == [0, 1]
+    assert any(
+        failure["type"] == distributed.DESYNCHRONIZED
+        for failure in aggregated["failures"]
+    )
+
+
+def test_no_failure_anywhere_is_not_divergence():
+    assert not distributed.ranks_diverged([None, None, None, None])
+    assert distributed.aggregate_rank_errors([None, None]) is None
