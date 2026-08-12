@@ -5,16 +5,13 @@ import torch.nn as nn
 from torch.distributed import ProcessGroup
 from diffusers.models.autoencoders.vae import Decoder
 from diffusers.models.unets.unet_2d_blocks import UpDecoderBlock2D
-from diffusers.models.autoencoders.autoencoder_kl_wan import (
-    WanUpBlock,
-    WanResidualUpBlock,
-)
 
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
     HUNYUAN_VIDEO_15,
     LTX2_VIDEO,
     QWEN_IMAGE,
+    WAN,
     block,
 )
 from distvae.modules.adapters.layers.conv_adapters import (
@@ -50,6 +47,8 @@ from distvae.utils import (
     parallel_context,
 )
 
+WanUpBlock = block(WAN, "WanUpBlock")
+WanResidualUpBlock = block(WAN, "WanResidualUpBlock")
 QwenImageUpBlock = block(QWEN_IMAGE, "QwenImageUpBlock")
 HunyuanVideoUpBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoUpBlock3D")
 HunyuanVideo15UpBlock3D = block(HUNYUAN_VIDEO_15, "HunyuanVideo15UpBlock3D")

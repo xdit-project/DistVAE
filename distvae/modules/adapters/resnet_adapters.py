@@ -8,6 +8,7 @@ from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO_15,
     LTX2_VIDEO,
     QWEN_IMAGE,
+    WAN,
     block,
     require,
     resolved,
@@ -23,8 +24,8 @@ from distvae.modules.adapters.layers.conv_adapters import (
 from distvae.modules.adapters.layers.norm_adapters import GroupNormAdapter
 from distvae.utils import ParallelContext, cache_cursor
 from diffusers.models.resnet import ResnetBlock2D
-from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, WanResidualBlock
 
+WanResidualBlock = block(WAN, "WanResidualBlock")
 QwenImageResidualBlock = block(QWEN_IMAGE, "QwenImageResidualBlock")
 HunyuanVideoResnetBlockCausal3D = block(HUNYUAN_VIDEO, "HunyuanVideoResnetBlockCausal3D")
 HunyuanVideo15ResnetBlock = block(HUNYUAN_VIDEO_15, "HunyuanVideo15ResnetBlock")

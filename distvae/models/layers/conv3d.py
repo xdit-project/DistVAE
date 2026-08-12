@@ -13,8 +13,6 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
-from torch.nn.modules.utils import _triple
-from torch.nn.common_types import _size_3_t
 
 from distvae.models.layers.conv_utils import (
     get_world_size_and_rank,
@@ -23,6 +21,13 @@ from distvae.models.layers.conv_utils import (
 )
 from distvae.models.layers.conv_mixin import PatchConvMixin
 from distvae.utils import ParallelContext, normalize_patch_dim
+
+
+Size3 = Union[int, Tuple[int, int, int]]
+
+
+def _triple(value: Size3) -> Tuple[int, int, int]:
+    return value if isinstance(value, tuple) else (value, value, value)
 
 
 class PatchConv3d(nn.Conv3d, PatchConvMixin):
@@ -39,10 +44,10 @@ class PatchConv3d(nn.Conv3d, PatchConvMixin):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: _size_3_t,
-        stride: _size_3_t = 1,
-        padding: Union[str, _size_3_t] = 0,
-        dilation: _size_3_t = 1,
+        kernel_size: Size3,
+        stride: Size3 = 1,
+        padding: Union[str, Size3] = 0,
+        dilation: Size3 = 1,
         groups: int = 1,
         bias: bool = True,
         padding_mode: str = 'zeros',  # TODO: refine this type

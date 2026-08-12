@@ -1,0 +1,49 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  minimum-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install minimum supported dependencies
+        run: |
+          python -m pip install \
+            "numpy<2" \
+            "torch==2.2.*" \
+            "diffusers==0.30.3" \
+            "huggingface-hub<0.26" \
+            pytest \
+            packaging
+          python -m pip install --no-deps -e .
+      - name: Test minimum dependency boundary
+        run: |
+          python -m pytest -q \
+            test/test_adapter_structure.py \
+            test/test_public_vae_api.py \
+            test/test_decoderadapter.py \
+            test/test_encoderadapter.py
+
+  latest-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install latest dependencies
+        run: |
+          python -m pip install -e .
+          python -m pip install pytest
+      - name: Run test suite
+        run: python -m pytest -q

@@ -15,6 +15,7 @@ from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO_15,
     LTX2_VIDEO,
     QWEN_IMAGE,
+    WAN,
     block,
     require,
     resolved,
@@ -33,9 +34,10 @@ from distvae.modules.adapters.resnet_adapters import (
     LTX2VideoResnetBlockAdapter,
     WanResidualBlockAdapter,
 )
-from diffusers.models.autoencoders.autoencoder_kl_wan import WanResample, WanResidualDownBlock
 from diffusers.models.downsampling import Downsample2D
 
+WanResample = block(WAN, "WanResample")
+WanResidualDownBlock = block(WAN, "WanResidualDownBlock")
 QwenImageResample = block(QWEN_IMAGE, "QwenImageResample")
 HunyuanVideoDownsampleCausal3D = block(HUNYUAN_VIDEO, "HunyuanVideoDownsampleCausal3D")
 HunyuanVideoDownBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoDownBlock3D")
@@ -403,14 +405,21 @@ class WanResidualDownBlockAdapter(nn.Module):
     Adapter for WanResidualDownBlock used in the encoder (Wan2.2).
     Patches residual blocks and downsampler with distributed processing support.
     """
+    _supported = resolved(WanResidualDownBlock)
+
     def __init__(
         self,
-        wan_residual_down_block: WanResidualDownBlock,
+        wan_residual_down_block: nn.Module,
         conv_block_size = 0,
         parallel_context: ParallelContext = None,
     ):
         super().__init__()
-        assert isinstance(wan_residual_down_block, WanResidualDownBlock), (
+        require(
+            self._supported,
+            type(self).__name__,
+            "WanResidualDownBlock",
+        )
+        assert isinstance(wan_residual_down_block, self._supported), (
             "WanResidualDownBlockAdapter only supports WanResidualDownBlock"
         )
         self.down_block = wan_residual_down_block
@@ -426,7 +435,9 @@ class WanResidualDownBlockAdapter(nn.Module):
                 )
             self.down_block.resnets = nn.ModuleList(adapted_resnets)
         if hasattr(wan_residual_down_block, "downsampler") and wan_residual_down_block.downsampler is not None:
-            if isinstance(wan_residual_down_block.downsampler, WanResample):
+            if WanResample is not None and isinstance(
+                wan_residual_down_block.downsampler, WanResample
+            ):
                 self.down_block.downsampler = WanResampleDownAdapter(
                     wan_residual_down_block.downsampler,
                     conv_block_size=conv_block_size,

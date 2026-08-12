@@ -11,6 +11,7 @@ from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO_15,
     LTX2_VIDEO,
     QWEN_IMAGE,
+    WAN,
     block,
     require,
     resolved,
@@ -31,8 +32,10 @@ from distvae.modules.adapters.resnet_adapters import (
     WanResidualBlockAdapter,
 )
 from diffusers.models.upsampling import Upsample2D
-from diffusers.models.autoencoders.autoencoder_kl_wan import WanResample, WanResidualUpBlock, WanUpBlock
 
+WanResample = block(WAN, "WanResample")
+WanResidualUpBlock = block(WAN, "WanResidualUpBlock")
+WanUpBlock = block(WAN, "WanUpBlock")
 QwenImageResample = block(QWEN_IMAGE, "QwenImageResample")
 QwenImageUpBlock = block(QWEN_IMAGE, "QwenImageUpBlock")
 HunyuanVideoUpsampleCausal3D = block(HUNYUAN_VIDEO, "HunyuanVideoUpsampleCausal3D")

@@ -8,7 +8,14 @@ Split a diffusers VAE across GPUs. DistVAE swaps the encoder and decoder for sha
 pip install distvae
 ```
 
-Python 3.10 or newer, with `torch>=2.2` and `diffusers>=0.35`.
+Python 3.10 or newer, with `torch>=2.2` and `diffusers>=0.30.3`. Individual VAE
+families may require a newer Diffusers release.
+
+The pipeline quickstart also needs Transformers:
+
+``` bash
+pip install "distvae[pipeline]"
+```
 
 ## Quickstart
 
@@ -31,21 +38,22 @@ torch.cuda.set_device(device)
 vae_group = dist.group.WORLD
 
 pipe = DiffusionPipeline.from_pretrained(
-    "stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16
+    os.environ["MODEL_ID"], torch_dtype=torch.bfloat16
 ).to(device)
 
 vae_api.parallelize_decoder(pipe.vae, vae_group)
 vae_api.parallelize_encoder(pipe.vae, vae_group)
 
-image = pipe("an astronaut riding a horse", height=1024, width=1024).images[0]
+image = pipe("A cat holding a sign that says hello world", height=1024, width=1024).images[0]
 if dist.get_rank() == 0:
     image.save("out.png")
 ```
 
-Then launch it across your GPUs:
+Then launch it across your GPUs with any pipeline whose VAE DistVAE supports. For example,
+with a recent Diffusers release:
 
 ``` bash
-torchrun --nproc_per_node=4 decode.py
+MODEL_ID=black-forest-labs/FLUX.2-dev torchrun --nproc_per_node=4 decode.py
 ```
 
 Both calls raise if there is no adapter for the VAE, so an unsupported model fails at setup rather than part way through a decode.

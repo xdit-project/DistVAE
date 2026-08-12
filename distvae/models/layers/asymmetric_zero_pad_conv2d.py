@@ -4,8 +4,6 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
-from torch.nn.common_types import _size_2_t, _size_4_t
-from torch.nn.modules.utils import _pair
 
 from distvae.models.layers.conv_mixin import PatchConvMixin
 from distvae.models.layers.conv_utils import (
@@ -16,19 +14,23 @@ from distvae.models.layers.conv_utils import (
 from distvae.utils import ParallelContext, normalize_patch_dim
 
 
+Size2 = Union[int, Tuple[int, int]]
+Size4 = Union[int, Tuple[int, int, int, int]]
+
+
 class AsymmetricZeroPadConv2d(nn.Conv2d, PatchConvMixin):
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: _size_2_t = 3,
-        stride: _size_2_t = 2,
-        dilation: _size_2_t = 1,
+        kernel_size: Size2 = 3,
+        stride: Size2 = 2,
+        dilation: Size2 = 1,
         groups: int = 1,
         bias: bool = True,
         device=None,
         dtype=None,
-        reversed_zero_padding: Union[int, _size_4_t] = 0,
+        reversed_zero_padding: Size4 = 0,
         block_size: Union[int, Tuple[int, int, int]] = 0,
         parallel_context: ParallelContext = None,
     ) -> None:
@@ -168,7 +170,7 @@ class AsymmetricZeroPadConv2d(nn.Conv2d, PatchConvMixin):
                 weight,
                 bias,
                 self.stride,
-                _pair(0),
+                (0, 0),
                 self.dilation,
                 self.groups,
             )

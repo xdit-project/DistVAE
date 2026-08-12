@@ -4,8 +4,6 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
-from torch.nn.modules.utils import _pair
-from torch.nn.common_types import _size_2_t
 
 from distvae.models.layers.conv_utils import (
     get_world_size_and_rank,
@@ -16,15 +14,22 @@ from distvae.models.layers.conv_mixin import PatchConvMixin
 from distvae.utils import ParallelContext, normalize_patch_dim
 
 
+Size2 = Union[int, Tuple[int, int]]
+
+
+def _pair(value: Size2) -> Tuple[int, int]:
+    return value if isinstance(value, tuple) else (value, value)
+
+
 class PatchConv2d(nn.Conv2d, PatchConvMixin):
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: _size_2_t,
-        stride: _size_2_t = 1,
-        padding: Union[str, _size_2_t] = 0,
-        dilation: _size_2_t = 1,
+        kernel_size: Size2,
+        stride: Size2 = 1,
+        padding: Union[str, Size2] = 0,
+        dilation: Size2 = 1,
         groups: int = 1,
         bias: bool = True,
         padding_mode: str = 'zeros',  # TODO: refine this type

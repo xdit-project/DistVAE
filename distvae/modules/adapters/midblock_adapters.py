@@ -1,13 +1,13 @@
 from typing import Tuple
 
 import torch.nn as nn
-from diffusers.models.autoencoders.autoencoder_kl_wan import WanMidBlock
 
 from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO,
     HUNYUAN_VIDEO_15,
     LTX2_VIDEO,
     QWEN_IMAGE,
+    WAN,
     block,
     require,
     resolved,
@@ -22,6 +22,7 @@ from distvae.modules.adapters.resnet_adapters import (
     WanResidualBlockAdapter,
 )
 
+WanMidBlock = block(WAN, "WanMidBlock")
 QwenImageMidBlock = block(QWEN_IMAGE, "QwenImageMidBlock")
 HunyuanVideoMidBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoMidBlock3D")
 HunyuanVideo15MidBlock = block(HUNYUAN_VIDEO_15, "HunyuanVideo15MidBlock")

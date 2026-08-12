@@ -9,6 +9,7 @@ from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO_15,
     LTX2_VIDEO,
     QWEN_IMAGE,
+    WAN,
     block,
 )
 from distvae.modules.adapters.downsampling_adapters import (
@@ -50,13 +51,11 @@ from distvae.utils import (
 
 from diffusers.models.autoencoders.vae import Encoder
 from diffusers.models.unets.unet_2d_blocks import DownEncoderBlock2D
-from diffusers.models.autoencoders.autoencoder_kl_wan import (
-    WanAttentionBlock,
-    WanResample,
-    WanResidualBlock,
-    WanResidualDownBlock,
-)
 
+WanAttentionBlock = block(WAN, "WanAttentionBlock")
+WanResample = block(WAN, "WanResample")
+WanResidualBlock = block(WAN, "WanResidualBlock")
+WanResidualDownBlock = block(WAN, "WanResidualDownBlock")
 QwenImageAttentionBlock = block(QWEN_IMAGE, "QwenImageAttentionBlock")
 QwenImageResample = block(QWEN_IMAGE, "QwenImageResample")
 QwenImageResidualBlock = block(QWEN_IMAGE, "QwenImageResidualBlock")

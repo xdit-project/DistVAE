@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
 from distvae.models.layers.conv2d import PatchConv2d
 from distvae.models.layers.conv3d import PatchConv3d
 from distvae.modules.adapters.adapter_utils import adopt_convolution_parameters
@@ -14,11 +13,13 @@ from distvae.modules.adapters.diffusers_blocks import (
     HUNYUAN_VIDEO_15,
     LTX2_VIDEO,
     QWEN_IMAGE,
+    WAN,
     block,
     require,
     resolved,
 )
 
+WanCausalConv3d = block(WAN, "WanCausalConv3d")
 QwenImageCausalConv3d = block(QWEN_IMAGE, "QwenImageCausalConv3d")
 HunyuanVideoCausalConv3d = block(HUNYUAN_VIDEO, "HunyuanVideoCausalConv3d")
 HunyuanVideo15CausalConv3d = block(HUNYUAN_VIDEO_15, "HunyuanVideo15CausalConv3d")
