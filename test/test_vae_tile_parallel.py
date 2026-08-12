@@ -5,6 +5,7 @@ import os
 import random
 import socket
 import unittest
+import warnings
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
@@ -341,6 +342,29 @@ class TestBackendAgreement(unittest.TestCase):
 
 class TestRuns(unittest.TestCase):
     """Tiles split into a contiguous run per rank, blended locally, gathered back whole"""
+
+    def test_fewer_tiles_than_ranks_warns_that_every_rank_repeats_the_decode(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with mock.patch.object(
+                vae_tile_parallel, "_distributed", return_value=(None, 0, 8)
+            ):
+                result = vae_tile_parallel.assemble_in_runs(
+                    None,
+                    rows=2,
+                    columns=2,
+                    decode=mock.Mock(),
+                    blend=_blend(1, 1),
+                    weights=[1, 1, 1, 1],
+                )
+
+        self.assertIsNone(result)
+        self.assertEqual(len(caught), 1)
+        self.assertIs(caught[0].category, RuntimeWarning)
+        self.assertRegex(
+            str(caught[0].message),
+            "4 tiles for 8 ranks.*every rank will decode all 4 tiles",
+        )
 
     def test_tiles_of_equal_weight_are_split_as_evenly_as_they_divide(self):
         # Evenly means no run heavier than it has to be, which for equal weights is the share

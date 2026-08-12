@@ -17,6 +17,7 @@ have made, and gets back what all of those calls returned, on every rank, in ord
 
 import functools
 import math
+import warnings
 from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import torch
@@ -346,6 +347,14 @@ def assemble_in_runs(
     # Fewer tiles than ranks and some rank would hold nothing, with no tensor of its own to take a
     # dtype and a device from. A decode that small has nothing worth dividing anyway.
     if len(order) < world_size:
+        if rank == 0:
+            warnings.warn(
+                f"VAE tile grid has {len(order)} tiles for {world_size} ranks; "
+                f"whole-tile distribution is disabled and every rank will decode all "
+                f"{len(order)} tiles locally. Use fewer VAE ranks or a smaller tile window.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return None
     if (
         blend.tile_down < 2 * blend.deep_down
