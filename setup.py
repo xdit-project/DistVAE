@@ -20,6 +20,8 @@ if __name__ == "__main__":
             "dev": [
                 "pytest",
                 "black",
+                "mdformat",
+                "mdformat-gfm",
                 "flake8",
                 "mypy",
             ],

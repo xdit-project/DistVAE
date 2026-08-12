@@ -1,19 +1,20 @@
 # DistVAE
 
-DistVAE replaces supported diffusers VAE encoders and decoders with distributed adapters. The rest of the diffusion pipeline stays unchanged.
+DistVAE replaces supported diffusers VAE encoders and decoders with distributed adapters. The rest
+of the diffusion pipeline stays unchanged.
 
 ## Installation
 
-``` bash
+```bash
 pip install distvae
 ```
 
-Python 3.10 or newer, with `torch>=2.2` and `diffusers>=0.30.3`. Individual VAE
-families may require a newer Diffusers release.
+Python 3.10 or newer, with `torch>=2.2` and `diffusers>=0.30.3`. Individual VAE families may require
+a newer Diffusers release.
 
 The pipeline quickstart also needs Transformers:
 
-``` bash
+```bash
 pip install "distvae[pipeline]"
 ```
 
@@ -21,7 +22,7 @@ pip install "distvae[pipeline]"
 
 Every rank builds the same pipeline, and DistVAE shards the VAE inside it. Save this as `decode.py`:
 
-``` python
+```python
 import os
 
 import torch
@@ -49,50 +50,67 @@ if dist.get_rank() == 0:
     image.save("out.png")
 ```
 
-Then launch it across your GPUs with any pipeline whose VAE DistVAE supports. For example,
-with a recent Diffusers release:
+Then launch it across your GPUs with any pipeline whose VAE DistVAE supports. For example, with a
+recent Diffusers release:
 
-``` bash
+```bash
 MODEL_ID=black-forest-labs/FLUX.2-dev torchrun --nproc_per_node=4 decode.py
 ```
 
-Both calls raise if there is no adapter for the VAE, so an unsupported model fails at setup rather than part way through a decode.
+Both calls raise if there is no adapter for the VAE, so an unsupported model fails at setup rather
+than part way through a decode.
 
 ## Supported VAEs
 
-Every family below supports both row sharding and tiling. Qwen-Image is listed with the video VAEs because its Wan-derived autoencoder has a frame axis.
+Every family below supports both row sharding and tiling. Qwen-Image is listed with the video VAEs
+because its Wan-derived autoencoder has a frame axis.
 
-| VAE | Frame axis | Tiles by | A tile is |
-| --- | --- | --- | --- |
-| `AutoencoderKL` | no | overlap-derived strides | one decoder call |
-| Flux.2 | no | overlap-derived strides | one decoder call |
-| HunyuanVideo 1.5 | yes | overlap-derived strides | one decoder call |
-| HunyuanVideo | yes | a stored stride | one decoder call |
-| LTX-2 | yes | a stored stride | one decoder call |
-| Wan | yes | a stored stride | a call per frame, threading a causal cache |
-| Qwen-Image | yes | a stored stride | a call per frame, threading a causal cache |
+| VAE              | Frame axis | Tiles by                | A tile is                                          |
+| ---------------- | ---------- | ----------------------- | -------------------------------------------------- |
+| `AutoencoderKL`  | no         | overlap-derived strides | one decoder call                                   |
+| Flux.2           | no         | overlap-derived strides | one decoder call                                   |
+| HunyuanVideo 1.5 | yes        | overlap-derived strides | one decoder call                                   |
+| HunyuanVideo     | yes        | a stored stride         | one decoder call per temporal chunk                |
+| LTX-2            | yes        | a stored stride         | one decoder call unless temporal tiling is enabled |
+| Wan              | yes        | a stored stride         | a call per frame, threading a causal cache         |
+| Qwen-Image       | yes        | a stored stride         | a call per frame, threading a causal cache         |
 
-Tile size affects the families differently. A smaller tile reduces peak memory when one tile is one decoder call. Wan and Qwen-Image decode one frame at a time, so their peak memory is usually set elsewhere.
+Tile size affects the families differently. A smaller tile reduces tile-local activation memory when
+one tile is one decoder call, but allocations outside the spatial tile can determine the measured
+peak. Wan and Qwen-Image decode one frame at a time, so their peak memory is often set by temporal
+state.
 
-`tile_overlap_plan` accepts exact output-pixel `(height, width)` values and maps them to each VAE's stride settings. DistVAE owns the tiling loop for every family in the table. CogVideoX is excluded because it tiles frames inside the spatial loop, so its spatial tiles are not independent.
+`tile_overlap_plan` accepts exact output-pixel `(height, width)` values and maps them to each VAE's
+stride settings. DistVAE owns the tiling loop for every family in the table. CogVideoX is excluded
+because it tiles frames inside the spatial loop, so its spatial tiles are not independent.
 
-## Row sharding or tiling
+## Distributed decode strategies
 
-The figure compares row sharding with two tile sizes. Each row reports peak activations, decoded work, seams, load imbalance, and synchronization:
+DistVAE provides two distributed decode strategies:
+
+- **Row sharding** gives each rank a band in every adapted layer. It exchanges convolution halos and
+  normalization statistics, preserves the unsharded result within numerical tolerance, and usually
+  reduces activation memory as ranks are added.
+- **Whole-tile distribution** gives each rank complete windows. Ranks exchange tile-edge data and
+  gather decoded pieces for assembly. Peak activation memory usually follows the tile window,
+  including on one GPU, while overlap repeats work and tile-local normalization can change the
+  output.
+
+The figure compares the two distributed paths at two tile sizes. Each row reports peak activations,
+decoded work, seams, load imbalance, and synchronization:
 
 ![Row sharding and two whole-tile distributions for a 1024 by 1024 image on four GPUs, compared by peak activations, work, seams, load imbalance, and synchronization](docs/figure.png)
 
-**Row sharding** gives each rank a band of rows and communicates inside every adapted layer. It preserves the unsharded result. Activation memory falls as ranks are added, but every rank still stores the full decoder.
-
-**Tiling** gives each rank complete windows and communicates when distributing and assembling them. Peak memory follows the tile size, including on one GPU. Overlap repeats work, and normalization over one tile can change the output.
-
-[Row sharding or tiling](docs/strategies.md) explains when to use each mode.
+[Choosing a decode path](docs/strategies.md) explains how VAE family, input shape, rank count, and
+interconnect affect the choice. The [benchmark guide](bench/README.md) shows how to measure both
+strategies against a vanilla unsharded Diffusers decode.
 
 ## Usage
 
-The quickstart uses `distvae.vae`, which picks the adapter for a whole VAE. To shard a single diffusers module instead, wrap it in its adapter:
+The quickstart uses `distvae.vae`, which picks the adapter for a whole VAE. To shard a single
+diffusers module instead, wrap it in its adapter:
 
-``` python
+```python
 import os
 
 import torch
@@ -128,9 +146,10 @@ There are more runnable examples in `test/`.
 
 ### Tiling
 
-Diffusers decides whether to tile. DistVAE resizes the window and distributes the tiles across the group:
+Diffusers decides whether to tile. DistVAE resizes the window and distributes the tiles across the
+group:
 
-``` python
+```python
 from distvae import vae as vae_api
 
 vae_api.require_vae_support(pipe.vae, "tiling", "enable_tiling()")
@@ -165,37 +184,43 @@ if tiled_decode is None:
 pipe.vae.tiled_decode = tiled_decode
 ```
 
-Window and overlap are separate controls in output pixels. The window sets the memory required for one tile. The overlap reduces the stride and increases repeated work.
+Window and overlap are separate controls in output pixels. The window sets the memory required for
+one tile. The overlap reduces the stride and increases repeated work.
 
-Both planners return `None` when a request cannot be represented exactly. Apply `tile_shape_plan` first because `tile_overlap_plan` reads the current tile shape. Requested overlap values are never rounded.
+Both planners return `None` when a request cannot be represented exactly. Apply `tile_shape_plan`
+first because `tile_overlap_plan` reads the current tile shape. Requested overlap values are never
+rounded.
 
-[Choosing a tile window](docs/tiling.md) explains rectangular windows, clipped edge tiles, and overlap.
+[Choosing a tile window](docs/tiling.md) explains rectangular windows, clipped edge tiles, and
+overlap.
 
 ### xDiT integration
 
-xDiT chooses the tile settings and calls the DistVAE planners. Supply
-`vae_tile_overlap_height` and `vae_tile_overlap_width` together in output pixels. Use zero on an
-axis that is not tiled. Installing new shape or overlap settings replaces the previous tiled
-decode callable.
+xDiT chooses the tile settings and calls the DistVAE planners. Supply `vae_tile_overlap_height` and
+`vae_tile_overlap_width` together in output pixels. Use zero on an axis that is not tiled.
+Installing new shape or overlap settings replaces the previous tiled decode callable.
 
 ## Performance
 
-Latency and memory depend on the VAE family, input shape, rank count, device, and interconnect.
-The benchmark chooses up to three rectangular plans and records their work, memory estimate, and
-load imbalance before running them. See `bench/README.md` for the suite and its limits.
+Latency and memory depend on the VAE family, input shape, rank count, device, and interconnect. The
+benchmark chooses up to three rectangular plans and records their work, memory estimate, and load
+imbalance before running them. See `bench/README.md` for the suite and its limits.
 
 ## Development
 
-``` bash
+```bash
 git clone https://github.com/xdit-project/DistVAE
 cd DistVAE
 pip install -e ".[dev]"
+mdformat --extensions gfm --wrap 100 README.md bench/README.md docs/*.md
 pytest
 ```
 
-Tests marked `gloo` spawn several ranks over gloo and need no accelerator, so `pytest -m gloo` exercises the distributed paths on a CPU-only machine.
+Tests marked `gloo` spawn several ranks over gloo and need no accelerator, so `pytest -m gloo`
+exercises the distributed paths on a CPU-only machine.
 
-`docs/make_figure.py` regenerates `docs/figure.svg` and, when `cairosvg` is installed, `docs/figure.png`.
+`docs/make_figure.py` regenerates `docs/figure.svg` and, when `cairosvg` is installed,
+`docs/figure.png`.
 
 ## License
 
