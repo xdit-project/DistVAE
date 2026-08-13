@@ -209,14 +209,15 @@ def latent_rows(vae, plan: Optional[dict] = None) -> Optional[int]:
     # load.
     if plan is None:
         plan = _tile_defaults(vae)
-    latents = [plan[attr] for attr in LATENT_ATTRS if attr in plan]
-    if latents:
-        return min(latents)
+    for attr in ("tile_latent_min_height", "tile_latent_min_size"):
+        if attr in plan:
+            return plan[attr]
     ratio = spatial_ratio(vae)
-    pixels = [plan[attr] for attr in PIXEL_ATTRS if attr in plan]
-    if ratio is None or not pixels:
-        return None
-    return min(pixels) // ratio
+    if ratio is not None:
+        for attr in ("tile_sample_min_height", "tile_sample_min_size"):
+            if attr in plan:
+                return plan[attr] // ratio
+    return None
 
 
 def overlap_windows(vae) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:

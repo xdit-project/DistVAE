@@ -347,6 +347,15 @@ class TestTileShapePlan(unittest.TestCase):
 class TestLatentRows(unittest.TestCase):
     """How many rows a planned tile leaves available for spatial sharding"""
 
+    def test_rectangular_window_uses_height_instead_of_the_smaller_axis(self):
+        vae = legacy_pair_vae()
+        self.assertEqual(
+            vae_tiling.latent_rows(
+                vae, vae_tiling.tile_shape_plan(vae, 256, 64)
+            ),
+            32,
+        )
+
     def test_rows_come_from_the_latent_window_where_the_vae_carries_one(self):
         vae = legacy_pair_vae()
         self.assertEqual(
