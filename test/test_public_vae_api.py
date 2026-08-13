@@ -13,6 +13,8 @@ PUBLIC_VAE_FUNCTIONS = {
     "encoder_adapter_name",
     "encoder_scale_factor",
     "is_tile_padding_error",
+    "latent_rows",
+    "mark",
     "parallelize_decoder",
     "parallelize_encoder",
     "require_vae_support",

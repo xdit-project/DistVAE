@@ -11,11 +11,13 @@ from .parallel import (
 )
 from .tile_parallel import (
     context_of,
+    mark,
     sharing,
 )
 from .tiling import (
     apply_tile_plan,
     is_tile_padding_error,
+    latent_rows,
     require_vae_support,
     supports_tile_parallel,
     tile_overlap,
@@ -33,6 +35,8 @@ __all__ = [
     "encoder_adapter_name",
     "encoder_scale_factor",
     "is_tile_padding_error",
+    "latent_rows",
+    "mark",
     "parallelize_decoder",
     "parallelize_encoder",
     "require_vae_support",
