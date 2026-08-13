@@ -8,6 +8,19 @@ import torch.distributed as dist
 from distvae.models.layers.conv_mixin import PatchConvMixin
 from distvae.utils import ParallelContext, normalize_patch_dim
 
+
+class VAERowSplitError(ValueError):
+    """A row-sharded VAE cannot divide this axis into complete processing units."""
+
+    def __init__(self, rows: int, factor: int):
+        self.rows = rows
+        self.factor = factor
+        super().__init__(
+            f"Cannot split {rows} rows into multiples of {factor}: the VAE narrows this "
+            f"axis by {factor}, so every band must contain a whole multiple of {factor} rows."
+        )
+
+
 def _patch_axis(conv) -> int:
     """Which entry of a convolution's per-axis tuples describes the axis being split"""
     patch_dim = conv.patch_dim
@@ -127,11 +140,7 @@ class Patchify(nn.Module):
         size = hidden_state.shape[patch_dim]
         factor = max(1, self.scale_factor)
         if size % factor:
-            raise ValueError(
-                f"Cannot split {size} rows into multiples of {factor}: the VAE narrows this "
-                f"axis by {factor}, so every band must contain a whole multiple of {factor} "
-                f"rows."
-            )
+            raise VAERowSplitError(size, factor)
         units = size // factor
         if units < self.group_world_size:
             raise ValueError(

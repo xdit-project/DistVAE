@@ -20,7 +20,13 @@ import torch.nn as nn
 
 from distvae.models.layers.conv2d import PatchConv2d
 from distvae.models.layers.conv3d import PatchConv3d
-from distvae.modules.patch_utils import DePatchify, Patchify, gather_patches, widest_halo
+from distvae.modules.patch_utils import (
+    DePatchify,
+    Patchify,
+    VAERowSplitError,
+    gather_patches,
+    widest_halo,
+)
 from distvae.utils import ParallelContext, normalize_patch_dim
 
 from distributed_harness import (
@@ -34,6 +40,16 @@ from distributed_harness import (
 def test_patchify_requires_an_explicit_parallel_context():
     with pytest.raises(TypeError, match="parallel_context"):
         Patchify()
+
+
+def test_non_integral_vae_rows_raise_a_typed_error():
+    context = ParallelContext(group=None, rank=0, world_size=1, patch_dim=-2)
+
+    with pytest.raises(VAERowSplitError) as error:
+        Patchify(context, scale_factor=2)(torch.randn(1, 2, 45, 4))
+
+    assert error.value.rows == 45
+    assert error.value.factor == 2
 
 
 def test_the_widest_halo_is_half_the_widest_kernel_on_the_split_axis():

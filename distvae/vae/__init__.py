@@ -1,6 +1,7 @@
 """Public VAE orchestration APIs for DistVAE."""
 
 from distvae.utils import ParallelContext
+from distvae.modules.patch_utils import VAERowSplitError
 
 from .parallel import (
     decoder_adapter_name,
@@ -29,6 +30,7 @@ from .tiling import (
 
 __all__ = [
     "ParallelContext",
+    "VAERowSplitError",
     "apply_tile_plan",
     "context_of",
     "decoder_adapter_name",

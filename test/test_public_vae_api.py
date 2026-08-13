@@ -7,6 +7,7 @@ from distvae import vae
 MINIMUM_PUBLIC_VAE_API_VERSION = Version("0.0.0beta9")
 PUBLIC_VAE_FUNCTIONS = {
     "ParallelContext",
+    "VAERowSplitError",
     "apply_tile_plan",
     "context_of",
     "decoder_adapter_name",
