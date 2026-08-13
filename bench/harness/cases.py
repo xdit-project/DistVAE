@@ -4,7 +4,7 @@ import math
 
 from distvae import vae as vae_api
 from distvae.vae.tile_parallel import shares
-from distvae.vae.tiling import latent_rows
+from distvae.vae.tiling import _latent_shape
 
 
 # Named for tile count, which is a fact about the plan, rather than for an outcome, which is a
@@ -411,13 +411,13 @@ def normalizer_for_vae(vae, sample_shape, world_size):
                 shape_plan = vae_api.tile_shape_plan(vae, height, width)
                 if shape_plan is None:
                     continue
-                # `latent_rows` reports the SMALLER of the tile's two latent extents, so this
-                # bounds the narrow axis whichever one it is. A tile needs enough of it both to
-                # shard across the ranks and to normalize over something representative; the
-                # second is the binding constraint at every world size we run. Without it the
-                # widened overlap search reaches genuinely small windows for the first time and
-                # the memory profile selects them - it picked 9 latent rows on FLUX.2 at 1024.
-                extent = latent_rows(vae, shape_plan)
+                # A tile needs enough of its narrow latent axis both to shard across the ranks
+                # and to normalize over something representative; the second is the binding
+                # constraint at every world size we run. Without it the widened overlap search
+                # reaches genuinely small windows for the first time and the memory profile
+                # selects them - it picked 9 latent rows on FLUX.2 at 1024.
+                latent_shape = _latent_shape(vae, shape_plan)
+                extent = min(latent_shape) if latent_shape is not None else None
                 if extent is not None and extent < max(world_size, MIN_TILE_LATENT_EXTENT):
                     continue
                 blend = blend_for_window(overlap, (height, width))

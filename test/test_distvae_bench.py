@@ -360,7 +360,7 @@ def test_vae_normalizer_rejects_windows_with_too_few_latent_rows(monkeypatch):
         "tile_shape_plan",
         lambda value, height, width: {"window": (height, width)},
     )
-    monkeypatch.setattr(cases, "latent_rows", lambda value, plan: 3)
+    monkeypatch.setattr(cases, "_latent_shape", lambda value, plan: (3, 3))
     monkeypatch.setattr(
         cases.vae_api,
         "tile_overlap_plan",
@@ -389,7 +389,7 @@ def test_vae_normalizer_rejects_windows_that_band(monkeypatch):
         "tile_shape_plan",
         lambda value, height, width: {"window": (height, width)},
     )
-    monkeypatch.setattr(cases, "latent_rows", lambda value, plan: extent)
+    monkeypatch.setattr(cases, "_latent_shape", lambda value, plan: (extent, extent))
     monkeypatch.setattr(
         cases.vae_api,
         "tile_overlap_plan",
@@ -399,6 +399,41 @@ def test_vae_normalizer_rejects_windows_that_band(monkeypatch):
     normalize = cases.normalizer_for_vae(vae, (512, 512), world_size=4)
 
     assert normalize((256, 256), (32, 32)) is None
+
+
+def test_vae_normalizer_checks_the_shorter_latent_axis(monkeypatch):
+    rectangle = {
+        "tile_sample_min_size": 64,
+        "tile_sample_min_height": 256,
+        "tile_sample_min_width": 64,
+        "tile_latent_min_size": 8,
+        "tile_latent_min_height": 32,
+        "tile_latent_min_width": 8,
+    }
+    vae = SimpleNamespace(**rectangle)
+    monkeypatch.setattr(cases.vae_api, "tile_shape", lambda value: (256, 256))
+    monkeypatch.setattr(
+        cases.vae_api, "tile_shape_plan", lambda *args, **kwargs: rectangle
+    )
+    monkeypatch.setattr(
+        cases.vae_api,
+        "tile_overlap_plan",
+        lambda *args, **kwargs: pytest.fail("a narrow window reached overlap planning"),
+    )
+
+    normalize = cases.normalizer_for_vae(vae, (512, 512), world_size=4)
+
+    assert normalize((256, 64), (32, 8)) is None
+
+
+def test_tile_latent_area_prefers_keyed_rectangle_over_scalar_threshold():
+    vae = SimpleNamespace(
+        tile_latent_min_size=8,
+        tile_latent_min_height=32,
+        tile_latent_min_width=8,
+    )
+
+    assert measure._tile_latent_area(vae) == 256
 
 
 def _bounded_plans():
@@ -1804,7 +1839,7 @@ def test_vae_normalizer_returns_overlap_for_the_normalized_window(monkeypatch):
             {"window": (height, width)} if height % 128 == 0 and width % 128 == 0 else None
         ),
     )
-    monkeypatch.setattr(cases, "latent_rows", lambda value, plan: 32)
+    monkeypatch.setattr(cases, "_latent_shape", lambda value, plan: (32, 32))
     monkeypatch.setattr(
         cases.vae_api,
         "tile_overlap_plan",

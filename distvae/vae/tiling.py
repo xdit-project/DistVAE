@@ -200,24 +200,41 @@ def apply_tile_plan(vae, plan: dict) -> None:
         setattr(vae, attr, value)
 
 
-def latent_rows(vae, plan: Optional[dict] = None) -> Optional[int]:
-    """How many latent rows a tile holds, under `plan` or as the VAE stands, None where it
-    does not say
-    """
+def _latent_shape(vae, plan: Optional[dict] = None) -> Optional[Tuple[int, int]]:
+    """Latent tile height and width under `plan`, or None where the VAE does not say."""
     # Without a plan the VAE's own attributes are the plan, which is how a caller asks about a
     # window that no flag set - a VAE tiling at its own default, or one a model turned on at
     # load.
     if plan is None:
         plan = _tile_defaults(vae)
-    for attr in ("tile_latent_min_height", "tile_latent_min_size"):
-        if attr in plan:
-            return plan[attr]
+    keyed = tuple(
+        plan.get(attr)
+        for attr in ("tile_latent_min_height", "tile_latent_min_width")
+    )
+    if all(value is not None for value in keyed):
+        return keyed
+    scalar = plan.get("tile_latent_min_size")
+    if scalar is not None:
+        return scalar, scalar
     ratio = spatial_ratio(vae)
     if ratio is not None:
-        for attr in ("tile_sample_min_height", "tile_sample_min_size"):
-            if attr in plan:
-                return plan[attr] // ratio
+        keyed = tuple(
+            plan.get(attr)
+            for attr in ("tile_sample_min_height", "tile_sample_min_width")
+        )
+        if all(value is not None for value in keyed):
+            return tuple(value // ratio for value in keyed)
+        scalar = plan.get("tile_sample_min_size")
+        if scalar is not None:
+            edge = scalar // ratio
+            return edge, edge
     return None
+
+
+def latent_rows(vae, plan: Optional[dict] = None) -> Optional[int]:
+    """How many latent rows a tile holds, under `plan` or as the VAE stands."""
+    shape = _latent_shape(vae, plan)
+    return shape[0] if shape is not None else None
 
 
 def overlap_windows(vae) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:

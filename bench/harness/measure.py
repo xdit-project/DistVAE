@@ -8,7 +8,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from distvae import vae as vae_api
-from distvae.vae.tiling import latent_rows
+from distvae.vae.tiling import _latent_shape, latent_rows
 
 from . import catalog, profile
 from .distributed import across_ranks
@@ -22,18 +22,8 @@ def _device_api(runtime):
 
 
 def _tile_latent_area(vae):
-    sizes = [
-        getattr(vae, name, None)
-        for name in (
-            "tile_latent_min_size",
-            "tile_latent_min_height",
-            "tile_latent_min_width",
-        )
-    ]
-    sizes = [value for value in sizes if isinstance(value, int) and value > 0]
-    if not sizes:
-        return None
-    return sizes[0] * (sizes[-1] if len(sizes) > 1 else sizes[0])
+    shape = _latent_shape(vae)
+    return shape[0] * shape[1] if shape is not None else None
 
 
 def configure_tiling(vae, cell, runtime, half, say):
