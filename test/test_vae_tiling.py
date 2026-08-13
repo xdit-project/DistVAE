@@ -962,9 +962,15 @@ class TestStrideTiledDecode(unittest.TestCase):
                     ).sample
                 # State may be shared between frames within one tile, but not between tiles.
                 # Tile execution order therefore cannot affect the output.
-                stride = vae.tile_sample_stride_height // vae.spatial_compression_ratio
-                across = len(range(0, latents.shape[-1], stride))
-                self.assertEqual(seen, [across * across])
+                stride_height = (
+                    vae.tile_sample_stride_height // vae.spatial_compression_ratio
+                )
+                stride_width = (
+                    vae.tile_sample_stride_width // vae.spatial_compression_ratio
+                )
+                rows = len(range(0, latents.shape[-2], stride_height))
+                columns = len(range(0, latents.shape[-1], stride_width))
+                self.assertEqual(seen, [rows * columns])
                 torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
     def test_a_wider_step_decodes_fewer_tiles_to_the_same_image_size(self):
