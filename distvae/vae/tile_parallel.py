@@ -144,6 +144,12 @@ def runs(weights: Sequence[int], world_size: int) -> List[Tuple[int, int]]:
 
 
 def shares(weights: Sequence[int], world_size: int) -> List[int]:
+    """Return the cached tile assignment as a caller-owned list."""
+    return list(_shares(tuple(weights), world_size))
+
+
+@functools.lru_cache(maxsize=128)
+def _shares(weights: Tuple[int, ...], world_size: int) -> Tuple[int, ...]:
     """Which rank decodes each tile: contiguous runs, levelled by moving or swapping a few tiles
 
     A run is the cheap shape to blend, since its tiles' neighbours are mostly its own, but it is
@@ -163,7 +169,7 @@ def shares(weights: Sequence[int], world_size: int) -> List[int]:
     for rank, (start, stop) in enumerate(runs(weights, world_size)):
         owner.extend([rank] * (stop - start))
     if world_size < 2:
-        return owner
+        return tuple(owner)
 
     load = [0] * world_size
     for n, weight in enumerate(weights):
@@ -271,7 +277,7 @@ def shares(weights: Sequence[int], world_size: int) -> List[int]:
             count[second] += 1
         else:
             owner[first], owner[second] = owner[second], owner[first]
-    return owner
+    return tuple(owner)
 
 
 def _greedy(weights: Sequence[int], ceiling: int) -> List[Tuple[int, int]]:

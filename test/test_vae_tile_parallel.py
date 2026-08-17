@@ -462,6 +462,19 @@ class TestRuns(unittest.TestCase):
         for _ in range(10):
             self.assertEqual(vae_tile_parallel.shares(weights, 4), expected)
 
+    def test_equal_weights_reuse_the_cached_assignment(self):
+        weights = [101, 103, 107, 109, 113, 127, 131]
+
+        with mock.patch.object(
+            vae_tile_parallel, "runs", wraps=vae_tile_parallel.runs
+        ) as split:
+            first = vae_tile_parallel.shares(weights, 3)
+            second = vae_tile_parallel.shares(list(weights), 3)
+
+        split.assert_called_once()
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+
     def test_equal_balance_prefers_fewer_tiles_displaced_from_the_runs(self):
         # Moving tile 1 and swapping tiles 0 and 2 both produce loads [2, 2, 4]. The move leaves
         # only one tile outside its original run, while the swap leaves two.
