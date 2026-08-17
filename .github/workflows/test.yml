@@ -29,7 +29,7 @@ jobs:
       - name: Test minimum dependency boundary
         run: |
           python -m pytest -q \
-            test/test_adapter_structure.py \
+            test/test_adapter_compatibility.py \
             test/test_public_vae_api.py \
             test/test_decoderadapter.py \
             test/test_encoderadapter.py
