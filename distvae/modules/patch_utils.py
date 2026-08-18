@@ -167,6 +167,8 @@ class Patchify(nn.Module):
         rank = self.rank_in_vae_group
         start = (rank * band + min(rank, remainder)) * factor
         length = (band + (1 if rank < remainder else 0)) * factor
+        # `narrow` alone would retain the complete input storage and a width slice would be
+        # non-contiguous. Materialize an independent contiguous rank-local shard.
         return hidden_state.narrow(patch_dim, start, length).clone()
 
 
