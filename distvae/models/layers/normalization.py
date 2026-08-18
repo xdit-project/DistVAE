@@ -8,49 +8,16 @@ from distvae.utils import ParallelContext, normalize_patch_dim
 
 
 class PatchGroupNorm(nn.GroupNorm):
-    r"""Applies Group Normalization over a mini-batch of inputs.
+    """Inference-only GroupNorm over spatial shards held by a VAE process group.
 
-    This layer implements the operation as described in
-    the paper `Group Normalization <https://arxiv.org/abs/1803.08494>`__
+    Each rank supplies its local, potentially uneven shard. Group sums and squared
+    deviations are reduced across ``parallel_context.group``, so every rank normalizes
+    its shard with the statistics of the complete unsharded tensor. The biased variance
+    estimator and affine transform match :class:`torch.nn.GroupNorm`.
 
-    .. math::
-        y = \frac{x - \mathrm{E}[x]}{ \sqrt{\mathrm{Var}[x] + \epsilon}} * \gamma + \beta
-
-    The input channels are separated into :attr:`num_groups` groups, each containing
-    ``num_channels / num_groups`` channels. :attr:`num_channels` must be divisible by
-    :attr:`num_groups`. The mean and standard-deviation are calculated
-    separately over the each group. :math:`\gamma` and :math:`\beta` are learnable
-    per-channel affine transform parameter vectors of size :attr:`num_channels` if
-    :attr:`affine` is ``True``.
-    The standard-deviation is calculated via the biased estimator, equivalent to
-    `torch.var(input, unbiased=False)`.
-
-    This layer uses statistics computed from input data in both training and
-    evaluation modes.
-
-    Args:
-        num_groups (int): number of groups to separate the channels into
-        num_channels (int): number of channels expected in input
-        eps: a value added to the denominator for numerical stability. Default: 1e-5
-        affine: a boolean value that when set to ``True``, this module
-            has learnable per-channel affine parameters initialized to ones (for weights)
-            and zeros (for biases). Default: ``True``.
-
-    Shape:
-        - Input: :math:`(N, C, *)` where :math:`C=\text{num\_channels}`
-        - Output: :math:`(N, C, *)` (same shape as input)
-
-    Examples::
-
-        >>> input = torch.randn(20, 6, 10, 10)
-        >>> # Separate 6 channels into 3 groups
-        >>> m = nn.GroupNorm(3, 6)
-        >>> # Separate 6 channels into 6 groups (equivalent with InstanceNorm)
-        >>> m = nn.GroupNorm(6, 6)
-        >>> # Put all 6 channels into a single group (equivalent with LayerNorm)
-        >>> m = nn.GroupNorm(1, 6)
-        >>> # Activating the module
-        >>> output = m(input)
+    ``parallel_context`` identifies the process group and spatial patch dimension.
+    ``forward`` runs without gradient tracking and returns a tensor with the same local
+    shape as its input.
     """
 
     def __init__(
