@@ -427,6 +427,26 @@ class TestRuns(unittest.TestCase):
                         f"{weights} over {world_size}",
                     )
 
+    def test_large_grids_keep_the_weighted_runs_when_one_round_exceeds_the_budget(
+        self,
+    ):
+        world_size = 4
+        weights = [128 * 128] * 483 + [64 * 64]
+        candidates = (
+            len(weights) * (world_size - 1)
+            + len(weights) * (len(weights) - 1) // 2
+        )
+        self.assertGreater(candidates, vae_tile_parallel.MAX_LEVEL_CANDIDATES)
+
+        vae_tile_parallel._shares.cache_clear()
+        try:
+            self.assertEqual(
+                vae_tile_parallel.shares(weights, world_size),
+                _by_runs(weights, world_size),
+            )
+        finally:
+            vae_tile_parallel._shares.cache_clear()
+
     def test_a_tile_moves_across_where_a_run_cannot_be_levelled(self):
         # The grid measured on four ranks: nine tiles, the last row and column clipped. Contiguity
         # alone leaves the heaviest rank a quarter above the lightest possible; a tile moving

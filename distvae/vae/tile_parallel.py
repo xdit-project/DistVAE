@@ -37,6 +37,11 @@ Decode = Callable[[Sequence[Where]], Dict[Where, torch.Tensor]]
 # 4D sample and a 5D one alike, so the assembly below needs no axis of its own to be told.
 DOWN, ACROSS = -2, -1
 
+# Every rank independently searches the same tile assignment, so the bound must be deterministic:
+# a wall-clock deadline could leave ranks with different owners. This budget permits exhaustive
+# levelling for small grids while large grids keep the already weight-balanced contiguous runs.
+MAX_LEVEL_CANDIDATES = 100_000
+
 
 class Blend(NamedTuple):
     """Functions and dimensions used by Diffusers tiling loops to combine adjacent tiles."""
@@ -157,11 +162,12 @@ def _shares(weights: Tuple[int, ...], world_size: int) -> Tuple[int, ...]:
     allows still leaves the heaviest rank a quarter above the average, because the tiles are large
     against the share and a run cannot skip one. No weighing fixes that; only a finer assignment.
 
-    So the runs are a starting point rather than the answer. Moves and pairwise swaps are searched
-    together across every rank pair. Each accepted change strictly lowers the descending load
-    vector, or keeps that vector while restoring a tile to its original run. Among equally balanced
-    choices, fewer tiles displaced from those runs win, followed by tiles already beside their new
-    owner. The total tie-break is deterministic because every rank computes this independently.
+    So the runs are a starting point rather than the answer. Within a fixed candidate budget, moves
+    and pairwise swaps are searched together across every rank pair. Each accepted change strictly
+    lowers the descending load vector, or keeps that vector while restoring a tile to its original
+    run. Among equally balanced choices, fewer tiles displaced from those runs win, followed by
+    tiles already beside their new owner. The budget and total tie-break are deterministic because
+    every rank computes this independently.
 
     A move never takes a rank's last tile. Swaps preserve every rank's tile count.
     """
@@ -182,10 +188,17 @@ def _shares(weights: Tuple[int, ...], world_size: int) -> Tuple[int, ...]:
     def objective(loads, moved):
         return tuple(sorted(loads, reverse=True)), moved
 
-    # Every accepted operation strictly lowers `objective`, so no ownership state can recur.
-    # There are world_size ** tile_count states, which is a conservative finite round bound; the
-    # search normally reaches its fixed point after only a handful.
-    for _ in range(world_size ** len(weights)):
+    # Conservatively count every move to another rank and every tile pair. Some are skipped below,
+    # but charging for them makes this a simple hard ceiling independent of the current ownership.
+    tiles = len(weights)
+    candidates_per_round = (
+        tiles * (world_size - 1) + tiles * (tiles - 1) // 2
+    )
+    rounds = MAX_LEVEL_CANDIDATES // candidates_per_round
+
+    # Every accepted operation strictly lowers `objective`, so stopping at the budget can only
+    # leave the assignment no worse than the weighted runs it started from.
+    for _ in range(rounds):
         current = objective(load, displaced)
         best = None
 
