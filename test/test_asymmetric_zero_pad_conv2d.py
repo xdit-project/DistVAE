@@ -160,12 +160,15 @@ def test_asymmetric_zero_pad_conv2d_gloo_matches_single_rank_reference(
 
 
 @pytest.mark.gloo
-def test_asymmetric_zero_pad_conv2d_gloo_chunked_path(master_port, seed=42):
-    """Chunked path: large H/W and block_size>0 so _use_direct_path is False inside the layer."""
+@pytest.mark.parametrize("block_size", [1, 4])
+def test_asymmetric_zero_pad_conv2d_gloo_chunked_path(
+    block_size, master_port, seed=42
+):
+    """Chunked paths clamp every input chunk to at least the kernel size."""
     _run_one(
         world_size=2,
         patch_dim=-2,
-        block_size=4,
+        block_size=block_size,
         seed=seed,
         master_port=master_port,
     )

@@ -7,8 +7,7 @@ from torch.nn import functional as F
 
 from distvae.models.layers.conv_mixin import PatchConvMixin
 from distvae.models.layers.conv_utils import (
-    correct_end,
-    correct_start,
+    chunk_bounds,
     get_world_size_and_rank,
 )
 from distvae.utils import ParallelContext, normalize_patch_dim
@@ -31,7 +30,7 @@ class AsymmetricZeroPadConv2d(nn.Conv2d, PatchConvMixin):
         device=None,
         dtype=None,
         reversed_zero_padding: Size4 = 0,
-        block_size: Union[int, Tuple[int, int, int]] = 0,
+        block_size: Union[int, Tuple[int, int]] = 0,
         parallel_context: ParallelContext = None,
     ) -> None:
         if isinstance(dilation, int):
@@ -175,58 +174,34 @@ class AsymmetricZeroPadConv2d(nn.Conv2d, PatchConvMixin):
                 self.groups,
             )
 
-        if isinstance(self.block_size, int):
-            num_chunks_in_h = (height + self.block_size - 1) // self.block_size
-            num_chunks_in_w = (width + self.block_size - 1) // self.block_size
-        else:
-            num_chunks_in_h = (
-                height + self.block_size[0] - 1
-            ) // self.block_size[0]
-            num_chunks_in_w = (
-                width + self.block_size[1] - 1
-            ) // self.block_size[1]
-        unit_chunk_size_h = height // num_chunks_in_h
-        unit_chunk_size_w = width // num_chunks_in_w
-        if isinstance(self.kernel_size, int):
-            kernel_size_h, kernel_size_w = self.kernel_size, self.kernel_size
-        else:
-            kernel_size_h, kernel_size_w = self.kernel_size
-        if isinstance(self.stride, int):
-            stride_h, stride_w = self.stride, self.stride
-        else:
-            stride_h, stride_w = self.stride
+        block_h, block_w = (
+            (self.block_size, self.block_size)
+            if isinstance(self.block_size, int)
+            else self.block_size
+        )
+        kernel_h, kernel_w = self.kernel_size
+        stride_h, stride_w = self.stride
+        rows = chunk_bounds(height, block_h, kernel_h, stride_h)
+        columns = chunk_bounds(width, block_w, kernel_w, stride_w)
 
-        output = []
-        for idx_h in range(num_chunks_in_h):
-            inner_output = []
-            for idx_w in range(num_chunks_in_w):
-                start_w = idx_w * unit_chunk_size_w
-                start_h = idx_h * unit_chunk_size_h
-                end_w = (idx_w + 1) * unit_chunk_size_w
-                end_h = (idx_h + 1) * unit_chunk_size_h
-                if idx_w + 1 < num_chunks_in_w:
-                    end_w = correct_end(end_w, kernel_size_w, stride_w)
-                else:
-                    end_w = width
-                if idx_h + 1 < num_chunks_in_h:
-                    end_h = correct_end(end_h, kernel_size_h, stride_h)
-                else:
-                    end_h = height
-                if idx_w > 0:
-                    start_w = correct_start(start_w, stride_w)
-                if idx_h > 0:
-                    start_h = correct_start(start_h, stride_h)
-
-                inner_output.append(
-                    F.conv2d(
-                        input[:, :, start_h:end_h, start_w:end_w],
-                        weight,
-                        bias,
-                        self.stride,
-                        0,
-                        self.dilation,
-                        self.groups,
-                    )
+        return torch.cat(
+            [
+                torch.cat(
+                    [
+                        F.conv2d(
+                            input[:, :, top:bottom, left:right],
+                            weight,
+                            bias,
+                            self.stride,
+                            0,
+                            self.dilation,
+                            self.groups,
+                        )
+                        for left, right in columns
+                    ],
+                    dim=-1,
                 )
-            output.append(torch.cat(inner_output, dim=-1))
-        return torch.cat(output, dim=2)
+                for top, bottom in rows
+            ],
+            dim=-2,
+        )
