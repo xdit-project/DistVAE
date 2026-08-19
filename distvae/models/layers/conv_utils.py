@@ -13,20 +13,18 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from distvae.utils import DistributedEnv
+from distvae.utils import ParallelContext
 
 
-def get_world_size_and_rank():
-    """Return distributed group and rank info from DistributedEnv.
+def get_world_size_and_rank(parallel_context: ParallelContext):
+    """Return rank metadata captured by an immutable parallel context.
 
     Returns:
-        Tuple of (group_world_size, global_rank, rank_in_group, local_rank).
+        Tuple of (group_world_size, rank_in_group).
     """
-    group_world_size = DistributedEnv.get_group_world_size()
-    global_rank = DistributedEnv.get_global_rank()
-    rank_in_group = DistributedEnv.get_rank_in_vae_group()
-    local_rank = DistributedEnv.get_local_rank()
-    return group_world_size, global_rank, rank_in_group, local_rank
+    if not isinstance(parallel_context, ParallelContext):
+        raise TypeError("patch convolution requires a ParallelContext")
+    return parallel_context.world_size, parallel_context.rank
 
 
 def calc_patch_index(patch_list: List[Tensor]):
@@ -114,8 +112,7 @@ def calc_halo_width(rank, height_index, kernel_size, padding=0, stride=1):
 
     The halo is the region used for convolution but not included in this rank's
     output. The first rank forces top to 0; the last rank (world_size - 1, inferred
-    from len(height_index) - 1 or DistributedEnv.get_group_world_size()) forces
-    bottom to 0.
+    from len(height_index) - 1) forces bottom to 0.
 
     Returns:
         Tuple (top_halo_width, bottom_halo_width) in patch-dim elements.
@@ -126,9 +123,34 @@ def calc_halo_width(rank, height_index, kernel_size, padding=0, stride=1):
     ]
     if rank == 0:
         halo_width[0] = 0
-    elif rank == DistributedEnv.get_group_world_size() - 1:
+    elif rank == len(height_index) - 2:
         halo_width[1] = 0
     return tuple(halo_width)
+
+
+def calc_halo_width_unit_stride(rank, world_size, kernel_size):
+    """Compute (top, bottom) halo widths for a stride-1 conv, asking no other rank anything.
+
+    Under unit stride every term that mentions where a patch sits cancels out of
+    calc_top_halo_width and calc_bottom_halo_width, and the halo comes down to the kernel:
+    a rank needs the (kernel_size - 1) // 2 rows above it that its first output row reads,
+    and kernel_size // 2 rows below it for its last. Padding cancels too, because it shifts
+    the output grid and the patch start by the same amount.
+
+    That matters because the alternative is an all_gather of one integer per convolution,
+    and on a Wan decode those gathers are half of every collective the model makes.
+
+    Args:
+        rank: This rank's index within the VAE group.
+        world_size: Size of the VAE group.
+        kernel_size: Kernel size along the patch dimension.
+
+    Returns:
+        Tuple (top_halo_width, bottom_halo_width), matching calc_halo_width at stride 1.
+    """
+    top = 0 if rank == 0 else (kernel_size - 1) // 2
+    bottom = 0 if rank == world_size - 1 else kernel_size // 2
+    return top, bottom
 
 
 def correct_end(end, kernel_size, stride):
@@ -155,6 +177,46 @@ def correct_start(start, stride):
     boundaries in the chunked conv path.
     """
     return ((start + stride - 1) // stride) * stride
+
+
+def chunk_bounds(extent, block, kernel_size, stride) -> List[Tuple[int, int]]:
+    """Where each chunk of one axis begins and ends, so that convolving them separately and
+    concatenating gives what convolving the whole axis would
+
+    The chunks divide the axis evenly and are then grown at each cut: every chunk but the last
+    runs on to the last input its final output position reads, and every chunk but the first
+    begins at the first input the next output step needs. Both are the same two corrections the
+    2D and the 3D path each used to write out per axis, which is two of them and five copies.
+
+    Never more chunks than leave every one of them at least a kernel long. Asking for more cuts
+    an axis into pieces no convolution can be run on at all, which raises out of torch rather
+    than costing accuracy - and the count that does it is not obvious from the block size: a
+    frame axis of 4 padded to 6, chunked by 4 at stride 2, ends on a chunk of 2. Fewer chunks
+    only means a larger intermediate, which is the knob's own currency, and the output is the
+    same however the axis is divided.
+
+    Args:
+        extent: Length of the axis, after any padding.
+        block: Requested chunk length; the count is the ceiling of extent over it.
+        kernel_size, stride: Conv parameters along this axis.
+
+    Returns:
+        List of (start, end) input-space bounds, one per chunk.
+    """
+    chunks = (extent + block - 1) // block
+    # A chunk spans its share of the axis less what the corrections at either end move it, which
+    # is a stride at most, so a share of kernel + stride - 1 is what keeps the shortest of them
+    # at a kernel. At stride 1 that is the kernel itself.
+    chunks = max(1, min(chunks, extent // (kernel_size + stride - 1)))
+    unit = extent // chunks
+    bounds = []
+    for idx in range(chunks):
+        start = idx * unit
+        bounds.append((
+            correct_start(start, stride) if idx else start,
+            extent if idx + 1 == chunks else correct_end(start + unit, kernel_size, stride),
+        ))
+    return bounds
 
 
 def build_crop_slice(
@@ -283,8 +345,7 @@ def exchange_halo(
     halo_width: tuple,
     prev_bottom_halo_width: int,
     next_top_halo_width: int,
-    group_world_size: int,
-    rank_in_group: int,
+    parallel_context: ParallelContext,
     halo_buffer: dict = None,
 ) -> Tensor:
     """Exchange halo regions with previous and next ranks; return extended local tensor.
@@ -292,10 +353,13 @@ def exchange_halo(
     Send: bottom halo to next rank (size next_top_halo_width), top halo to prev
     (size prev_bottom_halo_width). Receive: top halo from prev (halo_width[0]),
     bottom halo from next (halo_width[1]). Concatenate [top_halo_recv, input,
-    bottom_halo_recv] along patch_dim and return. Uses non-blocking isend and
-    blocking recv, then wait on sends.
+    bottom_halo_recv] along patch_dim and return. All four are issued as one
+    batch and waited on together.
 
     Args:
+        patch_index: Cumulative patch boundaries, or None when the caller never gathered them.
+            They only serve the bounds checks here, which are skipped in that case rather than
+            paid for with a collective.
         halo_buffer: Optional dict to cache/reuse comms buffers for better performance
     """
     ndim = input.ndim
@@ -304,77 +368,59 @@ def exchange_halo(
     indices_start = [slice(None)] * ndim
     indices_start[patch_dim] = slice(0, prev_bottom_halo_width)
 
-    to_next = None
-    to_prev = None
+    if not isinstance(parallel_context, ParallelContext):
+        raise TypeError("exchange_halo requires a ParallelContext")
+    vae_group = parallel_context.group
+    rank_in_group = parallel_context.rank
+    ops = []
     top_halo_recv = None
     bottom_halo_recv = None
     global_rank_of_next = None
     global_rank_of_prev = None
 
-    if next_top_halo_width > 0:
-        global_rank_of_next = DistributedEnv.get_global_rank_from_group_rank(rank_in_group + 1)
-        bottom_halo_send = input[tuple(indices_end)].contiguous()
-        to_next = dist.isend(
-            bottom_halo_send,
-            global_rank_of_next,
-            group=DistributedEnv.get_vae_group(),
-        )
-    if halo_width[0] > 0:
-        assert patch_index[rank_in_group] - halo_width[0] >= patch_index[rank_in_group - 1], (
-            "width of top halo region is larger than the input tensor of prev rank"
-        )
+    def recv_buffer(name: str, width: int) -> Tensor:
         recv_shape = list(input.shape)
-        recv_shape[patch_dim] = halo_width[0]
+        recv_shape[patch_dim] = width
         if halo_buffer is None:
-            top_halo_recv = torch.empty(
+            return torch.empty(recv_shape, dtype=input.dtype, device=input.device)
+        key = (name, tuple(recv_shape), input.dtype, input.device)
+        if key not in halo_buffer:
+            halo_buffer[key] = torch.empty(
                 recv_shape, dtype=input.dtype, device=input.device
             )
-        else:
-            key = ("top_recv", tuple(recv_shape), input.dtype, input.device)
-            if key in halo_buffer:
-                top_halo_recv = halo_buffer[key]
-            else:
-                top_halo_recv = torch.empty(
-                    recv_shape, dtype=input.dtype, device=input.device
-                )
-                halo_buffer[key] = top_halo_recv
-        global_rank_of_prev = DistributedEnv.get_global_rank_from_group_rank(rank_in_group - 1)
-        dist.recv(top_halo_recv, global_rank_of_prev, group=DistributedEnv.get_vae_group())
+        return halo_buffer[key]
+
+    if next_top_halo_width > 0:
+        global_rank_of_next = parallel_context.global_rank(rank_in_group + 1)
+        bottom_halo_send = input[tuple(indices_end)].contiguous()
+        ops.append(dist.P2POp(dist.isend, bottom_halo_send, global_rank_of_next, group=vae_group))
+    if halo_width[0] > 0:
+        assert patch_index is None or (
+            patch_index[rank_in_group] - halo_width[0] >= patch_index[rank_in_group - 1]
+        ), "width of top halo region is larger than the input tensor of prev rank"
+        top_halo_recv = recv_buffer("top_recv", halo_width[0])
+        global_rank_of_prev = parallel_context.global_rank(rank_in_group - 1)
+        ops.append(dist.P2POp(dist.irecv, top_halo_recv, global_rank_of_prev, group=vae_group))
     if prev_bottom_halo_width > 0:
         top_halo_send = input[tuple(indices_start)].contiguous()
         if global_rank_of_prev is None:
-            global_rank_of_prev = DistributedEnv.get_global_rank_from_group_rank(rank_in_group - 1)
-        to_prev = dist.isend(
-            top_halo_send,
-            global_rank_of_prev,
-            group=DistributedEnv.get_vae_group(),
-        )
+            global_rank_of_prev = parallel_context.global_rank(rank_in_group - 1)
+        ops.append(dist.P2POp(dist.isend, top_halo_send, global_rank_of_prev, group=vae_group))
     if halo_width[1] > 0:
-        assert patch_index[rank_in_group + 1] + halo_width[1] <= patch_index[rank_in_group + 2], (
-            "width of bottom halo region is larger than the input tensor of next rank"
-        )
-        recv_shape = list(input.shape)
-        recv_shape[patch_dim] = halo_width[1]
-        if halo_buffer is None:
-            bottom_halo_recv = torch.empty(
-                recv_shape, dtype=input.dtype, device=input.device
-            )
-        else:
-            key = ("bottom_recv", tuple(recv_shape), input.dtype, input.device)
-            if key in halo_buffer:
-                bottom_halo_recv = halo_buffer[key]
-            else:
-                bottom_halo_recv = torch.empty(
-                    recv_shape, dtype=input.dtype, device=input.device
-                )
-                halo_buffer[key] = bottom_halo_recv
+        assert patch_index is None or (
+            patch_index[rank_in_group + 1] + halo_width[1] <= patch_index[rank_in_group + 2]
+        ), "width of bottom halo region is larger than the input tensor of next rank"
+        bottom_halo_recv = recv_buffer("bottom_recv", halo_width[1])
         if global_rank_of_next is None:
-            global_rank_of_next = DistributedEnv.get_global_rank_from_group_rank(rank_in_group + 1)
-        dist.recv(
-            bottom_halo_recv,
-            global_rank_of_next,
-            group=DistributedEnv.get_vae_group(),
-        )
+            global_rank_of_next = parallel_context.global_rank(rank_in_group + 1)
+        ops.append(dist.P2POp(dist.irecv, bottom_halo_recv, global_rank_of_next, group=vae_group))
+
+    # Batching exposes both independent directions at once and lets NCCL reuse the wider group's
+    # communicator instead of constructing one for each point-to-point operation.
+    if ops:
+        for work in dist.batch_isend_irecv(ops):
+            work.wait()
+
     if halo_width[0] < 0:
         trim_slice = [slice(None)] * ndim
         trim_slice[patch_dim] = slice(-halo_width[0], None)
@@ -383,9 +429,5 @@ def exchange_halo(
         input = torch.cat([top_halo_recv, input], dim=patch_dim)
     if bottom_halo_recv is not None:
         input = torch.cat([input, bottom_halo_recv], dim=patch_dim)
-    if to_next is not None:
-        to_next.wait()
-    if to_prev is not None:
-        to_prev.wait()
     return input
 

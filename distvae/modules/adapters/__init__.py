@@ -1,31 +1,71 @@
-# Export downsampling adapters
-from .downsampling_adapters import (
-    WanResampleDownAdapter,
-    WanResidualDownBlockAdapter,
-)
+"""Public adapter exports, loaded only when requested."""
 
-# Export upsampling adapters
-from .upsampling_adapters import (
-    Upsample2DAdapter,
-    WanResampleAdapter,
-    WanResidualUpBlockAdapter,
-    WanUpBlockAdapter,
-)
+from importlib import import_module
 
-# Export other adapters
-from .midblock_adapters import WanMidBlockAdapter
-from .resnet_adapters import WanResidualBlockAdapter
 
-__all__ = [
-    # Downsampling
+_DOWNSAMPLING = (
+    "Downsample2DAdapter",
+    "HunyuanVideo15DownBlockAdapter",
+    "HunyuanVideo15DownsampleAdapter",
+    "HunyuanVideoDownBlockAdapter",
+    "HunyuanVideoDownsampleAdapter",
+    "LTX2VideoDownBlockAdapter",
+    "LTX2VideoDownsamplerAdapter",
+    "QwenImageResampleDownAdapter",
     "WanResampleDownAdapter",
     "WanResidualDownBlockAdapter",
-    # Upsampling
+)
+_UPSAMPLING = (
+    "HunyuanVideo15UpBlockAdapter",
+    "HunyuanVideo15UpsampleAdapter",
+    "HunyuanVideoUpBlockAdapter",
+    "HunyuanVideoUpsampleAdapter",
+    "LTX2VideoUpBlockAdapter",
+    "LTX2VideoUpsamplerAdapter",
+    "QwenImageResampleAdapter",
+    "QwenImageUpBlockAdapter",
     "Upsample2DAdapter",
     "WanResampleAdapter",
     "WanResidualUpBlockAdapter",
     "WanUpBlockAdapter",
-    # Other
+)
+_MIDBLOCK = (
+    "HunyuanVideo15MidBlockAdapter",
+    "HunyuanVideoMidBlockAdapter",
+    "LTX2VideoMidBlockAdapter",
+    "QwenImageMidBlockAdapter",
     "WanMidBlockAdapter",
+)
+_RESNET = (
+    "HunyuanVideo15ResnetBlockAdapter",
+    "HunyuanVideoResnetBlockAdapter",
+    "LTX2VideoResnetBlockAdapter",
+    "QwenImageResidualBlockAdapter",
     "WanResidualBlockAdapter",
+)
+_EXPORTS = {
+    **{name: "downsampling_adapters" for name in _DOWNSAMPLING},
+    **{name: "upsampling_adapters" for name in _UPSAMPLING},
+    **{name: "midblock_adapters" for name in _MIDBLOCK},
+    **{name: "resnet_adapters" for name in _RESNET},
+}
+
+__all__ = [
+    *_DOWNSAMPLING,
+    *_UPSAMPLING,
+    *_MIDBLOCK,
+    *_RESNET,
 ]
+
+
+def __getattr__(name):
+    module_name = _EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(f"{__name__}.{module_name}"), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted((*globals(), *__all__))

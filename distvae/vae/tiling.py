@@ -1,0 +1,846 @@
+"""What the installed diffusers can tile or slice, and how wide a window it can decode.
+
+Everything here is knowledge about diffusers VAEs: which tiling attributes a class carries, how
+they relate, and which releases have them. The calling integration decides whether to use them.
+"""
+
+import functools
+import inspect
+import math
+from typing import Callable, List, NamedTuple, Optional, Tuple
+
+import diffusers
+import torch
+
+# Diffusers represents tiling windows with several attribute layouts: a latent/pixel pair
+# (AutoencoderKL and friends), a pixel window plus a stride (Wan, Qwen-Image, the video VAEs), and
+# either of those keyed by height and width. Frame tiling is left out on purpose, being unrelated
+# to a spatial tile edge.
+PIXEL_ATTRS = (
+    "tile_sample_min_size",
+    "tile_sample_min_height",
+    "tile_sample_min_width",
+)
+LATENT_ATTRS = (
+    "tile_latent_min_size",
+    "tile_latent_min_height",
+    "tile_latent_min_width",
+)
+STRIDE_ATTRS = ("tile_sample_stride_height", "tile_sample_stride_width")
+SCALED_ATTRS = LATENT_ATTRS + STRIDE_ATTRS
+OVERLAP_ATTRS = (
+    "tile_overlap_factor",
+    "tile_overlap_factor_height",
+    "tile_overlap_factor_width",
+)
+def require_vae_support(vae, feature: str, flag: str) -> None:
+    """Raise unless the installed diffusers really implements `feature` for this VAE"""
+    # Diffusers hands every autoencoder the enable_tiling and enable_slicing methods through a
+    # shared mixin, implemented or not, so their presence proves nothing. The state flag the mixin
+    # itself checks does. Wan added support in Diffusers 0.34, later than the minimum supported
+    # Diffusers version.
+    if not hasattr(vae, f"use_{feature}"):
+        raise ValueError(
+            f"{flag} is not supported by this VAE ({type(vae).__name__}) in the installed "
+            f"diffusers {diffusers.__version__}."
+        )
+
+
+def is_tile_padding_error(error: BaseException) -> bool:
+    """Whether a decode failure is the padding error a too-narrow tile window causes"""
+    # Torch raises this from a pad deep inside the decoder, where a tile arrives thinner than the
+    # convolution's own padding: "Padding size should be less than the corresponding input
+    # dimension, but got: padding (1, 1) at dimension 4 of input [1, 8, 3, 4, 1]". Text is all
+    # there is to key on, and a rewording upstream only costs the hint, since anything unmatched
+    # reaches the caller as the decoder wrote it.
+    return "padding size should be less than" in str(error).lower()
+
+
+def tile_shape(vae) -> Optional[Tuple[int, int]]:
+    """The VAE's pixel-space tile window as (height, width), if it carries one."""
+    height = getattr(vae, "tile_sample_min_height", None)
+    width = getattr(vae, "tile_sample_min_width", None)
+    if all(isinstance(value, int) and value > 0 for value in (height, width)):
+        return height, width
+    square = getattr(vae, "tile_sample_min_size", None)
+    if isinstance(square, int) and square > 0:
+        return square, square
+    return None
+
+
+def _tile_defaults(vae) -> dict:
+    """Every tiling attribute the VAE carries, as the reference to rescale from"""
+    defaults = {}
+    for attr in PIXEL_ATTRS + SCALED_ATTRS + OVERLAP_ATTRS:
+        value = getattr(vae, attr, None)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value > 0
+        ):
+            defaults[attr] = value
+    return defaults
+
+
+def spatial_ratio(vae) -> Optional[int]:
+    """Pixels per latent pixel, where the VAE says so; config first, since reading a config key
+    off the module is deprecated"""
+    for source in (getattr(vae, "config", None), vae):
+        ratio = (
+            getattr(source, "spatial_compression_ratio", None)
+            if source is not None
+            else None
+        )
+        if isinstance(ratio, int) and ratio > 0:
+            return ratio
+    return None
+
+
+def _is_whole(value: float) -> bool:
+    """Whole within float error, so 30 x (1 - 1/3) counts as 20 and not 20.000000000000004"""
+    return abs(value - round(value)) < 1e-9
+
+
+def tile_shape_plan(vae, height: int, width: int) -> Optional[dict]:
+    """Tiling attributes rescaled independently to an exact (height, width) window.
+
+    Scalar-window VAEs receive complete per-axis attributes for DistVAE's replacement overlap
+    loop. VAEs that already define per-axis windows retain their native attribute layout.
+    """
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in (height, width)
+    ):
+        return None
+
+    defaults = _tile_defaults(vae)
+    legacy_scalar = all(
+        attr in defaults for attr in ("tile_sample_min_size", "tile_latent_min_size")
+    )
+    keyed = all(
+        attr in defaults
+        for attr in ("tile_sample_min_height", "tile_sample_min_width")
+    )
+    if keyed:
+        source_pixels = (
+            defaults["tile_sample_min_height"],
+            defaults["tile_sample_min_width"],
+        )
+        pixel_attrs = ("tile_sample_min_height", "tile_sample_min_width")
+        latent_attrs = ("tile_latent_min_height", "tile_latent_min_width")
+    elif "tile_sample_min_size" in defaults:
+        source_pixels = (defaults["tile_sample_min_size"],) * 2
+        pixel_attrs = ("tile_sample_min_height", "tile_sample_min_width")
+        latent_attrs = ("tile_latent_min_height", "tile_latent_min_width")
+    else:
+        return None
+
+    targets = (height, width)
+    plan = dict(zip(pixel_attrs, targets))
+    scalar_latent = defaults.get("tile_latent_min_size")
+    factors = (
+        defaults.get("tile_overlap_factor_height", defaults.get("tile_overlap_factor")),
+        defaults.get("tile_overlap_factor_width", defaults.get("tile_overlap_factor")),
+    )
+
+    for axis, (target, source) in enumerate(zip(targets, source_pixels)):
+        latent_source = defaults.get(latent_attrs[axis], scalar_latent)
+        if latent_source is not None:
+            latent = target * latent_source / source
+            if latent < 1 or not _is_whole(latent):
+                return None
+            latent = round(latent)
+            factor = factors[axis]
+            if (
+                isinstance(factor, float)
+                and factor < 1.0
+                and not _overlap_lands(latent, target, factor)
+            ):
+                return None
+            plan[latent_attrs[axis]] = latent
+
+        stride_attr = STRIDE_ATTRS[axis]
+        stride_source = defaults.get(stride_attr)
+        if stride_source is not None:
+            stride = target * stride_source / source
+            if stride < 1 or not _is_whole(stride):
+                return None
+            plan[stride_attr] = round(stride)
+
+    if legacy_scalar:
+        # AutoencoderKL and Flux decide whether to enter tiled_decode with one scalar threshold.
+        # The smaller axis is conservative: crossing either requested window must cross it, while
+        # overlap_windows reads the exact keyed rectangle above once the loop is entered.
+        plan["tile_sample_min_size"] = min(targets)
+        plan["tile_latent_min_size"] = min(
+            plan["tile_latent_min_height"], plan["tile_latent_min_width"]
+        )
+
+    granularity = _stride_granularity(vae) if any(
+        attr in plan for attr in STRIDE_ATTRS
+    ) else None
+    if granularity is not None and any(
+        value % granularity
+        for value in targets + tuple(plan[attr] for attr in STRIDE_ATTRS if attr in plan)
+    ):
+        return None
+
+    ratio = spatial_ratio(vae)
+    if ratio is not None and not any(attr in plan for attr in LATENT_ATTRS):
+        if any(target < ratio or target % ratio for target in targets):
+            return None
+    return plan
+
+
+def apply_tile_plan(vae, plan: dict) -> None:
+    """Set a planned window on the VAE"""
+    # Newer VAE classes also take these through enable_tiling(), but only some of them, with a
+    # different signature each, and the body is a plain assignment either way.
+    for attr, value in plan.items():
+        setattr(vae, attr, value)
+
+
+def _latent_shape(vae, plan: Optional[dict] = None) -> Optional[Tuple[int, int]]:
+    """Latent tile height and width under `plan`, or None where the VAE does not say."""
+    # Without a plan the VAE's own attributes are the plan, which is how a caller asks about a
+    # window that no flag set - a VAE tiling at its own default, or one a model turned on at
+    # load.
+    if plan is None:
+        plan = _tile_defaults(vae)
+    keyed = tuple(
+        plan.get(attr)
+        for attr in ("tile_latent_min_height", "tile_latent_min_width")
+    )
+    if all(value is not None for value in keyed):
+        return keyed
+    scalar = plan.get("tile_latent_min_size")
+    if scalar is not None:
+        return scalar, scalar
+    ratio = spatial_ratio(vae)
+    if ratio is not None:
+        keyed = tuple(
+            plan.get(attr)
+            for attr in ("tile_sample_min_height", "tile_sample_min_width")
+        )
+        if all(value is not None for value in keyed):
+            return tuple(value // ratio for value in keyed)
+        scalar = plan.get("tile_sample_min_size")
+        if scalar is not None:
+            edge = scalar // ratio
+            return edge, edge
+    return None
+
+
+def latent_rows(vae, plan: Optional[dict] = None) -> Optional[int]:
+    """How many latent rows a tile holds, under `plan` or as the VAE stands."""
+    shape = _latent_shape(vae, plan)
+    return shape[0] if shape is not None else None
+
+
+def overlap_windows(vae) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
+    """The latent and pixel tile windows as (down, across) pairs, None where the VAE has neither
+
+    AutoencoderKL and FLUX.2 store one square edge; HunyuanVideo 1.5 stores one edge per axis.
+    Normalize both attribute layouts to a pair so one loop can support all three classes.
+    """
+    keyed = [
+        getattr(vae, attr, None)
+        for attr in (
+            "tile_latent_min_height",
+            "tile_latent_min_width",
+            "tile_sample_min_height",
+            "tile_sample_min_width",
+        )
+    ]
+    if all(isinstance(value, int) and value > 0 for value in keyed):
+        return (keyed[0], keyed[1]), (keyed[2], keyed[3])
+    square = getattr(vae, "tile_latent_min_size", None)
+    if isinstance(square, int) and square > 0:
+        pixels = getattr(vae, "tile_sample_min_size", None)
+        return (
+            ((square, square), (pixels, pixels))
+            if isinstance(pixels, int) and pixels > 0
+            else None
+        )
+    return None
+
+
+def _overlap_factors(vae) -> Optional[Tuple[float, float]]:
+    """Configured overlap factors by axis, preferring keyed values."""
+    keyed = (
+        getattr(vae, "tile_overlap_factor_height", None),
+        getattr(vae, "tile_overlap_factor_width", None),
+    )
+    if all(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and 0.0 <= value < 1.0
+        for value in keyed
+    ):
+        return keyed
+    scalar = getattr(vae, "tile_overlap_factor", None)
+    if (
+        isinstance(scalar, (int, float))
+        and not isinstance(scalar, bool)
+        and 0.0 <= scalar < 1.0
+    ):
+        return scalar, scalar
+    return None
+
+
+def tiles_by_overlap_factor(vae) -> bool:
+    """Whether this VAE tiles with the loop `overlap_tiled_decode` reimplements"""
+    # AutoencoderKL, AutoencoderKLFlux2 and HunyuanVideo 1.5 walk a latent window at a stride
+    # derived from an overlap fraction. Wan, Qwen-Image and the other video VAEs walk a stride
+    # they store outright, over a loop with different blending, and keep their own tiled_decode.
+    if any(getattr(vae, attr, None) for attr in STRIDE_ATTRS):
+        return False
+    if overlap_windows(vae) is None:
+        return False
+    # The scalar attribute identifies this family rather than CogVideoX, whose keyed-factor loop
+    # also tiles frames inside the spatial loop. DistVAE adds keyed values to this family when a
+    # caller requests rectangular overlap, but leaves the scalar marker in place.
+    return (
+        isinstance(getattr(vae, "tile_overlap_factor", None), (int, float))
+        and not isinstance(getattr(vae, "tile_overlap_factor", None), bool)
+        and _overlap_factors(vae) is not None
+        and callable(getattr(vae, "blend_v", None))
+        and callable(getattr(vae, "blend_h", None))
+    )
+
+
+WINDOW_ATTRS_FOR_STRIDE = ("tile_sample_min_height", "tile_sample_min_width")
+"""The window each stride in STRIDE_ATTRS steps across, in the same order"""
+
+
+def tile_overlap(vae) -> Optional[Tuple[int, int]]:
+    """Return absolute output-pixel overlap as (height, width) for any supported attribute layout."""
+    strides = [getattr(vae, attr, None) for attr in STRIDE_ATTRS]
+    windows = [getattr(vae, attr, None) for attr in WINDOW_ATTRS_FOR_STRIDE]
+    if all(isinstance(value, int) and value > 0 for value in strides + windows):
+        overlap = tuple(window - stride for stride, window in zip(strides, windows))
+        return (
+            overlap
+            if all(
+                0 <= value < window for value, window in zip(overlap, windows)
+            )
+            else None
+        )
+    factors = _overlap_factors(vae)
+    shape = tile_shape(vae)
+    if factors is not None and shape is not None:
+        return tuple(int(window * factor) for window, factor in zip(shape, factors))
+    return None
+
+
+def _stride_granularity(vae) -> Optional[int]:
+    """Return the required pixel-stride multiple for a consistent stored-stride tiling loop.
+
+    That loop divides the stride it stores twice: by the compression ratio, to step the latent
+    grid, and - where the family decodes into a pixel unshuffle - by the patch size, to place the
+    crop. Both are integer divisions, so a stride that is not a multiple of each truncates in one
+    of them and the grid and the crop stop describing the same region.
+    """
+    ratio = spatial_ratio(vae)
+    if ratio is None:
+        return None
+    loop = _STRIDE_LOOPS.get(type(vae).__name__)
+    patch = getattr(vae.config, "patch_size", None) if loop and loop.patches else None
+    if isinstance(patch, int) and patch > 1:
+        return math.lcm(ratio, patch)
+    return ratio
+
+
+def _overlap_lands(latent: int, pixel: int, factor: float) -> bool:
+    """Whether the overlap-fraction loop's own arithmetic agrees with itself on this axis
+
+    The loop derives the latent step by truncating `latent x (1 - factor)`, and crops each
+    decoded tile to `pixel - int(pixel x factor)`. Unless the second is the first in pixels, the
+    tiles step by one amount and are cropped by another, and the assembled image comes out a
+    different size than the decode was asked for - with nothing downstream to catch it.
+
+    Checked by recomputing what the loop will compute, rather than by reasoning about the
+    algebra, because the factor is a float and the two truncations do not have to fall the same
+    way on both sides of it.
+    """
+    stride = int(latent * (1.0 - factor))
+    if stride < 1:
+        return False
+    ratio, remainder = divmod(pixel, latent)
+    return remainder == 0 and pixel - int(pixel * factor) == stride * ratio
+
+
+def tile_overlap_plan(
+    vae,
+    overlap_height: int,
+    overlap_width: int,
+    sample_shape: Optional[Tuple[int, int]] = None,
+) -> Optional[dict]:
+    """Plan an exact absolute output-pixel overlap, or None when it is not representable."""
+    requested = (overlap_height, overlap_width)
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in requested
+    ):
+        return None
+    shape = tile_shape(vae)
+    if shape is None:
+        return None
+    active_axes = (True, True)
+    if sample_shape is not None:
+        if (
+            not isinstance(sample_shape, tuple)
+            or len(sample_shape) != 2
+            or not all(
+                isinstance(value, int) and not isinstance(value, bool) and value > 0
+                for value in sample_shape
+            )
+        ):
+            return None
+        active_axes = tuple(sample > window for sample, window in zip(sample_shape, shape))
+    if any(
+        (active and overlap >= window) or (not active and overlap != 0)
+        for active, overlap, window in zip(active_axes, requested, shape)
+    ):
+        return None
+
+    if tiles_by_stored_stride(vae):
+        step = _stride_granularity(vae)
+        if step is None:
+            return None
+        strides = (
+            window - overlap for window, overlap in zip(shape, requested)
+        )
+        plan = dict(zip(STRIDE_ATTRS, strides))
+        for stride in plan.values():
+            if stride <= 0 or stride % step:
+                return None
+        return plan
+
+    if not tiles_by_overlap_factor(vae):
+        return None
+    windows = overlap_windows(vae)
+    if windows is None:
+        return None
+    (latent_down, latent_across), (pixel_down, pixel_across) = windows
+    axes = ((latent_down, pixel_down), (latent_across, pixel_across))
+    factors = tuple(overlap / pixel for overlap, (_, pixel) in zip(requested, axes))
+    if not all(
+        _overlap_lands(latent, pixel, factor)
+        for (latent, pixel), factor in zip(axes, factors)
+    ):
+        return None
+    plan = {
+        "tile_overlap_factor_height": factors[0],
+        "tile_overlap_factor_width": factors[1],
+    }
+    if hasattr(vae, "tile_overlap_factor") and factors[0] == factors[1]:
+        plan["tile_overlap_factor"] = factors[0]
+    return plan
+
+
+def _returns_decoder_output(vae) -> bool:
+    """Return whether this class's tiled_decode returns DecoderOutput rather than a tensor.
+
+    The replacement must preserve the return type expected by `_decode`. Most classes accept
+    `return_dict` and return DecoderOutput; HunyuanVideo 1.5 accepts no such argument and returns
+    a tensor directly.
+
+    Read off the class rather than the instance, so that installing twice cannot end up reading
+    the first install's signature instead of the original.
+    """
+    own = getattr(type(vae), "tiled_decode", None)
+    if own is None:
+        return True
+    try:
+        return "return_dict" in inspect.signature(own).parameters
+    except (TypeError, ValueError):
+        return True
+
+
+class _StrideLoop(NamedTuple):
+    """Where the stride-walked tiling loops differ from one another"""
+
+    patches: (
+        bool  # decodes into a pixel unshuffle, and unpatchifies the assembled sample
+    )
+    clamps: bool  # holds the assembled sample in [-1, 1]
+    first_chunk: bool  # tells the decoder which frame starts the tile
+    frame_cache: (
+        bool  # decodes a tile frame by frame, threading the VAE's own feature cache
+    )
+    post_quant: bool  # puts a tile through post_quant_conv before decoding it
+    conditioned: (
+        bool  # carries a timestep embedding and a causality flag into the decoder
+    )
+
+
+# The VAEs whose stride-walked loop is reimplemented below, by name, because no attribute says
+# which loop body a class has. All four walk the same grid and blend it the same way, and differ
+# only in what a tile costs to turn into a decoder call.
+#
+# HunyuanVideo and LTX-2 keep no feature cache, so one decoder call handles all frames in a
+# spatial tile. Their temporal loops call this spatial loop once per frame chunk. LTX-2 disables
+# temporal tiling by default; HunyuanVideo enables it.
+#
+# CogVideoX is excluded because its spatial loop also tiles frames, so its tiles are not
+# independent. HunyuanVideo 1.5 uses overlap-fraction tiling and is handled by
+# overlap_tiled_decode.
+_STRIDE_LOOPS = {
+    "AutoencoderKLWan": _StrideLoop(
+        patches=True,
+        clamps=True,
+        first_chunk=True,
+        frame_cache=True,
+        post_quant=True,
+        conditioned=False,
+    ),
+    "AutoencoderKLQwenImage": _StrideLoop(
+        patches=False,
+        clamps=False,
+        first_chunk=False,
+        frame_cache=True,
+        post_quant=True,
+        conditioned=False,
+    ),
+    "AutoencoderKLHunyuanVideo": _StrideLoop(
+        patches=False,
+        clamps=False,
+        first_chunk=False,
+        frame_cache=False,
+        post_quant=True,
+        conditioned=False,
+    ),
+    "AutoencoderKLLTX2Video": _StrideLoop(
+        patches=False,
+        clamps=False,
+        first_chunk=False,
+        frame_cache=False,
+        post_quant=False,
+        conditioned=True,
+    ),
+}
+
+
+def tiles_by_stored_stride(vae) -> bool:
+    """Whether this VAE tiles with the stride-walked loop `strided_tiled_decode` reimplements"""
+    loop = _STRIDE_LOOPS.get(type(vae).__name__)
+    if loop is None:
+        return False
+    # The class is the loop, but the pieces it walks are still checked, so that a VAE refactored
+    # out from under this fails the question rather than the decode.
+    parts = ["blend_v", "blend_h", "decoder"]
+    if loop.post_quant:
+        parts.append("post_quant_conv")
+    if loop.frame_cache:
+        parts.append("clear_cache")
+    return all(
+        isinstance(getattr(vae, attr, None), int)
+        for attr in (
+            "tile_sample_min_height",
+            "tile_sample_min_width",
+            "tile_sample_stride_height",
+            "tile_sample_stride_width",
+            "spatial_compression_ratio",
+        )
+    ) and all(callable(getattr(vae, attr, None)) for attr in parts)
+
+
+def supports_tile_parallel(vae) -> bool:
+    """Whether this VAE's tiling loop is one of the ones reimplemented here
+
+    Deciding which rank makes which decoder call means owning the loop that makes them, so this
+    is what a caller asks before planning to decode a VAE's tiles apart from one another.
+    """
+    return tiles_by_overlap_factor(vae) or tiles_by_stored_stride(vae)
+
+
+def tiled_decode_for(
+    vae,
+    dispatch: Optional[Callable] = None,
+    assemble: Optional[Callable] = None,
+) -> Optional[Callable]:
+    """The tiled_decode to install on this VAE, None where its loop is not one reimplemented here"""
+    overlapping = overlap_tiled_decode(vae, dispatch, assemble)
+    if overlapping is not None:
+        return overlapping
+    # The stride-walked loop is reimplemented for one reason, which is to hand its tiles round;
+    # left to decode them all here it would only be diffusers' own loop with a second author.
+    if dispatch is None and assemble is None:
+        return None
+    return strided_tiled_decode(vae, dispatch, assemble)
+
+
+def _latent_areas(down, across, window, bounds) -> List[int]:
+    """The latent area each tile of the grid covers, in the order the loop walks
+
+    What a tile costs to decode follows the latent it is cut from, and the tiles on the last row
+    and the last column are cut short by the bounds. Which of them are short is the same on every
+    rank, being read off the grid rather than off a decoded tile.
+    """
+    deep, wide = window if isinstance(window, tuple) else (window, window)
+    return [
+        (min(top + deep, bounds[0]) - top) * (min(left + wide, bounds[1]) - left)
+        for top in down
+        for left in across
+    ]
+
+
+def overlap_tiled_decode(
+    vae,
+    dispatch: Optional[Callable] = None,
+    assemble: Optional[Callable] = None,
+) -> Optional[Callable]:
+    """A tiled_decode for the overlap-fraction family, None where the VAE is not one of them
+
+    One tile per decoder call, as upstream does. This preserves exact decoder-call semantics while
+    allowing independent tiles to be dispatched in any order.
+
+    `dispatch` decides which rank makes each call and defaults to this rank making all calls in
+    order. `distvae.vae.tile_parallel` supplies a dispatcher for distributing calls to a group.
+
+    `assemble` goes further and divides the blending too, by giving each rank a run of
+    neighbouring tiles to decode and stitch by itself. Where it declines - too few tiles to give
+    every rank one, or tiles too small to blend against a neighbour's edge alone - the decode
+    falls back to `dispatch`, which divides the decoder calls and leaves the blending everywhere.
+
+    AutoencoderKL, Flux.2, and HunyuanVideo 1.5 share this loop but use different window
+    attributes and return types. Normalize every window to ``(height, width)`` and preserve the
+    original method's return type. Height and width are always the final two dimensions.
+    """
+    if not tiles_by_overlap_factor(vae):
+        return None
+
+    from diffusers.models.autoencoders.vae import DecoderOutput
+
+    from distvae.vae import tile_parallel as vae_tile_parallel
+
+    # Treat either config.use_post_quant_conv or a non-null post_quant_conv as enabling
+    # post-quantization convolution.
+    use_post_quant_conv = getattr(
+        getattr(vae, "config", None), "use_post_quant_conv", None
+    )
+    if use_post_quant_conv is None:
+        use_post_quant_conv = getattr(vae, "post_quant_conv", None) is not None
+
+    def decode_tiles(z):
+        (latent_down, latent_across), (pixel_down, pixel_across) = overlap_windows(vae)
+        factor_down, factor_across = _overlap_factors(vae)
+        stride_down = int(latent_down * (1 - factor_down))
+        stride_across = int(latent_across * (1 - factor_across))
+        blend_down = int(pixel_down * factor_down)
+        blend_across = int(pixel_across * factor_across)
+        limit_down = pixel_down - blend_down
+        limit_across = pixel_across - blend_across
+
+        down = range(0, z.shape[-2], stride_down)
+        across = range(0, z.shape[-1], stride_across)
+
+        def latent_at(i, j):
+            tile = z[
+                ...,
+                down[i] : down[i] + latent_down,
+                across[j] : across[j] + latent_across,
+            ]
+            return vae.post_quant_conv(tile) if use_post_quant_conv else tile
+
+        def decode_with(share):
+            def decode(where):
+                # Every call is built before any is made, so that a dispatcher can see them all
+                # and hand them round. Each holds a latent tile, which is the small side of the
+                # decode; what they return is not held any longer than it was before.
+                at_order = list(where)
+                calls = [
+                    functools.partial(vae.decoder, latent_at(*at)) for at in at_order
+                ]
+                return dict(zip(at_order, share(calls)))
+
+            return decode
+
+        blend = vae_tile_parallel.Blend(
+            down=vae.blend_v,
+            across=vae.blend_h,
+            deep_down=blend_down,
+            deep_across=blend_across,
+            crop=lambda tile: tile[..., :limit_down, :limit_across],
+            tile_down=pixel_down,
+            tile_across=pixel_across,
+        )
+        if assemble is not None:
+            # A run decodes its own tiles, so the calls stay here rather than going round again.
+            dec = assemble(
+                len(down),
+                len(across),
+                decode_with(vae_tile_parallel.in_order),
+                blend,
+                _latent_areas(down, across, (latent_down, latent_across), z.shape[-2:]),
+            )
+            if dec is not None:
+                return dec
+        share = dispatch if dispatch is not None else vae_tile_parallel.in_order
+        return vae_tile_parallel.assemble_here(
+            len(down), len(across), decode_with(share), blend
+        )
+
+    def tiled_decode(z, return_dict: bool = True):
+        dec = decode_tiles(z)
+        if not return_dict:
+            return (dec,)
+        return DecoderOutput(sample=dec)
+
+    def bare_tiled_decode(z):
+        return decode_tiles(z)
+
+    return tiled_decode if _returns_decoder_output(vae) else bare_tiled_decode
+
+
+def strided_tiled_decode(
+    vae, dispatch: Optional[Callable] = None, assemble: Optional[Callable] = None
+) -> Optional[Callable]:
+    """A tiled_decode for the video VAEs that walk a stride they store, None where it can't
+
+    Upstream's loop, with the tiles built as calls rather than made where they are built, so that
+    `dispatch` can hand them round a group. Where the family keeps a feature cache a tile is a
+    frame loop threading it, cleared at the start of each tile, so a tile is independent of every
+    other tile in the way the frames inside it are not; where it keeps none, a tile is one call.
+
+    A tile remains one call, preserving the VAE's cache and conditioning boundaries.
+    """
+    if not tiles_by_stored_stride(vae):
+        return None
+
+    from diffusers.models.autoencoders.vae import DecoderOutput
+
+    from distvae.vae import tile_parallel as vae_tile_parallel
+
+    loop = _STRIDE_LOOPS[type(vae).__name__]
+    patch_size = getattr(vae.config, "patch_size", None) if loop.patches else None
+
+    # `temb` and `causal` are LTX-2's, which conditions its decoder on them and passes them
+    # through tiled_decode. Other families omit those arguments, so their defaults allow one
+    # replacement signature to support all four loops.
+    def tiled_decode(z, temb=None, causal=None, return_dict: bool = True):
+        _, _, num_frames, height, width = z.shape
+        ratio = vae.spatial_compression_ratio
+        sample_height = height * ratio
+        sample_width = width * ratio
+        latent_min_height = vae.tile_sample_min_height // ratio
+        latent_min_width = vae.tile_sample_min_width // ratio
+        latent_stride_height = vae.tile_sample_stride_height // ratio
+        latent_stride_width = vae.tile_sample_stride_width // ratio
+        sample_stride_height = vae.tile_sample_stride_height
+        sample_stride_width = vae.tile_sample_stride_width
+        if patch_size is not None:
+            sample_height //= patch_size
+            sample_width //= patch_size
+            sample_stride_height //= patch_size
+            sample_stride_width //= patch_size
+            blend_height = (
+                vae.tile_sample_min_height // patch_size - sample_stride_height
+            )
+            blend_width = vae.tile_sample_min_width // patch_size - sample_stride_width
+        else:
+            blend_height = vae.tile_sample_min_height - sample_stride_height
+            blend_width = vae.tile_sample_min_width - sample_stride_width
+
+        down = range(0, height, latent_stride_height)
+        across = range(0, width, latent_stride_width)
+
+        def tile_at(i, j):
+            def cut(frames=slice(None)):
+                return z[
+                    :,
+                    :,
+                    frames,
+                    down[i] : down[i] + latent_min_height,
+                    across[j] : across[j] + latent_min_width,
+                ]
+
+            def decode_frame_by_frame():
+                # The cache is per tile and threaded through the frames of one, which is why the
+                # frames cannot be handed round but the tiles can.
+                vae.clear_cache()
+                frames = []
+                for k in range(num_frames):
+                    vae._conv_idx = [0]
+                    tile = vae.post_quant_conv(cut(slice(k, k + 1)))
+                    extra = {"first_chunk": k == 0} if loop.first_chunk else {}
+                    frames.append(
+                        vae.decoder(
+                            tile,
+                            feat_cache=vae._feat_map,
+                            feat_idx=vae._conv_idx,
+                            **extra,
+                        )
+                    )
+                return torch.cat(frames, dim=2)
+
+            def decode_at_once():
+                tile = vae.post_quant_conv(cut()) if loop.post_quant else cut()
+                if loop.conditioned:
+                    return vae.decoder(tile, temb, causal=causal)
+                return vae.decoder(tile)
+
+            return decode_frame_by_frame if loop.frame_cache else decode_at_once
+
+        def decode_with(share):
+            def decode(where):
+                made = share([tile_at(*at) for at in where])
+                if loop.frame_cache:
+                    vae.clear_cache()
+                return dict(zip(where, made))
+
+            return decode
+
+        blend = vae_tile_parallel.Blend(
+            down=vae.blend_v,
+            across=vae.blend_h,
+            deep_down=blend_height,
+            deep_across=blend_width,
+            crop=lambda tile: tile[
+                :, :, :, :sample_stride_height, :sample_stride_width
+            ],
+            tile_down=(
+                vae.tile_sample_min_height // patch_size
+                if patch_size is not None
+                else vae.tile_sample_min_height
+            ),
+            tile_across=(
+                vae.tile_sample_min_width // patch_size
+                if patch_size is not None
+                else vae.tile_sample_min_width
+            ),
+        )
+        dec = None
+        if assemble is not None:
+            dec = assemble(
+                len(down),
+                len(across),
+                decode_with(vae_tile_parallel.in_order),
+                blend,
+                _latent_areas(
+                    down,
+                    across,
+                    (latent_min_height, latent_min_width),
+                    (height, width),
+                ),
+            )
+        if dec is None:
+            share = dispatch if dispatch is not None else vae_tile_parallel.in_order
+            dec = vae_tile_parallel.assemble_here(
+                len(down), len(across), decode_with(share), blend
+            )
+        dec = dec[:, :, :, :sample_height, :sample_width]
+
+        if patch_size is not None:
+            from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
+
+            dec = unpatchify(dec, patch_size=patch_size)
+        if loop.clamps:
+            dec = torch.clamp(dec, min=-1.0, max=1.0)
+
+        if not return_dict:
+            return (dec,)
+        return DecoderOutput(sample=dec)
+
+    return tiled_decode

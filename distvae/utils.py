@@ -2,87 +2,78 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 import os
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
-try:
-    import torch_musa
-except ModuleNotFoundError:
-    pass
+
+def cache_cursor(feat_idx: Optional[List[int]]) -> List[int]:
+    """The caller's position in the feature cache, or a fresh one at the start of it
+
+    The causal video decoders walk their feature cache with a one-element list, advancing it as
+    each layer takes its slot. That cursor cannot be a default argument: Python binds one list
+    per function at definition, so every call omitting it would share the same one, and a second
+    decode would carry on reading from wherever the first one stopped. What that gives is not an
+    error but a video conditioned on the tail of the previous decode.
+    """
+    return [0] if feat_idx is None else feat_idx
+
+
+def normalize_patch_dim(patch_dim: int, ndim: int, *, spatial_only: bool = False) -> int:
+    """Return a canonical negative patch axis after validating it for the tensor rank."""
+    if not isinstance(patch_dim, int) or isinstance(patch_dim, bool):
+        raise ValueError(f"patch_dim must be an integer, got {patch_dim!r}")
+    if ndim not in (4, 5):
+        raise ValueError(f"patch_dim validation supports 4D or 5D tensors, got {ndim}D")
+    positive = patch_dim if patch_dim >= 0 else ndim + patch_dim
+    if positive < 2 or positive >= ndim:
+        raise ValueError(f"patch_dim {patch_dim} is not a data axis of a {ndim}D tensor")
+    if spatial_only and ndim == 5 and positive == 2:
+        raise ValueError(
+            f"patch_dim {patch_dim} selects the frame axis; only H (-2 or 3) and "
+            "W (-1 or 4) are supported"
+        )
+    return positive - ndim
+
+
+@dataclass(frozen=True)
+class ParallelContext:
+    """Immutable distributed settings owned by one adapted VAE."""
+
+    group: Optional[ProcessGroup]
+    rank: int
+    world_size: int
+    patch_dim: int
+    global_ranks: Tuple[int, ...] = ()
+
+    def global_rank(self, group_rank: int) -> int:
+        if self.global_ranks:
+            return self.global_ranks[group_rank]
+        if self.world_size == 1:
+            return dist.get_rank() if dist.is_initialized() else 0
+        return dist.get_global_rank(self.group, group_rank)
+
+
+def parallel_context(
+    vae_group: Optional[ProcessGroup], patch_dim: int, *, ndim: int
+) -> ParallelContext:
+    """Capture one adapter's group and axis without changing process-global state."""
+    group = dist.group.WORLD if vae_group is None else vae_group
+    world_size = dist.get_world_size(group)
+    rank = dist.get_rank(group)
+    global_ranks = tuple(dist.get_global_rank(group, one) for one in range(world_size))
+    return ParallelContext(
+        group=group,
+        rank=rank,
+        world_size=world_size,
+        patch_dim=normalize_patch_dim(patch_dim, ndim, spatial_only=True),
+        global_ranks=global_ranks,
+    )
+
 
 class DistributedEnv:
-    _vae_group = None
-    _local_rank = None
-    _world_size = None  # 添加新的类变量
-    _patch_dim = -2  # -3=F, -2=H, -1=W; same for 2D/3D
-
-    @classmethod
-    def initialize(cls, vae_group: ProcessGroup):
-        if vae_group is None:
-            cls._vae_group = dist.group.WORLD
-        else:
-            cls._vae_group = vae_group
-        cls._local_rank = int(os.environ.get('LOCAL_RANK', 0)) # FIXME: in ray all local_rank is 0
-        cls._rank_mapping = None
-        cls._init_rank_mapping()
-    
-    @classmethod
-    def get_vae_group(cls) -> ProcessGroup:
-        if cls._vae_group is None:
-            raise RuntimeError("DistributedEnv not initialized. Call initialize() first.")
-        return cls._vae_group
-
-    @classmethod
-    def get_global_rank(cls) -> int:
-        return dist.get_rank()
-    
-    @classmethod
-    def _init_rank_mapping(cls):
-        """Initialize the mapping between group ranks and global ranks"""
-        if cls._rank_mapping is None:
-            # Get all ranks in the group
-            ranks = [None] * cls.get_group_world_size() 
-            dist.all_gather_object(ranks, cls.get_global_rank(), group=cls.get_vae_group())
-            cls._rank_mapping = ranks
-
-    @classmethod
-    def get_global_rank_from_group_rank(cls, group_rank: int) -> int:
-        """Convert a rank in VAE group to global rank using cached mapping.
-        
-        Args:
-            group_rank: The rank in VAE group
-            
-        Returns:
-            The corresponding global rank
-            
-        Raises:
-            RuntimeError: If the group_rank is invalid
-        """
-        if cls._rank_mapping is None:
-            cls._init_rank_mapping()
-            
-        if group_rank < 0 or group_rank >= cls.get_group_world_size():
-            raise RuntimeError(f"Invalid group rank: {group_rank}. Must be in range [0, {cls.get_group_world_size()-1}]")
-            
-        return cls._rank_mapping[group_rank]
-    
-    @classmethod
-    def get_rank_in_vae_group(cls) -> int:
-        return dist.get_rank(cls.get_vae_group())
-
-    @classmethod
-    def get_group_world_size(cls) -> int:
-        return dist.get_world_size(cls.get_vae_group())
-
-    @classmethod
-    def set_patch_dim(cls, dim: int):
-        cls._patch_dim = dim
-
-    @classmethod
-    def get_patch_dim(cls) -> int:
-        return cls._patch_dim
-
     @classmethod
     def get_local_rank(cls) -> int:
-        return cls._local_rank
+        return int(os.environ.get("LOCAL_RANK", 0))
 
     @classmethod
     def get_device(cls) -> torch.device:
@@ -109,7 +100,10 @@ class DistributedEnv:
         elif hasattr(torch, "musa") and torch.musa.is_available():
             return "mccl"
         else:
-            raise NotImplementedError("No Accelerators(NV/MTT GPU accelerators) available")
+            # Sharding is correctness-testable without an accelerator, and gloo is the only
+            # backend that gets there. Raising instead would make every distributed entry point
+            # unreachable on a CPU-only machine, tests included.
+            return "gloo"
 
     @classmethod
     def record_memory_history(cls):

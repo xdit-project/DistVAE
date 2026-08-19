@@ -15,11 +15,11 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.multiprocessing import spawn
 
-from distvae.utils import DistributedEnv
 from distvae.modules.patch_utils import Patchify, DePatchify
 from distvae.modules.adapters.layers.conv_adapters import Conv3dAdapter
+
+from distributed_harness import make_parallel_context, run_distributed
 
 
 def worker(
@@ -30,6 +30,7 @@ def worker(
     stride: int,
     padding: int,
     block_size: int,
+    size: tuple,
     seed: int,
     master_port: int,
 ) -> None:
@@ -39,7 +40,6 @@ def worker(
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     dist.init_process_group(backend="gloo", init_method="env://")
-    DistributedEnv.initialize(None)
 
     torch.manual_seed(seed)
     in_ch, out_ch = 4, 8
@@ -47,18 +47,12 @@ def worker(
     # For stride>1 tests, use sizes that stress-test alignment logic
     # For stride=1, use sizes divisible by world_size for even splitting
     n, c, f = 1, in_ch, 4
-    if stride > 1:
-        # Use even sizes for stride>1 tests
-        # TODO: Add support for odd sizes with stride>1 (currently produces off-by-one errors)
-        h, w = 8, 8
-    else:
-        # Use sizes divisible by world_size for even splitting
-        h, w = 8, 8
-        if patch_dim == -2:
-            assert h % world_size == 0
-        else:
-            assert patch_dim == -1
-            assert w % world_size == 0
+    # Both branches of the conditional this replaces set 8 by 8, so the comment about needing
+    # even sizes for stride > 1 described the only case there was, and the assertions below it
+    # enforced an even split that no shipped decode gets. The split axis is now given by the
+    # caller, so a test can ask for a size that leaves the ranks holding different amounts -
+    # which is the case the halo widths and the crop are actually difficult for.
+    h, w = size
 
     x_full = torch.randn(n, c, f, h, w, device=device, dtype=torch.float32)
     ref_conv = nn.Conv3d(
@@ -66,9 +60,12 @@ def worker(
     ).to(device)
     ref_conv.eval()
 
-    patchify = Patchify(patch_dim=patch_dim)
-    depatchify = DePatchify(patch_dim=patch_dim)
-    adapter = Conv3dAdapter(ref_conv, block_size=block_size, patch_dim=patch_dim)
+    context = make_parallel_context(patch_dim)
+    patchify = Patchify(context)
+    depatchify = DePatchify(context)
+    adapter = Conv3dAdapter(
+        ref_conv, block_size=block_size, parallel_context=context
+    )
     adapter.eval()
 
     with torch.no_grad():
@@ -98,31 +95,21 @@ def _run_one(
     block_size: int,
     seed: int,
     master_port: int,
+    size: tuple = (8, 8),
 ) -> None:
     """Spawn processes and run worker; raises on failure."""
-    spawn(
+    # Through the shared harness rather than spawn directly, so a port claimed between being
+    # found free and being bound is retried rather than failing the test.
+    run_distributed(
         worker,
-        nprocs=world_size,
-        args=(
-            world_size,
-            patch_dim,
-            kernel_size,
-            stride,
-            padding,
-            block_size,
-            seed,
-            master_port,
-        ),
-        join=True,
+        world_size,
+        (patch_dim, kernel_size, stride, padding, block_size, size, seed),
+        master_port,
     )
 
 
-@pytest.fixture
-def master_port(request):
-    """Unique port per test to avoid Address already in use when tests run sequentially."""
-    base = 29500
-    nodeid = request.node.nodeid
-    return base + (hash(nodeid) % 10000)
+# The shared fixture uses CRC32 because Python salts string hashes per process. It also keeps all
+# distributed tests in one port range, preventing separate fixtures from selecting the same port.
 
 
 @pytest.mark.gloo
@@ -138,6 +125,32 @@ def test_patch_conv3d_gloo_direct(world_size, patch_dim, master_port, seed=42):
         block_size=0,
         seed=seed,
         master_port=master_port,
+    )
+
+
+@pytest.mark.gloo
+@pytest.mark.parametrize("world_size,patch_dim", [(4, -2), (4, -1), (3, -2)])
+def test_patch_conv3d_gloo_on_bands_of_different_sizes(
+    world_size, patch_dim, master_port, seed=42
+):
+    """The split axis not dividing by the rank count, which is what the 8 by 8 above never gives
+
+    Every band being the same size is the easy case: the halo each rank asks of its neighbour is
+    the same, and the crop starts at the same offset into each. Nine rows over four ranks gives
+    3, 2, 2, 2, and the sizes stop being interchangeable - a rank that assumes its neighbour
+    matches it reads the wrong rows, and a global quantity derived from a local one is wrong on
+    every rank but one.
+    """
+    _run_one(
+        world_size=world_size,
+        patch_dim=patch_dim,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        block_size=0,
+        seed=seed,
+        master_port=master_port,
+        size=(9, 7),
     )
 
 
@@ -159,13 +172,11 @@ def test_patch_conv3d_gloo_chunked_path(master_port, seed=42):
 @pytest.mark.gloo
 @pytest.mark.parametrize("world_size,patch_dim", [(4, -2), (2, -1)])
 def test_patch_conv3d_stride2_alignment(world_size, patch_dim, master_port, seed=42):
-    """
-    PatchConv3d with stride=2: tests stride alignment and global-position cropping logic.
+    """PatchConv3d at stride 2, where the crop has to be placed from the global position
 
-    This exercises the code path where:
-    1. Stride > 1 triggers stride alignment (shift calculation and input trimming)
-    2. build_crop_slice uses global_start and global_height for correct output cropping
-    3. Ranks would otherwise misalign without this logic
+    A strided convolution's output grid is set by where a rank's patch begins in the whole
+    image, not by where it begins in that rank, so build_crop_slice is given the global start
+    and the ranks would otherwise cut their outputs at offsets that do not join up.
     """
     _run_one(
         world_size=world_size,
@@ -176,6 +187,44 @@ def test_patch_conv3d_stride2_alignment(world_size, patch_dim, master_port, seed
         block_size=0,  # Direct path
         seed=seed,
         master_port=master_port,
+    )
+
+
+@pytest.mark.gloo
+@pytest.mark.parametrize("block_size", [0, 2, 4])
+@pytest.mark.parametrize("size", [(9, 7), (15, 11)])
+@pytest.mark.parametrize("world_size,patch_dim", [(4, -2), (3, -2), (2, -1)])
+def test_patch_conv3d_stride2_on_bands_of_different_sizes(
+    world_size, patch_dim, size, block_size, master_port, seed=42
+):
+    """Halving an uneven split, which the sizes elsewhere in this file were chosen to avoid
+
+    A TODO used to sit beside those even sizes saying odd extents at stride > 1 produce
+    off-by-one errors, and the test was shaped around it rather than at it. Written first as a
+    non-strict xfail so a known bug would not be quietly forgotten, it passed on both of its
+    cases, so the claim is checked here instead of recorded: three splits, two shapes that
+    divide by none of the rank counts, and both the direct and the chunked convolution.
+
+    A block of 2 against a kernel of 3 was tried first and cut chunks no convolution can run on.
+    So did a block of 4, once the frame axis was chunked as well: 4 frames padded to 6, cut in
+    two at stride 2, ends on a chunk of 2. That is chunk_bounds' to answer rather than each
+    caller's to avoid, and it now takes no more chunks than leave every one of them a kernel
+    long, so both blocks work and the small one is kept here.
+
+    If the off-by-one is real it is not this. Should one of these ever fail, it is the arithmetic
+    that is wrong and not the expectation - a strided convolution over an uneven split has to
+    match nn.Conv3d, or a decode of any image whose rows do not divide by the rank count is wrong.
+    """
+    _run_one(
+        world_size=world_size,
+        patch_dim=patch_dim,
+        kernel_size=3,
+        stride=2,
+        padding=1,
+        block_size=block_size,
+        seed=seed,
+        master_port=master_port,
+        size=size,
     )
 
 

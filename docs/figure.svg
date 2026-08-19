@@ -1,0 +1,274 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="1192" viewBox="0 0 680 1192">
+<defs><pattern id="seam" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="5" stroke="#1b1f24" stroke-width="1.5" opacity="0.3"/></pattern><marker id="fwd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#6a737d"/></marker><marker id="down" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#a7b0b8"/></marker><marker id="up" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#a7b0b8"/></marker></defs>
+<rect width="680" height="1192" fill="#ffffff"/>
+<text x="40.00" y="30.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="17" fill="#1b1f24" text-anchor="start" font-weight="700">DistVAE parallelism</text>
+<text x="40.00" y="49.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#6a737d" text-anchor="start" font-weight="400">The two modes below each decode a 1024 × 1024 image from a 128 × 128 latent on four GPUs.</text>
+<text x="40.00" y="65.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#6a737d" text-anchor="start" font-weight="400">The same five metrics compare both alternatives.</text>
+<rect x="40.00" y="79.00" width="5.00" height="14.00" rx="2" fill="#a7b0b8" stroke="none" stroke-width="0"/>
+<text x="54.00" y="90.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">collective: every rank waits</text>
+<line x1="231.00" y1="77.00" x2="231.00" y2="95.00" stroke="#a7b0b8" stroke-width="1.3" marker-end="url(#down)" marker-start="url(#up)"/>
+<text x="243.00" y="90.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">halo swap: neighbours only</text>
+<rect x="420.00" y="80.00" width="14.00" height="13.00" rx="1" fill="none" stroke="#1b1f24" stroke-width="2.6"/>
+<text x="440.00" y="90.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">held at once</text>
+<rect x="542.00" y="80.00" width="10.00" height="13.00" rx="0" fill="url(#seam)" stroke="none" stroke-width="0"/>
+<text x="558.00" y="90.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">tile overlap</text>
+<line x1="40.00" y1="113.00" x2="640.00" y2="113.00" stroke="#c2c8ce" stroke-width="1.4"/>
+<text x="40.00" y="139.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" fill="#1b1f24" text-anchor="start" font-weight="700">1. Row sharding</text>
+<text x="190.00" y="139.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#6a737d" text-anchor="start" font-weight="400">one decoder call, split into four bands of 32 latent rows</text>
+<text x="40.00" y="157.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#1b1f24" text-anchor="start" font-weight="600">Peak memory is rank-bound and every layer syncs, so the interconnect can be the bottleneck.</text>
+<text x="40.00" y="173.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">There is nothing to choose here, since the band is the latent divided by the GPU count.</text>
+<text x="40.00" y="189.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">The image is what a single GPU would produce, apart from floating-point rounding.</text>
+<rect x="40.00" y="211.00" width="120.00" height="30.00" rx="0" fill="#dce9f7" stroke="#3d6d99" stroke-width="1.2"/>
+<text x="100.00" y="230.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#1b1f24" text-anchor="middle" font-weight="400">rank 0</text>
+<rect x="40.00" y="241.00" width="120.00" height="30.00" rx="0" fill="#dff0da" stroke="#4f8b3f" stroke-width="1.2"/>
+<text x="100.00" y="260.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#1b1f24" text-anchor="middle" font-weight="400">rank 1</text>
+<rect x="40.00" y="271.00" width="120.00" height="30.00" rx="0" fill="#fce8d0" stroke="#bf7a2e" stroke-width="1.2"/>
+<text x="100.00" y="290.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#1b1f24" text-anchor="middle" font-weight="400">rank 2</text>
+<rect x="40.00" y="301.00" width="120.00" height="30.00" rx="0" fill="#f9d9dc" stroke="#b04a52" stroke-width="1.2"/>
+<text x="100.00" y="320.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#1b1f24" text-anchor="middle" font-weight="400">rank 3</text>
+<rect x="40.00" y="211.00" width="120.00" height="30.00" rx="1" fill="none" stroke="#1b1f24" stroke-width="2.6"/>
+<line x1="172.00" y1="271.00" x2="206.00" y2="271.00" stroke="#6a737d" stroke-width="1.4" marker-end="url(#fwd)"/>
+<text x="216.00" y="230.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">rank 0</text>
+<text x="216.00" y="260.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">rank 1</text>
+<text x="216.00" y="290.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">rank 2</text>
+<text x="216.00" y="320.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">rank 3</text>
+<rect x="258.00" y="215.00" width="48.00" height="22.00" rx="2" fill="#dce9f7" stroke="#3d6d99" stroke-width="1.2"/>
+<rect x="258.00" y="245.00" width="48.00" height="22.00" rx="2" fill="#dff0da" stroke="#4f8b3f" stroke-width="1.2"/>
+<rect x="258.00" y="275.00" width="48.00" height="22.00" rx="2" fill="#fce8d0" stroke="#bf7a2e" stroke-width="1.2"/>
+<rect x="258.00" y="305.00" width="48.00" height="22.00" rx="2" fill="#f9d9dc" stroke="#b04a52" stroke-width="1.2"/>
+<text x="282.00" y="205.00" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#6a737d" text-anchor="middle" font-weight="400">conv</text>
+<line x1="315.00" y1="232.00" x2="315.00" y2="250.00" stroke="#a7b0b8" stroke-width="1.3" marker-end="url(#down)" marker-start="url(#up)"/>
+<line x1="315.00" y1="262.00" x2="315.00" y2="280.00" stroke="#a7b0b8" stroke-width="1.3" marker-end="url(#down)" marker-start="url(#up)"/>
+<line x1="315.00" y1="292.00" x2="315.00" y2="310.00" stroke="#a7b0b8" stroke-width="1.3" marker-end="url(#down)" marker-start="url(#up)"/>
+<rect x="324.00" y="215.00" width="48.00" height="22.00" rx="2" fill="#dce9f7" stroke="#3d6d99" stroke-width="1.2"/>
+<rect x="324.00" y="245.00" width="48.00" height="22.00" rx="2" fill="#dff0da" stroke="#4f8b3f" stroke-width="1.2"/>
+<rect x="324.00" y="275.00" width="48.00" height="22.00" rx="2" fill="#fce8d0" stroke="#bf7a2e" stroke-width="1.2"/>
+<rect x="324.00" y="305.00" width="48.00" height="22.00" rx="2" fill="#f9d9dc" stroke="#b04a52" stroke-width="1.2"/>
+<text x="348.00" y="205.00" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#6a737d" text-anchor="middle" font-weight="400">norm</text>
+<rect x="378.50" y="211.00" width="5.00" height="120.00" rx="2" fill="#a7b0b8" stroke="none" stroke-width="0"/>
+<rect x="390.00" y="215.00" width="48.00" height="22.00" rx="2" fill="#dce9f7" stroke="#3d6d99" stroke-width="1.2"/>
+<rect x="390.00" y="245.00" width="48.00" height="22.00" rx="2" fill="#dff0da" stroke="#4f8b3f" stroke-width="1.2"/>
+<rect x="390.00" y="275.00" width="48.00" height="22.00" rx="2" fill="#fce8d0" stroke="#bf7a2e" stroke-width="1.2"/>
+<rect x="390.00" y="305.00" width="48.00" height="22.00" rx="2" fill="#f9d9dc" stroke="#b04a52" stroke-width="1.2"/>
+<text x="414.00" y="205.00" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#6a737d" text-anchor="middle" font-weight="400">conv</text>
+<line x1="447.00" y1="232.00" x2="447.00" y2="250.00" stroke="#a7b0b8" stroke-width="1.3" marker-end="url(#down)" marker-start="url(#up)"/>
+<line x1="447.00" y1="262.00" x2="447.00" y2="280.00" stroke="#a7b0b8" stroke-width="1.3" marker-end="url(#down)" marker-start="url(#up)"/>
+<line x1="447.00" y1="292.00" x2="447.00" y2="310.00" stroke="#a7b0b8" stroke-width="1.3" marker-end="url(#down)" marker-start="url(#up)"/>
+<rect x="456.00" y="215.00" width="48.00" height="22.00" rx="2" fill="#dce9f7" stroke="#3d6d99" stroke-width="1.2"/>
+<rect x="456.00" y="245.00" width="48.00" height="22.00" rx="2" fill="#dff0da" stroke="#4f8b3f" stroke-width="1.2"/>
+<rect x="456.00" y="275.00" width="48.00" height="22.00" rx="2" fill="#fce8d0" stroke="#bf7a2e" stroke-width="1.2"/>
+<rect x="456.00" y="305.00" width="48.00" height="22.00" rx="2" fill="#f9d9dc" stroke="#b04a52" stroke-width="1.2"/>
+<text x="480.00" y="205.00" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#6a737d" text-anchor="middle" font-weight="400">norm</text>
+<rect x="510.50" y="211.00" width="5.00" height="120.00" rx="2" fill="#a7b0b8" stroke="none" stroke-width="0"/>
+<rect x="522.00" y="215.00" width="48.00" height="22.00" rx="2" fill="#dce9f7" stroke="#3d6d99" stroke-width="1.2"/>
+<rect x="522.00" y="245.00" width="48.00" height="22.00" rx="2" fill="#dff0da" stroke="#4f8b3f" stroke-width="1.2"/>
+<rect x="522.00" y="275.00" width="48.00" height="22.00" rx="2" fill="#fce8d0" stroke="#bf7a2e" stroke-width="1.2"/>
+<rect x="522.00" y="305.00" width="48.00" height="22.00" rx="2" fill="#f9d9dc" stroke="#b04a52" stroke-width="1.2"/>
+<text x="546.00" y="205.00" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#6a737d" text-anchor="middle" font-weight="400">conv</text>
+<line x1="579.00" y1="232.00" x2="579.00" y2="250.00" stroke="#a7b0b8" stroke-width="1.3" marker-end="url(#down)" marker-start="url(#up)"/>
+<line x1="579.00" y1="262.00" x2="579.00" y2="280.00" stroke="#a7b0b8" stroke-width="1.3" marker-end="url(#down)" marker-start="url(#up)"/>
+<line x1="579.00" y1="292.00" x2="579.00" y2="310.00" stroke="#a7b0b8" stroke-width="1.3" marker-end="url(#down)" marker-start="url(#up)"/>
+<circle cx="591.00" cy="226.00" r="2.1" fill="#3d6d99"/>
+<circle cx="597.00" cy="226.00" r="2.1" fill="#3d6d99"/>
+<circle cx="603.00" cy="226.00" r="2.1" fill="#3d6d99"/>
+<circle cx="591.00" cy="256.00" r="2.1" fill="#4f8b3f"/>
+<circle cx="597.00" cy="256.00" r="2.1" fill="#4f8b3f"/>
+<circle cx="603.00" cy="256.00" r="2.1" fill="#4f8b3f"/>
+<circle cx="591.00" cy="286.00" r="2.1" fill="#bf7a2e"/>
+<circle cx="597.00" cy="286.00" r="2.1" fill="#bf7a2e"/>
+<circle cx="603.00" cy="286.00" r="2.1" fill="#bf7a2e"/>
+<circle cx="591.00" cy="316.00" r="2.1" fill="#b04a52"/>
+<circle cx="597.00" cy="316.00" r="2.1" fill="#b04a52"/>
+<circle cx="603.00" cy="316.00" r="2.1" fill="#b04a52"/>
+<rect x="612.00" y="211.00" width="5.00" height="120.00" rx="2" fill="#a7b0b8" stroke="none" stroke-width="0"/>
+<path d="M609.00,212.50 H255.00 V239.50 H609.00" fill="none" stroke="#1b1f24" stroke-width="2.6"/>
+<line x1="609.00" y1="212.50" x2="609.00" y2="239.50" stroke="#1b1f24" stroke-width="2.6" stroke-linecap="round" stroke-dasharray="0.1 5"/>
+<text x="614.50" y="343.00" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#6a737d" text-anchor="middle" font-weight="400">image</text>
+<line x1="40.00" y1="351.00" x2="554.00" y2="351.00" stroke="#e3e6e8" stroke-width="1.2"/>
+<text x="40.00" y="363.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">peak activations</text>
+<text x="40.00" y="378.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">25%</text>
+<text x="152.00" y="363.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">work</text>
+<text x="152.00" y="378.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">1.00×</text>
+<text x="264.00" y="363.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">seams</text>
+<text x="264.00" y="378.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">none</text>
+<text x="376.00" y="363.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">imbalance</text>
+<text x="376.00" y="378.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">0.0%</text>
+<text x="488.00" y="363.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">syncs</text>
+<text x="488.00" y="378.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">every layer</text>
+<text x="40.00" y="404.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#1b1f24" text-anchor="start" font-weight="600">Split the rows</text>
+<text x="40.00" y="420.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">The bands never overlap.</text>
+<text x="216.00" y="404.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#1b1f24" text-anchor="start" font-weight="600">Decode in lockstep</text>
+<text x="216.00" y="420.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">Convolutions swap edge rows, and norms reduce across all four ranks.</text>
+<line x1="40.00" y1="466.00" x2="640.00" y2="466.00" stroke="#c2c8ce" stroke-width="1.4"/>
+<text x="40.00" y="492.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" fill="#1b1f24" text-anchor="start" font-weight="700">2. Tile distribution</text>
+<text x="190.00" y="492.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#6a737d" text-anchor="start" font-weight="400">the same four GPUs, at two windows</text>
+<text x="40.00" y="510.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#1b1f24" text-anchor="start" font-weight="600">Peak memory is tile-bound and the decode needs only two collectives, but it repeats more work.</text>
+<text x="40.00" y="526.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">Window and overlap are yours to set in output pixels, so tune them to your VAE and your GPUs.</text>
+<text x="40.00" y="542.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">The two windows below are worked examples, chosen to show the trade rather than to be copied.</text>
+<text x="40.00" y="558.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">Full-width strips overlap less and stay contiguous in row-major memory, while a grid holds less at once.</text>
+<text x="40.00" y="574.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">The image is close but not exact: a blend hides seams, but norms over too small a tile can leave the colour blocky.</text>
+<text x="40.00" y="600.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="700">Cut the rows only</text>
+<text x="190.00" y="600.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#6a737d" text-anchor="start" font-weight="400">344 px tall overlapping 88 px, full width</text>
+<text x="40.00" y="617.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">Four strips, one per rank, have the same shape as the row-sharded bands, but they overlap and nothing syncs until the end.</text>
+<rect x="40.00" y="632.00" width="120.00" height="40.31" rx="0" fill="#dce9f7" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="40.00" y="662.00" width="120.00" height="40.31" rx="0" fill="#dff0da" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="40.00" y="692.00" width="120.00" height="40.31" rx="0" fill="#fce8d0" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="40.00" y="722.00" width="120.00" height="30.00" rx="0" fill="#f9d9dc" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="40.00" y="632.00" width="120.00" height="40.31" rx="1" fill="none" stroke="#3d6d99" stroke-width="1"/>
+<rect x="40.00" y="662.00" width="120.00" height="40.31" rx="1" fill="none" stroke="#4f8b3f" stroke-width="1"/>
+<rect x="40.00" y="692.00" width="120.00" height="40.31" rx="1" fill="none" stroke="#bf7a2e" stroke-width="1"/>
+<rect x="40.00" y="722.00" width="120.00" height="30.00" rx="1" fill="none" stroke="#b04a52" stroke-width="1"/>
+<text x="100.00" y="655.16" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">0</text>
+<text x="100.00" y="685.16" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">1</text>
+<text x="100.00" y="715.16" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">2</text>
+<text x="100.00" y="740.00" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">3</text>
+<rect x="40.00" y="662.00" width="120.00" height="10.31" rx="0" fill="url(#seam)" stroke="none" stroke-width="0"/>
+<rect x="40.00" y="692.00" width="120.00" height="10.31" rx="0" fill="url(#seam)" stroke="none" stroke-width="0"/>
+<rect x="40.00" y="722.00" width="120.00" height="10.31" rx="0" fill="url(#seam)" stroke="none" stroke-width="0"/>
+<rect x="40.00" y="632.00" width="120.00" height="40.31" rx="1" fill="none" stroke="#1b1f24" stroke-width="2.6"/>
+<line x1="172.00" y1="692.00" x2="206.00" y2="692.00" stroke="#6a737d" stroke-width="1.4" marker-end="url(#fwd)"/>
+<text x="216.00" y="651.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">rank 0</text>
+<rect x="259.00" y="636.00" width="328.00" height="22.00" rx="2" fill="#dce9f7" stroke="#3d6d99" stroke-width="1.2"/>
+<text x="423.00" y="650.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">0</text>
+<text x="216.00" y="681.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">rank 1</text>
+<rect x="259.00" y="666.00" width="328.00" height="22.00" rx="2" fill="#dff0da" stroke="#4f8b3f" stroke-width="1.2"/>
+<text x="423.00" y="680.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">1</text>
+<text x="216.00" y="711.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">rank 2</text>
+<rect x="259.00" y="696.00" width="328.00" height="22.00" rx="2" fill="#fce8d0" stroke="#bf7a2e" stroke-width="1.2"/>
+<text x="423.00" y="710.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">2</text>
+<text x="216.00" y="741.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">rank 3</text>
+<rect x="259.00" y="726.00" width="243.58" height="22.00" rx="2" fill="#f9d9dc" stroke="#b04a52" stroke-width="1.2"/>
+<text x="380.79" y="740.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">3</text>
+<rect x="503.58" y="726.00" width="84.42" height="22.00" rx="1" fill="#6a737d" stroke="none" stroke-width="0" opacity="0.16"/>
+<text x="545.79" y="740.00" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#6a737d" text-anchor="middle" font-weight="400">idle</text>
+<rect x="256.50" y="633.50" width="333.00" height="27.00" rx="1" fill="none" stroke="#1b1f24" stroke-width="2.6"/>
+<rect x="598.00" y="632.00" width="5.00" height="120.00" rx="2" fill="#a7b0b8" stroke="none" stroke-width="0"/>
+<rect x="612.00" y="632.00" width="5.00" height="120.00" rx="2" fill="#a7b0b8" stroke="none" stroke-width="0"/>
+<text x="614.00" y="764.00" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#6a737d" text-anchor="middle" font-weight="400">edges, image</text>
+<line x1="40.00" y1="772.00" x2="554.00" y2="772.00" stroke="#e3e6e8" stroke-width="1.2"/>
+<text x="40.00" y="784.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">peak activations</text>
+<text x="40.00" y="799.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">34%</text>
+<text x="152.00" y="784.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">work</text>
+<text x="152.00" y="799.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">1.26×</text>
+<text x="264.00" y="784.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">seams</text>
+<text x="264.00" y="799.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">3</text>
+<text x="376.00" y="784.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">imbalance</text>
+<text x="376.00" y="799.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">6.8%</text>
+<text x="488.00" y="784.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">syncs</text>
+<text x="488.00" y="799.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">twice</text>
+<text x="40.00" y="825.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#1b1f24" text-anchor="start" font-weight="600">Cut and overlap the rows</text>
+<text x="216.00" y="825.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#1b1f24" text-anchor="start" font-weight="600">One call each, and one rank waits</text>
+<text x="216.00" y="841.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">With one strip per rank, there is nothing for the scheduler to decide.</text>
+<text x="216.00" y="855.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">The last strip is 32 latent rows where the others are 43.</text>
+<text x="216.00" y="869.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">That shortfall is exactly the overlap, so closing it would thin the blend.</text>
+<text x="40.00" y="909.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="700">Cut both axes</text>
+<text x="190.00" y="909.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#6a737d" text-anchor="start" font-weight="400">432 × 296 px overlapping 72 px on both axes</text>
+<text x="40.00" y="926.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">Fifteen tiles across four ranks let the load be levelled, and a rank now holds a window rather than a strip.</text>
+<rect x="40.00" y="941.00" width="34.69" height="50.62" rx="0" fill="#dce9f7" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="66.25" y="941.00" width="34.69" height="50.62" rx="0" fill="#dce9f7" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="92.50" y="941.00" width="34.69" height="50.62" rx="0" fill="#dce9f7" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="118.75" y="941.00" width="34.69" height="50.62" rx="0" fill="#dff0da" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="145.00" y="941.00" width="15.00" height="50.62" rx="0" fill="#f9d9dc" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="40.00" y="983.19" width="34.69" height="50.62" rx="0" fill="#dff0da" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="66.25" y="983.19" width="34.69" height="50.62" rx="0" fill="#dff0da" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="92.50" y="983.19" width="34.69" height="50.62" rx="0" fill="#fce8d0" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="118.75" y="983.19" width="34.69" height="50.62" rx="0" fill="#fce8d0" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="145.00" y="983.19" width="15.00" height="50.62" rx="0" fill="#f9d9dc" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="40.00" y="1025.38" width="34.69" height="35.62" rx="0" fill="#fce8d0" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="66.25" y="1025.38" width="34.69" height="35.62" rx="0" fill="#f9d9dc" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="92.50" y="1025.38" width="34.69" height="35.62" rx="0" fill="#f9d9dc" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="118.75" y="1025.38" width="34.69" height="35.62" rx="0" fill="#f9d9dc" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="145.00" y="1025.38" width="15.00" height="35.62" rx="0" fill="#fce8d0" stroke="none" stroke-width="0" fill-opacity="0.55"/>
+<rect x="40.00" y="941.00" width="34.69" height="50.62" rx="1" fill="none" stroke="#3d6d99" stroke-width="1"/>
+<rect x="66.25" y="941.00" width="34.69" height="50.62" rx="1" fill="none" stroke="#3d6d99" stroke-width="1"/>
+<rect x="92.50" y="941.00" width="34.69" height="50.62" rx="1" fill="none" stroke="#3d6d99" stroke-width="1"/>
+<rect x="118.75" y="941.00" width="34.69" height="50.62" rx="1" fill="none" stroke="#4f8b3f" stroke-width="1"/>
+<rect x="145.00" y="941.00" width="15.00" height="50.62" rx="1" fill="none" stroke="#b04a52" stroke-width="1"/>
+<rect x="40.00" y="983.19" width="34.69" height="50.62" rx="1" fill="none" stroke="#4f8b3f" stroke-width="1"/>
+<rect x="66.25" y="983.19" width="34.69" height="50.62" rx="1" fill="none" stroke="#4f8b3f" stroke-width="1"/>
+<rect x="92.50" y="983.19" width="34.69" height="50.62" rx="1" fill="none" stroke="#bf7a2e" stroke-width="1"/>
+<rect x="118.75" y="983.19" width="34.69" height="50.62" rx="1" fill="none" stroke="#bf7a2e" stroke-width="1"/>
+<rect x="145.00" y="983.19" width="15.00" height="50.62" rx="1" fill="none" stroke="#b04a52" stroke-width="1"/>
+<rect x="40.00" y="1025.38" width="34.69" height="35.62" rx="1" fill="none" stroke="#bf7a2e" stroke-width="1"/>
+<rect x="66.25" y="1025.38" width="34.69" height="35.62" rx="1" fill="none" stroke="#b04a52" stroke-width="1"/>
+<rect x="92.50" y="1025.38" width="34.69" height="35.62" rx="1" fill="none" stroke="#b04a52" stroke-width="1"/>
+<rect x="118.75" y="1025.38" width="34.69" height="35.62" rx="1" fill="none" stroke="#b04a52" stroke-width="1"/>
+<rect x="145.00" y="1025.38" width="15.00" height="35.62" rx="1" fill="none" stroke="#bf7a2e" stroke-width="1"/>
+<text x="57.34" y="969.31" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">0</text>
+<text x="83.59" y="969.31" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">1</text>
+<text x="109.84" y="969.31" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">2</text>
+<text x="136.09" y="969.31" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">3</text>
+<text x="152.50" y="969.31" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">4</text>
+<text x="57.34" y="1011.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">5</text>
+<text x="83.59" y="1011.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">6</text>
+<text x="109.84" y="1011.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">7</text>
+<text x="136.09" y="1011.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">8</text>
+<text x="152.50" y="1011.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">9</text>
+<text x="57.34" y="1046.19" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">10</text>
+<text x="83.59" y="1046.19" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">11</text>
+<text x="109.84" y="1046.19" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">12</text>
+<text x="136.09" y="1046.19" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">13</text>
+<text x="152.50" y="1046.19" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#1b1f24" text-anchor="middle" font-weight="400">14</text>
+<rect x="40.00" y="983.19" width="120.00" height="8.44" rx="0" fill="url(#seam)" stroke="none" stroke-width="0"/>
+<rect x="40.00" y="1025.38" width="120.00" height="8.44" rx="0" fill="url(#seam)" stroke="none" stroke-width="0"/>
+<rect x="66.25" y="941.00" width="8.44" height="120.00" rx="0" fill="url(#seam)" stroke="none" stroke-width="0"/>
+<rect x="92.50" y="941.00" width="8.44" height="120.00" rx="0" fill="url(#seam)" stroke="none" stroke-width="0"/>
+<rect x="118.75" y="941.00" width="8.44" height="120.00" rx="0" fill="url(#seam)" stroke="none" stroke-width="0"/>
+<rect x="145.00" y="941.00" width="8.44" height="120.00" rx="0" fill="url(#seam)" stroke="none" stroke-width="0"/>
+<rect x="40.00" y="941.00" width="34.69" height="50.62" rx="1" fill="none" stroke="#1b1f24" stroke-width="2.6"/>
+<line x1="172.00" y1="1001.00" x2="206.00" y2="1001.00" stroke="#6a737d" stroke-width="1.4" marker-end="url(#fwd)"/>
+<text x="216.00" y="960.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">rank 0</text>
+<rect x="259.00" y="945.00" width="107.71" height="22.00" rx="2" fill="#dce9f7" stroke="#3d6d99" stroke-width="1.2"/>
+<text x="312.85" y="959.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">0</text>
+<rect x="368.71" y="945.00" width="107.71" height="22.00" rx="2" fill="#dce9f7" stroke="#3d6d99" stroke-width="1.2"/>
+<text x="422.56" y="959.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">1</text>
+<rect x="478.41" y="945.00" width="107.71" height="22.00" rx="2" fill="#dce9f7" stroke="#3d6d99" stroke-width="1.2"/>
+<text x="532.27" y="959.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">2</text>
+<text x="216.00" y="990.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">rank 1</text>
+<rect x="259.00" y="975.00" width="107.71" height="22.00" rx="2" fill="#dff0da" stroke="#4f8b3f" stroke-width="1.2"/>
+<text x="312.85" y="989.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">3</text>
+<rect x="368.71" y="975.00" width="107.71" height="22.00" rx="2" fill="#dff0da" stroke="#4f8b3f" stroke-width="1.2"/>
+<text x="422.56" y="989.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">5</text>
+<rect x="478.41" y="975.00" width="107.71" height="22.00" rx="2" fill="#dff0da" stroke="#4f8b3f" stroke-width="1.2"/>
+<text x="532.27" y="989.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">6</text>
+<text x="216.00" y="1020.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">rank 2</text>
+<rect x="259.00" y="1005.00" width="107.71" height="22.00" rx="2" fill="#fce8d0" stroke="#bf7a2e" stroke-width="1.2"/>
+<text x="312.85" y="1019.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">7</text>
+<rect x="368.71" y="1005.00" width="107.71" height="22.00" rx="2" fill="#fce8d0" stroke="#bf7a2e" stroke-width="1.2"/>
+<text x="422.56" y="1019.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">8</text>
+<rect x="478.41" y="1005.00" width="75.20" height="22.00" rx="2" fill="#fce8d0" stroke="#bf7a2e" stroke-width="1.2"/>
+<text x="516.01" y="1019.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">10</text>
+<rect x="555.62" y="1005.00" width="31.38" height="22.00" rx="2" fill="#fce8d0" stroke="#bf7a2e" stroke-width="1.2"/>
+<text x="571.31" y="1019.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">14</text>
+<text x="216.00" y="1050.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">rank 3</text>
+<rect x="259.00" y="1035.00" width="45.44" height="22.00" rx="2" fill="#f9d9dc" stroke="#b04a52" stroke-width="1.2"/>
+<text x="281.72" y="1049.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">4</text>
+<rect x="306.44" y="1035.00" width="45.44" height="22.00" rx="2" fill="#f9d9dc" stroke="#b04a52" stroke-width="1.2"/>
+<text x="329.16" y="1049.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">9</text>
+<rect x="353.88" y="1035.00" width="75.20" height="22.00" rx="2" fill="#f9d9dc" stroke="#b04a52" stroke-width="1.2"/>
+<text x="391.48" y="1049.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">11</text>
+<rect x="431.08" y="1035.00" width="75.20" height="22.00" rx="2" fill="#f9d9dc" stroke="#b04a52" stroke-width="1.2"/>
+<text x="468.68" y="1049.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">12</text>
+<rect x="508.28" y="1035.00" width="75.20" height="22.00" rx="2" fill="#f9d9dc" stroke="#b04a52" stroke-width="1.2"/>
+<text x="545.89" y="1049.50" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9" fill="#1b1f24" text-anchor="middle" font-weight="400">13</text>
+<rect x="584.49" y="1035.00" width="3.51" height="22.00" rx="1" fill="#6a737d" stroke="none" stroke-width="0" opacity="0.16"/>
+<rect x="256.50" y="942.50" width="112.71" height="27.00" rx="1" fill="none" stroke="#1b1f24" stroke-width="2.6"/>
+<rect x="598.00" y="941.00" width="5.00" height="120.00" rx="2" fill="#a7b0b8" stroke="none" stroke-width="0"/>
+<rect x="612.00" y="941.00" width="5.00" height="120.00" rx="2" fill="#a7b0b8" stroke="none" stroke-width="0"/>
+<text x="614.00" y="1073.00" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="8.5" fill="#6a737d" text-anchor="middle" font-weight="400">edges, image</text>
+<line x1="40.00" y1="1081.00" x2="554.00" y2="1081.00" stroke="#e3e6e8" stroke-width="1.2"/>
+<text x="40.00" y="1093.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">peak activations</text>
+<text x="40.00" y="1108.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">12%</text>
+<text x="152.00" y="1093.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">work</text>
+<text x="152.00" y="1108.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">1.46×</text>
+<text x="264.00" y="1093.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">seams</text>
+<text x="264.00" y="1108.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">22</text>
+<text x="376.00" y="1093.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">imbalance</text>
+<text x="376.00" y="1108.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">0.4%</text>
+<text x="488.00" y="1093.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9.5" fill="#6a737d" text-anchor="start" font-weight="400">syncs</text>
+<text x="488.00" y="1108.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" fill="#1b1f24" text-anchor="start" font-weight="600">twice</text>
+<text x="40.00" y="1134.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#1b1f24" text-anchor="start" font-weight="600">Distribute the tiles</text>
+<text x="216.00" y="1134.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.5" fill="#1b1f24" text-anchor="start" font-weight="600">Each rank decodes its assigned tiles sequentially</text>
+<text x="216.00" y="1150.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">Each rank starts with a contiguous run, then single tiles move to level it.</text>
+<text x="216.00" y="1164.00" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" fill="#6a737d" text-anchor="start" font-weight="400">Rank 3 decodes five tiles to rank 0's three, and they still finish together.</text>
+</svg>

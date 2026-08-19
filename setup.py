@@ -11,12 +11,17 @@ if __name__ == "__main__":
         name="DistVAE",
         author="Jinzhe Pan",
         author_email="eigensystem1318@gmail.com",
-        packages=find_packages(),
-        install_requires=["torch>=2.2", "diffusers>=0.35.0", "transformers"],
+        packages=find_packages(include=["distvae", "distvae.*"]),
+        # This is the oldest dependency pair covered by compatibility CI. VAE families introduced
+        # in later diffusers releases are resolved lazily and name the missing class when used.
+        install_requires=["torch>=2.2", "diffusers>=0.30.3"],
         extras_require={
+            "pipeline": ["transformers"],
             "dev": [
                 "pytest",
                 "black",
+                "mdformat",
+                "mdformat-gfm",
                 "flake8",
                 "mypy",
             ],

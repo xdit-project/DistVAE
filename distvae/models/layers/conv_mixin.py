@@ -8,11 +8,12 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from distvae.utils import DistributedEnv
+from distvae.utils import normalize_patch_dim
 from distvae.models.layers.conv_utils import (
     get_world_size_and_rank,
     calc_patch_index,
     calc_halo_width,
+    calc_halo_width_unit_stride,
     calc_bottom_halo_width,
     calc_top_halo_width,
     exchange_halo,
@@ -29,7 +30,7 @@ class PatchConvMixin:
 
     Methods: _patch_ndim (return 4 or 5); _adjust_padding_for_patch (delegate to conv_utils);
     _use_direct_path (True if single rank or all spatial sizes <= block_size);
-    _multi_rank_metadata_and_halo (all_gather patch sizes, compute halo, exchange, return extended input + metadata).
+    _multi_rank_metadata_and_halo (compute halo, exchange it, return extended input + metadata).
     """
 
     def _patch_ndim(self) -> int:
@@ -41,6 +42,20 @@ class PatchConvMixin:
         return adjust_padding_for_patch(
             padding, rank, world_size, patch_dim, ndim=self._patch_ndim()
         )
+
+    def _check_padding_mode(self, group_world_size: int) -> None:
+        """Refuse a padding mode whose values a halo exchange cannot supply.
+
+        Zero, replicate, and reflect padding need only local values or rows from neighboring
+        ranks. Circular padding reads the opposite image edge, which may belong to a
+        non-neighboring rank and cannot be supplied by the halo exchange.
+        """
+        if group_world_size > 1 and self.padding_mode == "circular":
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot shard a convolution padded circularly: its "
+                f"padding wraps to the opposite edge of the image, which is not on a "
+                f"neighbouring rank. Use a single rank for this VAE, or tile it instead."
+            )
 
     def _use_direct_path(self, input: Tensor) -> bool:
         """Return True if we can run a single conv and crop (no chunking).
@@ -59,43 +74,26 @@ class PatchConvMixin:
             spatial_sizes[i] <= block_size[i] for i in range(len(spatial_sizes))
         )
 
-    def _uniform_patch_index(self, t: torch.Tensor, group_world_size: int):
-        """Calculate the patch index for a uniform patch.
-
-        Args:
-            patch_dim_size: The size of the patch dimension
-            group_world_size: The world size of the group
-
-        Returns:
-            The patch index
-        """
-        patch_dim = self.patch_dim if self.patch_dim >= 0 else t.ndim + self.patch_dim
-        patch_list = [
-            torch.tensor(
-                [t.shape[patch_dim]],
-                dtype=torch.int64,
-                device=t.device
-            ) for _ in range(group_world_size)
-        ]
-        return calc_patch_index(patch_list)
-
     def _multi_rank_metadata_and_halo(
         self,
         input: Tensor,
-        use_uniform_patch: bool = False,
         halo_buffer: dict = None
     ):
-        """All_gather patch sizes, compute patch_index and halo_width, exchange halos; return extended input and metadata.
+        """Exchange this rank's halo and return the input extended with neighboring rows.
 
-        All-gathers each rank's patch size along the patch dimension, builds
-        patch_index (cumulative boundaries), computes halo_width for this rank and
-        prev_bottom_halo_width/next_top_halo_width for send sizes, exchanges halos
-        with neighbors via exchange_halo. Returns (input, patch_dim, patch_size,
-        halo_width, kernel_size_patch_dim, padding_patch_dim, stride_patch_dim,
-        patch_index, group_world_size, rank_in_group).
+        A strided conv all-gathers each rank's patch size to build the cumulative boundaries
+        its halo widths and its output cropping both turn on. A unit-stride conv derives the
+        same widths from its kernel and skips the gather; it also has no use for the
+        boundaries, so it reports global_start as None.
+
+        Returns (input, patch_dim, patch_size, halo_width, kernel_size_patch_dim,
+        padding_patch_dim, stride_patch_dim, global_start, group_world_size, rank_in_group).
         """
-        group_world_size, global_rank, rank_in_group, local_rank = get_world_size_and_rank()
-        patch_dim = self.patch_dim if self.patch_dim >= 0 else input.ndim + self.patch_dim
+        context = getattr(self, "parallel_context", None)
+        group_world_size, rank_in_group = get_world_size_and_rank(context)
+        patch_dim = input.ndim + normalize_patch_dim(
+            self.patch_dim, input.ndim, spatial_only=True
+        )
         patch_size = input.shape[patch_dim]
         spatial_idx = patch_dim - 2
         kernel_size_patch_dim = (
@@ -113,17 +111,25 @@ class PatchConvMixin:
             if isinstance(self.stride, tuple)
             else self.stride
         )
-        if use_uniform_patch:
-            if halo_buffer is None:
-                patch_index = self._uniform_patch_index(input, group_world_size)
-            else:
-                key = ("patch_index", input.shape[patch_dim], torch.int64, input.device)
-                if key in halo_buffer:
-                    patch_index = halo_buffer[key]
-                else:
-                    patch_index = self._uniform_patch_index(input, group_world_size)
-                    halo_buffer[key] = patch_index
+        prev_bottom_halo_width: int = 0
+        next_top_halo_width: int = 0
+        if stride_patch_dim == 1:
+            # At unit stride the halo depends on the kernel alone, so no rank has to be told
+            # where the others' patches begin and the gather below can be skipped. A rank one
+            # along is neither first nor last from this rank's point of view, which is why the
+            # widths it wants are the plain kernel halves.
+            patch_index = None
+            halo_width = calc_halo_width_unit_stride(
+                rank_in_group, group_world_size, kernel_size_patch_dim
+            )
+            if rank_in_group != 0:
+                prev_bottom_halo_width = kernel_size_patch_dim // 2
+            if rank_in_group != group_world_size - 1:
+                next_top_halo_width = (kernel_size_patch_dim - 1) // 2
         else:
+            # Patchify cuts bands that differ in size wherever the row count does not divide by
+            # the rank count, and a strided conv's halo turns on where in the global stride grid
+            # a patch starts, so a rank cannot read this off its own patch and has to be told.
             patch_list = [
                 torch.zeros(1, dtype=torch.int64, device=input.device)
                 for _ in range(group_world_size)
@@ -135,36 +141,39 @@ class PatchConvMixin:
                     dtype=torch.int64,
                     device=input.device,
                 ),
-                group=DistributedEnv.get_vae_group(),
+                group=context.group,
             )
             patch_index = calc_patch_index(patch_list)
-        halo_width = calc_halo_width(
-            rank_in_group,
-            patch_index,
-            kernel_size_patch_dim,
-            padding_patch_dim,
-            stride_patch_dim,
-        )
-        prev_bottom_halo_width: int = 0
-        next_top_halo_width: int = 0
-        if rank_in_group != 0:
-            prev_bottom_halo_width = calc_bottom_halo_width(
-                rank_in_group - 1,
+            halo_width = calc_halo_width(
+                rank_in_group,
                 patch_index,
                 kernel_size_patch_dim,
                 padding_patch_dim,
                 stride_patch_dim,
             )
-        if rank_in_group != group_world_size - 1:
-            next_top_halo_width = calc_top_halo_width(
-                rank_in_group + 1,
-                patch_index,
-                kernel_size_patch_dim,
-                padding_patch_dim,
-                stride_patch_dim,
-            )
-            next_top_halo_width = max(0, next_top_halo_width)
+            if rank_in_group != 0:
+                prev_bottom_halo_width = calc_bottom_halo_width(
+                    rank_in_group - 1,
+                    patch_index,
+                    kernel_size_patch_dim,
+                    padding_patch_dim,
+                    stride_patch_dim,
+                )
+            if rank_in_group != group_world_size - 1:
+                next_top_halo_width = calc_top_halo_width(
+                    rank_in_group + 1,
+                    patch_index,
+                    kernel_size_patch_dim,
+                    padding_patch_dim,
+                    stride_patch_dim,
+                )
+                next_top_halo_width = max(0, next_top_halo_width)
         if self._patch_ndim() == 4:
+            # Backstop, not the guard. Bands differ by a unit, so this can be true on one rank and
+            # false on its neighbour, and a rank that stops here stops on its way into the
+            # exchange below - leaving the others waiting on rows that will not come. Patchify
+            # refuses the same case up front, where every rank works it out from the same numbers
+            # and they all refuse together. Anything reaching here came in already split.
             assert halo_width[0] <= patch_size and halo_width[1] <= patch_size, (
                 "halo width is larger than the patch dimension of input tensor"
             )
@@ -176,24 +185,19 @@ class PatchConvMixin:
             halo_width,
             prev_bottom_halo_width,
             next_top_halo_width,
-            group_world_size,
-            rank_in_group,
+            context,
             halo_buffer,
         )
 
-        # Stride alignment: when stride > 1, we need to align input to global stride grid
-        # to ensure output indices match across ranks (prevents border artifacts)
-        stride_shift = 0
-        if halo_width[0] > 0 and stride_patch_dim > 1:
-            global_start = patch_index[rank_in_group]
-            shift = (global_start - halo_width[0] + padding_patch_dim) % stride_patch_dim
-            if shift != 0:
-                stride_shift = shift
-                # Trim `shift` pixels from the top to align to stride grid
-                trim_slice = [slice(None)] * input.ndim
-                trim_slice[patch_dim] = slice(shift, None)
-                input = input[tuple(trim_slice)]
-                halo_width = (max(0, halo_width[0] - shift), halo_width[1])
+        # Where this rank's patch begins in the whole image. Only a strided conv needs it, and
+        # only a strided conv paid to find it out, so at unit stride there is nothing to report.
+        global_start = None if patch_index is None else patch_index[rank_in_group]
+
+        # A block trimming the input back onto the global stride grid used to sit here. It never
+        # trimmed anything: the top halo is defined as the distance from the patch start back to
+        # the last output step before it, so start - halo + padding is that step's position, which
+        # is a whole number of strides by construction and leaves nothing to shift by. What it
+        # reported was therefore always zero, and both callers unpacked it and never read it.
         return (
             input,
             patch_dim,
@@ -202,8 +206,7 @@ class PatchConvMixin:
             kernel_size_patch_dim,
             padding_patch_dim,
             stride_patch_dim,
-            patch_index,
+            global_start,
             group_world_size,
             rank_in_group,
-            stride_shift,
         )

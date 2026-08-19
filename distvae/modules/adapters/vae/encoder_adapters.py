@@ -1,167 +1,336 @@
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch.distributed import ProcessGroup
 
-from distvae.modules.adapters.layers.conv_adapters import WanCausalConv3dAdapter
-from distvae.modules.adapters.midblock_adapters import WanMidBlockAdapter
+from distvae.modules.adapters.diffusers_blocks import (
+    HUNYUAN_VIDEO,
+    HUNYUAN_VIDEO_15,
+    LTX2_VIDEO,
+    QWEN_IMAGE,
+    WAN,
+    block,
+)
 from distvae.modules.adapters.downsampling_adapters import (
+    HunyuanVideo15DownBlockAdapter,
+    HunyuanVideoDownBlockAdapter,
+    LTX2VideoDownBlockAdapter,
+    QwenImageResampleDownAdapter,
+    WanResampleDownAdapter,
     WanResidualDownBlockAdapter,
-    WanResampleDownAdapter
 )
-from distvae.modules.adapters.resnet_adapters import WanResidualBlockAdapter
-from distvae.modules.adapters.layers.attn_adapters import WanAttentionBlockAdapter
-from distvae.modules.patch_utils import Patchify, DePatchify
-from distvae.utils import DistributedEnv
-
-from diffusers.models.autoencoders.autoencoder_kl_wan import (
-    WanResidualDownBlock,
-    WanResidualBlock,
-    WanResample,
-    WanAttentionBlock,
+from distvae.modules.adapters.layers.attn_adapters import GatheredAttentionAdapter
+from distvae.modules.adapters.layers.conv_adapters import (
+    Conv2dAdapter,
+    HunyuanVideo15CausalConv3dAdapter,
+    HunyuanVideoCausalConv3dAdapter,
+    LTX2VideoCausalConv3dAdapter,
+    QwenImageCausalConv3dAdapter,
+    WanCausalConv3dAdapter,
+)
+from distvae.modules.adapters.midblock_adapters import (
+    HunyuanVideo15MidBlockAdapter,
+    HunyuanVideoMidBlockAdapter,
+    LTX2VideoMidBlockAdapter,
+    QwenImageMidBlockAdapter,
+    WanMidBlockAdapter,
+)
+from distvae.modules.adapters.resnet_adapters import (
+    QwenImageResidualBlockAdapter,
+    WanResidualBlockAdapter,
+)
+from distvae.modules.adapters.unets.unet_2d_blocks_adapters import DownEncoderBlock2DAdapter
+from distvae.modules.adapters.vae.causal_setup import CausalVAEAdapterSetup
+from distvae.modules.patch_utils import Patchify, DePatchify, widest_halo
+from distvae.utils import (
+    cache_cursor,
+    normalize_patch_dim,
+    parallel_context,
 )
 
-class WanEncoderAdapter(nn.Module):
+from diffusers.models.autoencoders.vae import Encoder
+from diffusers.models.unets.unet_2d_blocks import DownEncoderBlock2D
+
+WanAttentionBlock = block(WAN, "WanAttentionBlock")
+WanResample = block(WAN, "WanResample")
+WanResidualBlock = block(WAN, "WanResidualBlock")
+WanResidualDownBlock = block(WAN, "WanResidualDownBlock")
+QwenImageAttentionBlock = block(QWEN_IMAGE, "QwenImageAttentionBlock")
+QwenImageResample = block(QWEN_IMAGE, "QwenImageResample")
+QwenImageResidualBlock = block(QWEN_IMAGE, "QwenImageResidualBlock")
+HunyuanVideoDownBlock3D = block(HUNYUAN_VIDEO, "HunyuanVideoDownBlock3D")
+HunyuanVideo15DownBlock3D = block(HUNYUAN_VIDEO_15, "HunyuanVideo15DownBlock3D")
+LTX2VideoDownBlock3D = block(LTX2_VIDEO, "LTX2VideoDownBlock3D")
+
+
+class EncoderAdapter(nn.Module):
+    """Shards the 2D encoder AutoencoderKL and Flux.2 use, over its down blocks alone.
+
+    The mirror of the 2D decoder adapter, which splits after its mid block rather than before.
+    Here the split is undone before the mid block, so the attention in it and the GroupNorm after
+    it see the whole feature map and need no sharding of their own. What that costs is running the
+    narrowest part of the encoder on every rank, and what it buys is that the down blocks, which
+    carry the image at full size and are the reason to encode in parallel at all, are the part
+    that gets split.
+    """
+
     def __init__(
         self,
-        encoder,
+        encoder: Encoder,
         vae_group: ProcessGroup = None,
         *,
-        use_uniform_patch: bool = True,
         vae_scale_factor: int = 8,
         conv_block_size = 0,
         patch_dim: int = -2,
     ):
         super().__init__()
-        if patch_dim == -3:
-            raise ValueError("WanEncoderAdapter does not support patch_dim F (-3); use H (-2) or W (-1).")
-
-        DistributedEnv.initialize(vae_group)
+        adapter = type(self).__name__
+        patch_dim = normalize_patch_dim(patch_dim, 4, spatial_only=True)
+        if patch_dim != -2:
+            # The resnet adapter this reaches through splits H and says nothing about which axis.
+            raise ValueError(f"{adapter} only supports patch_dim H (-2).")
+        for down_block in encoder.down_blocks:
+            assert isinstance(down_block, DownEncoderBlock2D), (
+                f"{adapter} does not support down block except DownEncoderBlock2D"
+            )
+        # A band has to be a whole multiple of what the encoder narrows by, and here that can be
+        # counted rather than taken on trust: one halving per stage that carries a downsampler.
+        # A caller working from a config default rather than from the blocks would otherwise cut
+        # bands that a later stage halves into a row it does not own.
+        counted = 2 ** sum(
+            1 for down_block in encoder.down_blocks if down_block.downsamplers
+        )
+        if vae_scale_factor != counted:
+            raise ValueError(
+                f"{adapter} was told this encoder narrows by {vae_scale_factor}, but its "
+                f"down blocks narrow by {counted}."
+            )
         self.patch_dim = patch_dim
-        DistributedEnv.set_patch_dim(patch_dim)
-        self.vae_scale_factor = vae_scale_factor
+        self.parallel_context = parallel_context(vae_group, patch_dim, ndim=4)
         self.encoder = encoder
-
-        # Patch the conv_in layer
-        self.encoder.conv_in = WanCausalConv3dAdapter(
+        encoder.conv_in = Conv2dAdapter(
             encoder.conv_in,
             block_size=conv_block_size,
-            patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
+            parallel_context=self.parallel_context,
         )
-        # Patch the down_blocks
-        down_blocks = []
-        for i, down_block in enumerate(encoder.down_blocks):
-            if isinstance(down_block, WanResidualDownBlock):
-                # Wan2.2 style: wrapped in WanResidualDownBlock
-                down_blocks.append(
-                    WanResidualDownBlockAdapter(
-                        down_block,
-                        conv_block_size=conv_block_size,
-                        patch_dim=patch_dim,
-                        use_uniform_patch=use_uniform_patch
-                    )
-                )
-            elif isinstance(down_block, WanResidualBlock):
-                # Wan2.1 style: individual residual block
-                down_blocks.append(
-                    WanResidualBlockAdapter(
-                        down_block,
-                        conv_block_size=conv_block_size,
-                        patch_dim=patch_dim,
-                        use_uniform_patch=use_uniform_patch,
-                    )
-                )
-            elif isinstance(down_block, WanResample):
-                # Wan2.1 style: individual downsample block
-                down_blocks.append(
-                    WanResampleDownAdapter(
-                        down_block,
-                        conv_block_size=conv_block_size,
-                        patch_dim=patch_dim,
-                        use_uniform_patch=use_uniform_patch
-                    )
-                )
-            elif isinstance(down_block, WanAttentionBlock):
-                # Attention blocks need to see full spatial context, so wrap with adapter
-                down_blocks.append(
-                    WanAttentionBlockAdapter(down_block, patch_dim=patch_dim)
-                )
-            else:
-                # Unknown block type - keep as-is and log warning
-                import warnings
-                warnings.warn(
-                    f"Unsupported down_block type {type(down_block).__name__} at index {i} in encoder, "
-                    f"keeping original. This may cause issues with parallel VAE."
-                )
-                down_blocks.append(down_block)
-        self.encoder.down_blocks = nn.ModuleList(down_blocks)
-        # Patch the mid_block
-        self.encoder.mid_block = WanMidBlockAdapter(
-            encoder.mid_block,
+        encoder.down_blocks = nn.ModuleList([
+            DownEncoderBlock2DAdapter(
+                down_block,
+                conv_block_size=conv_block_size,
+                parallel_context=self.parallel_context,
+            )
+            for down_block in encoder.down_blocks
+        ])
+        self.patchify = Patchify(
+            scale_factor=vae_scale_factor,
+            parallel_context=self.parallel_context,
+            halo=widest_halo(self.encoder),
+        )
+        self.depatchify = DePatchify(parallel_context=self.parallel_context)
+        self.vae_group = vae_group
+
+    def forward(self, sample: torch.FloatTensor):
+        sample = self.encoder.conv_in(self.patchify(sample))
+        for down_block in self.encoder.down_blocks:
+            sample = down_block(sample)
+        sample = self.encoder.mid_block(self.depatchify(sample))
+        sample = self.encoder.conv_act(self.encoder.conv_norm_out(sample))
+        return self.encoder.conv_out(sample)
+
+
+def _gathered(attention: nn.Module, **options) -> nn.Module:
+    """Adapt an attention block, which needs the whole image rather than a patch of it
+
+    Written as a function so it can sit in a down block table beside the adapters that shard a
+    convolution, none of whose sizing options a gather has any use for.
+    """
+    return GatheredAttentionAdapter(
+        attention,
+        parallel_context=options["parallel_context"],
+    )
+
+
+class _CausalEncoderAdapter(nn.Module):
+    """Shards a causal 3D video encoder across ranks along one spatial axis.
+
+    The mirror of _CausalDecoderAdapter, over the same skeleton read the other way: a causal
+    convolution in, a run of down blocks, a mid block, a normalisation, a causal convolution
+    out. What differs is what a band has to be a multiple of. An encoder narrows what it is
+    handed, so a band is cut in whole multiples of the VAE's spatial ratio and the latent rows it
+    produces are its own, where a decoder cuts latent rows and multiplies.
+    """
+
+    _label = "Encoder"
+    _conv_adapter = None
+    _mid_adapter = None
+    # Which adapter fits which down block class. A family whose blocks are not in the installed
+    # diffusers leaves None in the type slot, which no block can match.
+    _down_block_adapters: Tuple[Tuple[Optional[type], object], ...] = ()
+    # Wan and the family forked from it thread a temporal cache through every forward. The
+    # HunyuanVideo and LTX-2 encoders take a tensor and nothing else.
+    _takes_feature_cache = True
+    _setup_type = CausalVAEAdapterSetup
+
+    def __init__(
+        self,
+        encoder: nn.Module,
+        vae_group: ProcessGroup = None,
+        *,
+        vae_scale_factor: int = 8,
+        conv_block_size = 0,
+        patch_dim: int = -2,
+    ):
+        super().__init__()
+        setup = self._setup_type.create(
+            adapter=type(self).__name__,
+            conv_adapter=self._conv_adapter,
+            block_adapters=self._down_block_adapters,
             conv_block_size=conv_block_size,
             patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
+            vae_group=vae_group,
         )
-        # Patch the conv_out layer
-        self.encoder.conv_out = WanCausalConv3dAdapter(
-            encoder.conv_out,
-            block_size=conv_block_size,
-            patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch
+        self._setup = setup
+        self.patch_dim = setup.patch_dim
+        self.parallel_context = setup.parallel_context
+        self.vae_scale_factor = vae_scale_factor
+        self.encoder = encoder
+        self.encoder.conv_in = setup.adapt_convolution(encoder.conv_in)
+        self.encoder.down_blocks = setup.adapt_blocks(encoder.down_blocks, "down")
+        self.encoder.mid_block = self._mid_adapter(
+            encoder.mid_block, conv_block_size=conv_block_size, **setup.options
         )
-        self.use_uniform_patch = use_uniform_patch
-        self.patchify = Patchify(
-            patch_dim=patch_dim,
-            use_uniform_patch=use_uniform_patch,
-            scale_factor=vae_scale_factor,
+        self.encoder.conv_out = setup.adapt_convolution(encoder.conv_out)
+        # HunyuanVideo ends on a GroupNorm, whose statistics span the axis being split. The RMS
+        # norms the other families end on do not, and are left as they are.
+        if hasattr(encoder, "conv_norm_out"):
+            self.encoder.conv_norm_out = setup.adapt_group_norm(encoder.conv_norm_out)
+        # Each band is a whole multiple of what the encoder narrows by, so it starts on the grid
+        # the strided convolutions step along and the latent rows it produces are its own.
+        # The scale factor comes from the public VAE orchestration, because some families narrow
+        # by folding space into channels rather than by convolution stride. Read the halo only
+        # after the complete stack has been adapted.
+        self.patchify, self.depatchify = setup.patchers(
+            self.encoder, vae_scale_factor
         )
-        self.depatchify = DePatchify(patch_dim=patch_dim, use_uniform_patch=use_uniform_patch)
+        self.vae_group = vae_group
 
-    def _forward(
-        self,
-        sample: torch.FloatTensor,
-        feat_cache: Optional[torch.FloatTensor] = None,
-        feat_idx: Optional[int] = 0,
-        patchify: bool = True,
-    ):
-        """Internal forward with optional patchify."""
-        if self.use_uniform_patch and not patchify:
-            raise ValueError("WanEncoderAdapter does not support use_uniform_patch for already patchified inputs.")
+    def _run_encoder(self, sample, feat_cache, feat_idx):
+        if not self._takes_feature_cache:
+            return self.encoder(sample)
+        return self.encoder(
+            sample, feat_cache=feat_cache, feat_idx=cache_cursor(feat_idx)
+        )
 
-        if self.use_uniform_patch:
-            patch_dim = self.patch_dim if self.patch_dim >= 0 else sample.ndim + self.patch_dim
-            patch_dim_size = sample.shape[patch_dim]
+    def _sharded_encode(self, sample: torch.FloatTensor, patchify: bool, run):
+        """Split the sample across ranks, encode this rank's share, and reassemble
 
+        Kept apart from forward because the families do not agree on what an encoder call looks
+        like: some thread a temporal cache through it, LTX-2 takes a causal flag. Splitting and
+        reassembling is the same either way.
+        """
         if patchify:
             sample = self.patchify(sample)
-        output = self.encoder(sample, feat_cache=feat_cache, feat_idx=feat_idx)
-        output = self.depatchify(output)
-
-        if self.use_uniform_patch:
-            downsampling_factor = self.vae_scale_factor
-            output = output.narrow(patch_dim, 0, patch_dim_size // downsampling_factor)
-
-        return output
+        return self.depatchify(run(sample))
 
     def forward(
         self,
         sample: torch.FloatTensor,
         feat_cache: Optional[torch.FloatTensor] = None,
-        feat_idx: Optional[int] = 0,
+        feat_idx: Optional[List[int]] = None,
         patchify: bool = True,
     ):
-        """
-        Forward pass through the encoder.
+        # A one-element list the causal blocks advance in place; see the decoder's forward for
+        # why it is neither a mutable default nor the bare 0 this used to take.
+        feat_idx = cache_cursor(feat_idx)
+        return self._sharded_encode(
+            sample, patchify, lambda x: self._run_encoder(x, feat_cache, feat_idx)
+        )
 
-        Args:
-            sample: Input tensor to encode
-            feat_cache: Optional feature cache for temporal consistency
-            feat_idx: Feature index for caching
-            patchify: Whether to apply patchify/depatchify (default: True)
 
-        Returns:
-            Encoded latent tensor
-        """
-        return self._forward(sample, feat_cache, feat_idx, patchify)
+class WanEncoderAdapter(_CausalEncoderAdapter):
+    """Wan's encoder, whose down blocks come either grouped or one layer at a time
+
+    Wan 2.2 wraps each stage in a WanResidualDownBlock; Wan 2.1 lays the same residual blocks,
+    attentions and resamples out flat in one list. Both ship, and the encoder class alone does
+    not say which, so both shapes are handled.
+    """
+
+    _label = "WanEncoder"
+    _conv_adapter = WanCausalConv3dAdapter
+    _mid_adapter = WanMidBlockAdapter
+    _down_block_adapters = (
+        (WanResidualDownBlock, WanResidualDownBlockAdapter),
+        (WanResidualBlock, WanResidualBlockAdapter),
+        (WanResample, WanResampleDownAdapter),
+        (WanAttentionBlock, _gathered),
+    )
+
+
+class QwenImageEncoderAdapter(_CausalEncoderAdapter):
+    """Qwen-Image's encoder, which is Wan 2.1's laid out flat and renamed
+
+    Its resample carries the same zero-pad-then-strided-convolution downsample as Wan's, so the
+    one thing it does not inherit outright is the residual down block Wan 2.2 groups its stages
+    into, which Qwen-Image has no equivalent of.
+    """
+
+    _label = "QwenImageEncoder"
+    _conv_adapter = QwenImageCausalConv3dAdapter
+    _mid_adapter = QwenImageMidBlockAdapter
+    _down_block_adapters = (
+        (QwenImageResidualBlock, QwenImageResidualBlockAdapter),
+        (QwenImageResample, QwenImageResampleDownAdapter),
+        (QwenImageAttentionBlock, _gathered),
+    )
+
+
+class HunyuanVideoEncoderAdapter(_CausalEncoderAdapter):
+    """HunyuanVideo's encoder, which groups its stages and ends on a GroupNorm
+
+    That norm reduces over the axis being split, so the base wraps it. Its mid block holds
+    diffusers' own attention, flattened over frames and rows and columns together, which the mid
+    block adapter gathers around rather than trying to shard.
+    """
+
+    _label = "HunyuanVideoEncoder"
+    _conv_adapter = HunyuanVideoCausalConv3dAdapter
+    _mid_adapter = HunyuanVideoMidBlockAdapter
+    _down_block_adapters = ((HunyuanVideoDownBlock3D, HunyuanVideoDownBlockAdapter),)
+    _takes_feature_cache = False
+
+
+class HunyuanVideo15EncoderAdapter(_CausalEncoderAdapter):
+    """HunyuanVideo 1.5's encoder, which downsamples by folding space into channels
+
+    It ends on an RMS norm, which reduces over channels and so needs no sharding. Its downsampler
+    packs each pair of rows and columns into channels, which reads one input position per output
+    one so long as a rank holds whole pairs of rows, and the bands Patchify cuts do.
+    """
+
+    _label = "HunyuanVideo15Encoder"
+    _conv_adapter = HunyuanVideo15CausalConv3dAdapter
+    _mid_adapter = HunyuanVideo15MidBlockAdapter
+    _down_block_adapters = ((HunyuanVideo15DownBlock3D, HunyuanVideo15DownBlockAdapter),)
+    _takes_feature_cache = False
+
+
+class LTX2VideoEncoderAdapter(_CausalEncoderAdapter):
+    """LTX-2's encoder, which takes a causal flag where the others take a temporal cache
+
+    Its mid block holds no attention, so nothing here has to be gathered: every layer is a
+    convolution or a norm that reduces over channels.
+    """
+
+    _label = "LTX2VideoEncoder"
+    _conv_adapter = LTX2VideoCausalConv3dAdapter
+    _mid_adapter = LTX2VideoMidBlockAdapter
+    _down_block_adapters = ((LTX2VideoDownBlock3D, LTX2VideoDownBlockAdapter),)
+
+    def forward(
+        self,
+        hidden_states: torch.FloatTensor,
+        causal: Optional[bool] = None,
+        patchify: bool = True,
+    ):
+        return self._sharded_encode(hidden_states, patchify, lambda x: self.encoder(x, causal))
