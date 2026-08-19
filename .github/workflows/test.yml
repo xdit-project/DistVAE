@@ -11,6 +11,10 @@ permissions:
 jobs:
   minimum-dependencies:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,7 +32,7 @@ jobs:
           python -m pip install --no-deps -e .
       - name: Test minimum dependency boundary
         run: |
-          python -m pytest -q \
+          python -m pytest -vv --durations=20 \
             test/test_adapter_compatibility.py \
             test/test_public_vae_api.py \
             test/test_decoderadapter.py \

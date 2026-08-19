@@ -8,6 +8,8 @@ passed), and the same spawn call. Only the module under test differs.
 
 import os
 import socket
+from datetime import timedelta
+from time import monotonic
 from typing import Optional
 
 import torch
@@ -19,6 +21,8 @@ from distvae.utils import ParallelContext
 
 # How many ports to try before giving up on finding a free one.
 _RENDEZVOUS_ATTEMPTS = 4
+_PROCESS_GROUP_TIMEOUT = timedelta(seconds=60)
+_DISTRIBUTED_TEST_TIMEOUT_SECONDS = 300
 
 
 def init_gloo(rank: int, world_size: int, master_port: int) -> torch.device:
@@ -27,7 +31,11 @@ def init_gloo(rank: int, world_size: int, master_port: int) -> torch.device:
     os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
-    dist.init_process_group(backend="gloo", init_method="env://")
+    dist.init_process_group(
+        backend="gloo",
+        init_method="env://",
+        timeout=_PROCESS_GROUP_TIMEOUT,
+    )
     return torch.device("cpu")
 
 
@@ -123,6 +131,19 @@ def _free_port() -> int:
         return probe.getsockname()[1]
 
 
+def _terminate_processes(context) -> None:
+    """Stop and reap every rank still owned by a timed-out spawn context."""
+    for process in context.processes:
+        if process.is_alive():
+            process.terminate()
+    for process in context.processes:
+        process.join(timeout=5)
+    for process in context.processes:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+
+
 def run_distributed(worker, world_size: int, args: tuple, master_port: int) -> None:
     """Spawn world_size ranks running worker(rank, *args); raises if any rank does
 
@@ -132,10 +153,24 @@ def run_distributed(worker, world_size: int, args: tuple, master_port: int) -> N
     open for the ranks, since rank 0 has to bind it itself.
     """
     for attempt in range(_RENDEZVOUS_ATTEMPTS):
+        context = spawn(
+            worker,
+            nprocs=world_size,
+            args=(world_size, *args, master_port),
+            join=False,
+        )
+        deadline = monotonic() + _DISTRIBUTED_TEST_TIMEOUT_SECONDS
         try:
-            spawn(worker, nprocs=world_size, args=(world_size, *args, master_port), join=True)
+            while not context.join(timeout=1):
+                if monotonic() >= deadline:
+                    _terminate_processes(context)
+                    raise TimeoutError(
+                        f"{worker.__name__} timed out after "
+                        f"{_DISTRIBUTED_TEST_TIMEOUT_SECONDS}s with {world_size} ranks"
+                    )
             return
         except ProcessRaisedException as raised:
+            _terminate_processes(context)
             last = attempt == _RENDEZVOUS_ATTEMPTS - 1
             if last or "EADDRINUSE" not in str(raised):
                 raise
