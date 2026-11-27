@@ -62,8 +62,9 @@ than part way through a decode.
 
 ## Supported VAEs
 
-Every family below supports both row sharding and tiling. Qwen-Image is listed with the video VAEs
-because its Wan-derived autoencoder has a frame axis.
+Every family below supports both row sharding and tiling, except Qwen-Image 2.1, which is tiled
+only. Both Qwen-Image VAEs are listed with the video VAEs because their Wan-derived autoencoders
+have a frame axis.
 
 | VAE              | Frame axis | Tiles by                | A tile is                                          |
 | ---------------- | ---------- | ----------------------- | -------------------------------------------------- |
@@ -74,6 +75,7 @@ because its Wan-derived autoencoder has a frame axis.
 | LTX-2            | yes        | a stored stride         | one decoder call unless temporal tiling is enabled |
 | Wan              | yes        | a stored stride         | a call per frame, threading a causal cache         |
 | Qwen-Image       | yes        | a stored stride         | a call per frame, threading a causal cache         |
+| Qwen-Image 2.1   | one frame  | a stored stride         | one decoder call                                   |
 
 Tile size affects the families differently. A smaller tile reduces tile-local activation memory when
 one tile is one decoder call, but allocations outside the spatial tile can determine the measured

@@ -25,6 +25,18 @@ def _diffusers_vae(testcase, name, kwargs, *, require_tiling=False):
     return vae
 
 
+# Qwen-Image 2.1's defaults (64 latent channels, five stages) at a size a CPU test can decode.
+QWEN_IMAGE_21 = dict(
+    base_dim=8,
+    decoder_base_dim=8,
+    z_dim=4,
+    dim_mult=[1, 2, 4, 4, 4],
+    num_res_blocks=1,
+    latents_mean=[0.0] * 4,
+    latents_std=[1.0] * 4,
+)
+
+
 def legacy_pair_vae():
     """Stub with shared square sample and latent windows and one overlap factor."""
     return StubVAE(
@@ -439,6 +451,11 @@ class TestEverySupportedVAE(unittest.TestCase):
         ),
         "AutoencoderKLQwenImage": (
             dict(base_dim=8, z_dim=4, dim_mult=[1, 2, 4, 4], num_res_blocks=1),
+            True,
+            4,
+        ),
+        "AutoencoderKLQwenImage21": (
+            QWEN_IMAGE_21,
             True,
             4,
         ),
@@ -867,6 +884,7 @@ class TestStrideTiledDecode(unittest.TestCase):
     FAMILY = (
         "AutoencoderKLWan",
         "AutoencoderKLQwenImage",
+        "AutoencoderKLQwenImage21",
         "AutoencoderKLHunyuanVideo",
         "AutoencoderKLLTX2Video",
     )
@@ -875,6 +893,8 @@ class TestStrideTiledDecode(unittest.TestCase):
     # The grid spans several tiles after halving the window. Two frames exercise cache reuse.
     LATENT_GRID = 16
     FRAMES = 2
+    # Qwen-Image 2.1's convolutions fold the frame axis away: its decoder takes one frame.
+    SINGLE_FRAME = ("AutoencoderKLQwenImage21",)
 
     def _tiled_vae(self, name, **extra):
         """Build a small video VAE and an input spanning several tiles."""
@@ -898,7 +918,8 @@ class TestStrideTiledDecode(unittest.TestCase):
 
         torch.manual_seed(0)
         grid = self.LATENT_GRID
-        return vae, torch.randn(1, channels, self.FRAMES, grid, grid)
+        frames = 1 if name in self.SINGLE_FRAME else self.FRAMES
+        return vae, torch.randn(1, channels, frames, grid, grid)
 
     def _conditioning(self, vae):
         """Return positional conditioning arguments required by tiled_decode."""
@@ -929,6 +950,7 @@ class TestStrideTiledDecode(unittest.TestCase):
                 },
             ),
             ("AutoencoderKLQwenImage", {}),
+            ("AutoencoderKLQwenImage21", {}),
             ("AutoencoderKLHunyuanVideo", {}),
             ("AutoencoderKLLTX2Video", {}),
         ):

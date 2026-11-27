@@ -476,8 +476,8 @@ class _StrideLoop(NamedTuple):
 
 
 # The VAEs whose stride-walked loop is reimplemented below, by name, because no attribute says
-# which loop body a class has. All four walk the same grid and blend it the same way, and differ
-# only in what a tile costs to turn into a decoder call.
+# which loop body a class has. All of them walk the same grid and blend it the same way, and
+# differ only in what a tile costs to turn into a decoder call.
 #
 # HunyuanVideo and LTX-2 keep no feature cache, so one decoder call handles all frames in a
 # spatial tile. Their temporal loops call this spatial loop once per frame chunk. LTX-2 disables
@@ -499,6 +499,16 @@ _STRIDE_LOOPS = {
         patches=False,
         clamps=False,
         first_chunk=False,
+        frame_cache=True,
+        post_quant=True,
+        conditioned=False,
+    ),
+    # Qwen-Image 2.1 copies Wan's loop. No row-sharding adapter fits its decoder, so tiles are
+    # the only way to spread its decode over ranks.
+    "AutoencoderKLQwenImage21": _StrideLoop(
+        patches=True,
+        clamps=True,
+        first_chunk=True,
         frame_cache=True,
         post_quant=True,
         conditioned=False,
