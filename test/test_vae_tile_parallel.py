@@ -218,7 +218,21 @@ RUN_VAES = {
         dict(base_dim=8, z_dim=4, dim_mult=[1, 2, 4, 4], num_res_blocks=1),
         True,
     ),
+    "AutoencoderKLQwenImage21": (
+        dict(
+            base_dim=8,
+            decoder_base_dim=8,
+            z_dim=4,
+            dim_mult=[1, 2, 4, 4, 4],
+            num_res_blocks=1,
+            latents_mean=[0.0] * 4,
+            latents_std=[1.0] * 4,
+        ),
+        True,
+    ),
 }
+# Qwen-Image 2.1's convolutions fold the frame axis away: its decoder takes one frame.
+SINGLE_FRAME = ("AutoencoderKLQwenImage21",)
 
 
 def _require_run_vae(testcase, name: str) -> None:
@@ -280,7 +294,8 @@ def _tiled_vae(name: str, device=None, overlap: Optional[Tuple[int, int]] = None
 
     window = vae_tiling.latent_rows(vae, plan)
     down, across = window * WINDOWS_DOWN, window * WINDOWS_ACROSS
-    shape = (1, 4, 2, down, across) if video else (1, 4, down, across)
+    frames = 1 if name in SINGLE_FRAME else 2
+    shape = (1, 4, frames, down, across) if video else (1, 4, down, across)
     torch.manual_seed(1)
     latents = torch.randn(*shape)
     if device is not None:
