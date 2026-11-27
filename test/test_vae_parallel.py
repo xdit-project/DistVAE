@@ -39,25 +39,29 @@ def _vae_class(name):
 
 # The adapter each class needs, or None where DistVAE has nothing for its decoder. Every class an
 # integration loads is shardable as of DistVAE's
-# QwenImage, HunyuanVideo and LTX-2 adapters, so a None appearing here again would mean a newly
-# supported model arrived ahead of the adapter for its VAE.
+# QwenImage, HunyuanVideo and LTX-2 adapters, except Qwen-Image 2.1, whose decode is distributed
+# by whole tiles only. Another None appearing here would mean a newly supported model arrived
+# ahead of the adapter for its VAE.
 EXPECTED = {
     "AutoencoderKL": vae_parallel.TWO_D,
     "AutoencoderKLFlux2": vae_parallel.TWO_D,
     "AutoencoderKLWan": vae_parallel.WAN,
     "AutoencoderKLQwenImage": vae_parallel.QWEN_IMAGE,
+    "AutoencoderKLQwenImage21": None,
     "AutoencoderKLHunyuanVideo": vae_parallel.HUNYUAN_VIDEO,
     "AutoencoderKLHunyuanVideo15": vae_parallel.HUNYUAN_VIDEO_15,
     "AutoencoderKLLTX2Video": vae_parallel.LTX2_VIDEO,
 }
 
 # The encoder adapter each class needs. DistVAE reached full encoder coverage alongside its
-# decoders, so a None here would mean an encoder adapter was lost rather than never written.
+# decoders, so a None here, other than Qwen-Image 2.1's, would mean an encoder adapter was lost
+# rather than never written.
 EXPECTED_ENCODERS = {
     "AutoencoderKL": vae_parallel.TWO_D_ENCODER,
     "AutoencoderKLFlux2": vae_parallel.TWO_D_ENCODER,
     "AutoencoderKLWan": "WanEncoderAdapter",
     "AutoencoderKLQwenImage": "QwenImageEncoderAdapter",
+    "AutoencoderKLQwenImage21": None,
     "AutoencoderKLHunyuanVideo": "HunyuanVideoEncoderAdapter",
     "AutoencoderKLHunyuanVideo15": "HunyuanVideo15EncoderAdapter",
     "AutoencoderKLLTX2Video": "LTX2VideoEncoderAdapter",
@@ -265,6 +269,8 @@ class TestBothHalvesShardTogether(unittest.TestCase):
 
     def test_every_vae_class_shards_both_halves(self):
         for name, config in CONFIGS.items():
+            if EXPECTED[name] is None:
+                continue
             with self.subTest(vae=name):
                 vae = _vae_class(name)(**config).eval()
                 expected = vae_parallel.encoder_adapter_name(vae)
